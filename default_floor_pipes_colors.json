@@ -1,0 +1,54 @@
+{
+    "colors": [
+        {
+            "name": "淡红",
+            "hex": "#FFB3B3"
+        },
+        {
+            "name": "淡橙",
+            "hex": "#FFD699"
+        },
+        {
+            "name": "淡黄",
+            "hex": "#FFFF99"
+        },
+        {
+            "name": "淡绿",
+            "hex": "#B3FFB3"
+        },
+        {
+            "name": "淡青",
+            "hex": "#B3FFFF"
+        },
+        {
+            "name": "淡蓝",
+            "hex": "#B3D9FF"
+        },
+        {
+            "name": "淡紫",
+            "hex": "#E6B3FF"
+        },
+        {
+            "name": "淡粉",
+            "hex": "#FFB3E6"
+        },
+        {
+            "name": "淡茶",
+            "hex": "#D9C2A3"
+        },
+        {
+            "name": "淡灰绿",
+            "hex": "#C2D9B3"
+        },
+        {
+            "name": "淡玫瑰",
+            "hex": "#FFCCCC"
+        },
+        {
+            "name": "淡靛蓝",
+            "hex": "#B3B3FF"
+        }
+    ],
+    "cycle": true,
+    "description": "用于整体管网分层着色的颜色表，按楼层标高升序循环使用。"
+}

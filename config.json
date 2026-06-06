@@ -1,0 +1,90 @@
+{
+  "last_scheme": "临时方案",
+  "global_settings": {
+    "last_cad_file": "F:/双向备份/pipe_loss_calculator/低区消火栓测试.dwg",
+    "history_layers": [
+      "PIPE-喷淋",
+      "PIPE-消防"
+    ],
+    "history_layers_pipe_layers": [
+      "PIPE-消防",
+      "PIPE-喷淋"
+    ],
+    "history_layers_riser_note_layers": [
+      "DIM_消防"
+    ],
+    "history_layers_riser_layers": [
+      "VPIPE-消防"
+    ],
+    "history_layers_pipe": [
+      "PIPE-消防",
+      "PIPE-喷淋"
+    ],
+    "history_layers_riser": [
+      "VPIPE-消防"
+    ],
+    "history_layers_riser_note": [
+      "DIM_消防"
+    ],
+    "pipe_z_offset_default": "0.8",
+    "last_export_import_dir": "H:/双向备份/pipe_loss_calculator/exports"
+  },
+  "schemes": {
+    "默认方案": {
+      "pipe_layers": [
+        "PIPE-消防"
+      ],
+      "drawing_unit": "毫米",
+      "flow_unit": "L/s",
+      "pressure_unit": "m",
+      "pipe_material": "镀锌钢管",
+      "supply_block_name": "supply_node",
+      "supply_attribute_name": "GroupID",
+      "demand_block_name": "demand_node",
+      "demand_attribute_name": "GroupID",
+      "valve_block_name": "valve",
+      "valve_attribute_name": "Status",
+      "tolerance": 10.0,
+      "preprocess_cad": false,
+      "sprinkler_K": 80,
+      "hydrant_Ad": 0.00172,
+      "hydrant_Ld": 25,
+      "hydrant_B": 1.577,
+      "hydrant_Hak": 2.0,
+      "align_block_name": "Floorbase",
+      "align_attribute_name": "Elevation"
+    },
+    "临时方案": {
+      "pipe_layers": [
+        "PIPE-消防"
+      ],
+      "drawing_unit": "毫米",
+      "flow_unit": "L/s",
+      "pressure_unit": "m",
+      "pipe_material": "镀锌钢管",
+      "supply_block_name": "supply_node",
+      "supply_attribute_name": "GroupID",
+      "demand_block_name": "demand_node",
+      "demand_attribute_name": "GroupID",
+      "valve_block_name": "$VALVE$00000316",
+      "valve_attribute_name": "Status",
+      "tolerance": 10.0,
+      "preprocess_cad": true,
+      "sprinkler_K": 80.0,
+      "hydrant_Ad": 0.00172,
+      "hydrant_Ld": 25,
+      "hydrant_B": 1.577,
+      "hydrant_Hak": 2.0,
+      "align_block_name": "Floorbase",
+      "align_attribute_name": "Elevation",
+      "hydrant_block_name": "$TwtSys$00000434",
+      "system_type": "indoor_hydrant",
+      "riser_note_layers": [
+        "DIM_消防"
+      ],
+      "riser_layers": [
+        "VPIPE-消防"
+      ]
+    }
+  }
+}

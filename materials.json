@@ -1,0 +1,350 @@
+{
+  "materials": {
+    "镀锌钢管": {
+      "roughness": 120,
+      "color_diameter_table": {
+        "10": {
+          "nominal": "DN15",
+          "inner": 15.7
+        },
+        "30": {
+          "nominal": "DN20",
+          "inner": 21.3
+        },
+        "40": {
+          "nominal": "DN25",
+          "inner": 27.3
+        },
+        "50": {
+          "nominal": "DN32",
+          "inner": 35.4
+        },
+        "60": {
+          "nominal": "DN40",
+          "inner": 41.3
+        },
+        "90": {
+          "nominal": "DN50",
+          "inner": 52.7
+        },
+        "130": {
+          "nominal": "DN65",
+          "inner": 68.1
+        },
+        "160": {
+          "nominal": "DN80",
+          "inner": 80.9
+        },
+        "200": {
+          "nominal": "DN100",
+          "inner": 106.3
+        },
+        "11": {
+          "nominal": "DN125",
+          "inner": 131.7
+        },
+        "31": {
+          "nominal": "DN150",
+          "inner": 156.1
+        },
+        "53": {
+          "nominal": "DN200",
+          "inner": 207.1
+        },
+        "83": {
+          "nominal": "DN250",
+          "inner": 261.0
+        },
+        "123": {
+          "nominal": "DN300",
+          "inner": 309.9
+        },
+        "163": {
+          "nominal": "DN350",
+          "inner": 341.6
+        },
+        "203": {
+          "nominal": "DN400",
+          "inner": 390.4
+        }
+      }
+    },
+    "加厚钢管": {
+      "roughness": 120,
+      "color_diameter_table": {
+        "10": {
+          "nominal": "DN15",
+          "inner": 14.3
+        },
+        "30": {
+          "nominal": "DN20",
+          "inner": 19.9
+        },
+        "40": {
+          "nominal": "DN25",
+          "inner": 25.7
+        },
+        "50": {
+          "nominal": "DN32",
+          "inner": 34.4
+        },
+        "60": {
+          "nominal": "DN40",
+          "inner": 39.3
+        },
+        "90": {
+          "nominal": "DN50",
+          "inner": 51.3
+        },
+        "130": {
+          "nominal": "DN65",
+          "inner": 67.1
+        },
+        "160": {
+          "nominal": "DN80",
+          "inner": 78.9
+        },
+        "200": {
+          "nominal": "DN100",
+          "inner": 104.3
+        },
+        "11": {
+          "nominal": "DN125",
+          "inner": 128.7
+        },
+        "31": {
+          "nominal": "DN150",
+          "inner": 153.1
+        },
+        "53": {
+          "nominal": "DN200",
+          "inner": 205.1
+        },
+        "83": {
+          "nominal": "DN250",
+          "inner": 257.0
+        },
+        "123": {
+          "nominal": "DN300",
+          "inner": 305.9
+        },
+        "163": {
+          "nominal": "DN350",
+          "inner": 337.6
+        },
+        "203": {
+          "nominal": "DN400",
+          "inner": 386.4
+        }
+      }
+    },
+    "无缝钢管": {
+      "roughness": 120,
+      "color_diameter_table": {
+        "10": {
+          "nominal": "DN15",
+          "inner": 15.3
+        },
+        "30": {
+          "nominal": "DN20",
+          "inner": 20.9
+        },
+        "40": {
+          "nominal": "DN25",
+          "inner": 27.7
+        },
+        "50": {
+          "nominal": "DN32",
+          "inner": 36.4
+        },
+        "60": {
+          "nominal": "DN40",
+          "inner": 41.3
+        },
+        "90": {
+          "nominal": "DN50",
+          "inner": 53.3
+        },
+        "130": {
+          "nominal": "DN65",
+          "inner": 68.1
+        },
+        "160": {
+          "nominal": "DN80",
+          "inner": 80.9
+        },
+        "200": {
+          "nominal": "DN100",
+          "inner": 106.3
+        },
+        "11": {
+          "nominal": "DN125",
+          "inner": 131.7
+        },
+        "31": {
+          "nominal": "DN150",
+          "inner": 159.3
+        },
+        "53": {
+          "nominal": "DN200",
+          "inner": 209.1
+        },
+        "83": {
+          "nominal": "DN250",
+          "inner": 261.0
+        },
+        "123": {
+          "nominal": "DN300",
+          "inner": 309.9
+        },
+        "163": {
+          "nominal": "DN350",
+          "inner": 341.6
+        },
+        "203": {
+          "nominal": "DN400",
+          "inner": 390.4
+        }
+      }
+    },
+    "钢丝网骨架PE管": {
+      "roughness": 140,
+      "color_diameter_table": {
+        "50": {
+          "nominal": "d50",
+          "inner": 41.0
+        },
+        "60": {
+          "nominal": "d63",
+          "inner": 52.0
+        },
+        "90": {
+          "nominal": "d75",
+          "inner": 65.0
+        },
+        "130": {
+          "nominal": "d90",
+          "inner": 89.0
+        },
+        "160": {
+          "nominal": "d110",
+          "inner": 96.0
+        },
+        "200": {
+          "nominal": "d140",
+          "inner": 124.0
+        },
+        "11": {
+          "nominal": "d160",
+          "inner": 142.0
+        },
+        "31": {
+          "nominal": "d225",
+          "inner": 205.0
+        },
+        "53": {
+          "nominal": "d250",
+          "inner": 226.0
+        },
+        "83": {
+          "nominal": "d315",
+          "inner": 289.0
+        },
+        "123": {
+          "nominal": "d355",
+          "inner": 327.0
+        },
+        "163": {
+          "nominal": "d400",
+          "inner": 370.0
+        },
+        "203": {
+          "nominal": "d450",
+          "inner": 418.0
+        }
+      }
+    },
+    "CPVC管": {
+      "roughness": 150,
+      "color_diameter_table": {
+        "40": {
+          "nominal": "DN25",
+          "inner": 28.4
+        },
+        "50": {
+          "nominal": "DN32",
+          "inner": 35.8
+        },
+        "60": {
+          "nominal": "DN40",
+          "inner": 41.0
+        },
+        "90": {
+          "nominal": "DN50",
+          "inner": 51.3
+        },
+        "130": {
+          "nominal": "DN65",
+          "inner": 62.0
+        },
+        "160": {
+          "nominal": "DN80",
+          "inner": 75.7
+        }
+      }
+    },
+    "K9球墨铸铁管": {
+      "roughness": 130,
+      "color_diameter_table": {
+        "60": {
+          "nominal": "DN40",
+          "inner": 47.2
+        },
+        "90": {
+          "nominal": "DN50",
+          "inner": 57.2
+        },
+        "130": {
+          "nominal": "DN65",
+          "inner": 73.2
+        },
+        "160": {
+          "nominal": "DN80",
+          "inner": 89.2
+        },
+        "200": {
+          "nominal": "DN100",
+          "inner": 109.2
+        },
+        "11": {
+          "nominal": "DN125",
+          "inner": 135.0
+        },
+        "31": {
+          "nominal": "DN150",
+          "inner": 161.0
+        },
+        "53": {
+          "nominal": "DN200",
+          "inner": 212.6
+        },
+        "83": {
+          "nominal": "DN250",
+          "inner": 263.0
+        },
+        "123": {
+          "nominal": "DN300",
+          "inner": 313.6
+        },
+        "163": {
+          "nominal": "DN350",
+          "inner": 363.8
+        },
+        "203": {
+          "nominal": "DN400",
+          "inner": 413.4
+        }
+      }
+    }
+  }
+}
