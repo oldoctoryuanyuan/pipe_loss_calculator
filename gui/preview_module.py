@@ -1086,7 +1086,9 @@ class PreviewPage(ttk.Frame):
         if self.canvas is not None:
             self.canvas = None
     
-        # 清空现有标签页
+        # 清空现有标签页（使用 forget 确保 tab 记录也被移除）
+        for tab_id in self.floor_notebook.tabs():
+            self.floor_notebook.forget(tab_id)
         for child in self.floor_notebook.winfo_children():
             child.destroy()
         self.floor_canvases.clear()
@@ -1758,7 +1760,7 @@ class PreviewPage(ttk.Frame):
     # ----------------------------------------------------------------------
     def redraw(self):
         if not self.cad_data_manager.is_loaded:
-            if self.canvas:
+            if self.canvas is not None and self.canvas.winfo_exists():
                 self.canvas.delete("all")
                 self.canvas.create_text(400, 300, text="请先在设置页面加载CAD数据",
                                          fill="white", font=("Arial", 20))
@@ -5404,6 +5406,7 @@ class PreviewPage(ttk.Frame):
         self._sep_cache_key = None
         self.maintenance_zones.clear()
         self._next_zone_id = 0
+        self._cached_grouped_floors_map = None
         self.redraw()
 
     def get_state_for_export(self) -> dict:

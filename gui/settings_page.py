@@ -807,9 +807,11 @@ class SettingsPage(ttk.Frame):
             root = self.winfo_toplevel()
             if hasattr(root, 'main_app'):
                 root.main_app.update_status()
-                root.main_app.reset_calculation_and_preview()
-                if '供水点和用水点' in root.main_app.pages:
-                    root.main_app.pages['供水点和用水点'].refresh_data()
+            root.main_app.reset_calculation_and_preview()
+            if '供水点和用水点' in root.main_app.pages:
+                root.main_app.pages['供水点和用水点'].refresh_data()
+            if '管网预览' in root.main_app.pages:
+                root.main_app.pages['管网预览'].refresh_data()
         else:
             self.loading_status_var.set(f"✗ {message}")
             self.load_status_label.config(foreground="red")
