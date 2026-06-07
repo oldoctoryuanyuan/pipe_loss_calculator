@@ -2438,7 +2438,7 @@ class PreviewPage(ttk.Frame):
                     floor_name = riser.floor_name
                     if floor_name in dup_dict:
                         # 判断当前 riser 对象是否在重复列表中（通过 riser_id）
-                        if any(r.riser_id == riser.riser_id for r in dup_dict[floor_name]):
+                        if any(hasattr(r, 'riser_id') and r.riser_id == riser.riser_id for r in dup_dict[floor_name]):
                             color = "yellow"
                             line_width = max(3, int(5 * self.scale)) * 1.5  # 加粗为1.5倍
 
