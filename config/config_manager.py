@@ -83,13 +83,11 @@ class ConfigManager:
             "flow_unit": "L/s",
             "pressure_unit": "m",
             "pipe_material": "镀锌钢管",
-            "supply_block_name": "supply_node",
-            "supply_attribute_name": "GroupID",
-            "demand_block_name": "demand_node",
-            "demand_attribute_name": "GroupID",
             "valve_block_name": "valve",
             "valve_attribute_name": "Status",
             "tolerance": 10.0,
+            "sprinkler_block_name": "",        # 喷头图块名（喷淋模式，无属性值）
+            "sprinkler_short_pipe_length": 0.1, # 喷头短立管长度(m)
             "sprinkler_K": 80,                # 喷头流量系数
             "hydrant_Ad": 0.00172,            # 水带比阻
             "hydrant_Ld": 25,                 # 水带长度 (m)
