@@ -4,6 +4,7 @@
 import tkinter as tk
 import json
 import os
+import sys
 from tkinter import ttk, simpledialog, messagebox
 import math
 import logging
@@ -12,6 +13,11 @@ from cad_data_manager import HydrantData, ValveData, DemandGroupData, DemandNode
 # from tkinter import messagebox
 
 logger = logging.getLogger(__name__)
+
+def _get_exe_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.dirname(__file__))
 
 class MaintenanceZone:
     """检修区数据类"""
@@ -487,9 +493,7 @@ class PreviewPage(ttk.Frame):
             {"name": "淡玫瑰", "r": 255, "g": 204, "b": 204, "hex": "#FFCCCC"},
             {"name": "淡靛蓝", "r": 179, "g": 179, "b": 255, "hex": "#B3B3FF"}
         ]
-        # 项目根目录（main.py 所在目录）
-        base_dir = os.path.dirname(os.path.dirname(__file__))
-        config_path = os.path.join(base_dir, "floor_pipes_colors.json")
+        config_path = os.path.join(_get_exe_dir(), "floor_pipes_colors.json")
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
@@ -525,9 +529,7 @@ class PreviewPage(ttk.Frame):
                 "name": c["name"],
                 "hex": c["hex"]
             })
-        # 项目根目录（main.py 所在目录）
-        base_dir = os.path.dirname(os.path.dirname(__file__))
-        config_path = os.path.join(base_dir, "floor_pipes_colors.json")
+        config_path = os.path.join(_get_exe_dir(), "floor_pipes_colors.json")
         try:
             with open(config_path, 'w', encoding='utf-8') as f:
                 json.dump({"colors": colors, "cycle": True, "description": "用于整体管网分层着色的颜色表，按楼层标高升序循环使用。"}, f, ensure_ascii=False, indent=4)
@@ -1842,6 +1844,7 @@ class PreviewPage(ttk.Frame):
         
         # 绘制供水点和用水点（现在 self.projected_coords 只包含当前楼层节点，draw_supply_demand 中的过滤会自动生效）
         self.draw_supply_demand()
+        self.draw_sprinklers()
         
         # 绘制节点（可选，节点编号或节点压力勾选时显示）
         if self.show_node_ids.get() or self.show_node_pressure.get():
@@ -1872,53 +1875,83 @@ class PreviewPage(ttk.Frame):
 
     def _draw_global_network(self):
         """绘制整体管网（所有楼层元素 + 罗盘）"""
-        # ===== 楼层分离显示（需求94-111） =====
         if self._separation_applied:
             self._draw_global_network_separated()
             return
-        # ======================================
         canvas = self._current_canvas
         if not canvas or not canvas.winfo_exists():
             return
         canvas.delete("all")
-        
-        # 确保遮挡缓存有效（若无效则预先处理）
-        if not self.occlusion_cache_valid:
-            self.build_occlusion_cache()
-    
+
+        # ----- 投影缓存：视角变化时重算，缩放/平移零计算开销 -----
+        cache_key = (round(self.global_view_angle, 2), round(self.global_view_elevation, 2))
+        cache_miss = getattr(self, '_global_cache_key', None) != cache_key
+
+        if cache_miss:
+            _cx, _cy, _cz = self.compute_network_centroid()
+            _az = math.radians(self.global_view_angle)
+            _el = math.radians(self.global_view_elevation)
+            _ca, _sa = math.cos(_az), math.sin(_az)
+            _ce, _se = math.cos(_el), math.sin(_el)
+
+            def _fast_proj(x, y, z):
+                tx, ty, tz = x-_cx, y-_cy, z-_cz
+                x1 = tx*_ca + ty*_sa
+                y1 = -tx*_sa + ty*_ca
+                return x1, -(y1*_ce + tz*_se)
+
+            def _fast_depth(x, y, z):
+                return (x*_sa - y*_ca)*_se + z*_ce
+
+            _proj = {}
+            _depth = {}
+            for node in self.cad_data_manager.nodes:
+                _proj[node.node_id] = _fast_proj(node.x, node.y, node.z)
+                _depth[node.node_id] = _fast_depth(node.x, node.y, node.z)
+
+            self._global_projected_coords = _proj
+            self._global_projected_depth = _depth
+            self._global_cache_key = cache_key
+            self.occlusion_cache_valid = False
+
+        self.projected_coords = self._global_projected_coords
+        self.projected_depth = self._global_projected_depth
+
+        # 遮挡处理
+        if self.show_occlusion_var.get():
+            if not self.occlusion_cache_valid:
+                self.build_occlusion_cache()
+        else:
+            self.occlusion_breaks.clear()
+            self.occlusion_cache_valid = True
+
         # 构建从 R_ 管道ID到立管对象的映射（用于重复立管高亮）
         self.riser_by_pipe_id = {}
         for riser in self.cad_data_manager.risers:
             self.riser_by_pipe_id[riser.riser_id] = riser  
 
-        # 重新计算所有节点的投影（使用整体管网的等轴测视角）
-        self.projected_coords.clear()
-        for node in self.cad_data_manager.nodes:
-            px, py = self.project_point(node.x, node.y, node.z)
-            self.projected_coords[node.node_id] = (px, py)
-    
         # 绘制管道
         for pipe in self.cad_data_manager.pipes:
             if self.hide_invalid_var.get() and not pipe.is_active:
                 continue
             self.draw_pipe(pipe)
-    
+
         # 绘制阀门
         for valve in self.cad_data_manager.valves:
             self.draw_valve(valve)
-    
+
         # 绘制供水点和用水点
         self.draw_supply_demand()
-    
+        self.draw_sprinklers()
+
         # 节点编号（可选）
         if self.show_node_ids.get() or self.show_node_pressure.get():
             for node in self.cad_data_manager.nodes:
                 self.draw_node(node)
-    
+
         # 消火栓
         for hydrant in self.cad_data_manager.hydrants:
-            if not hasattr(hydrant, 'hydrant_id'):   # 或 isinstance(hydrant, HydrantData)
-                # logger.warning(f"跳过非消火栓对象: {type(hydrant)}")
+            if not hasattr(hydrant, 'hydrant_id'):
                 continue
             self.draw_hydrant(hydrant)
 
@@ -2144,6 +2177,7 @@ class PreviewPage(ttk.Frame):
                             self.projected_coords[nid] = old_val
 
             self.draw_supply_demand()
+            self.draw_sprinklers()
 
             node_connected_floors = {}
             for node in self.cad_data_manager.nodes:
@@ -2804,6 +2838,22 @@ class PreviewPage(ttk.Frame):
                                                  cx + radius, cy + radius,
                                                  fill=fill, outline=outline,
                                                  width=1, tags="demand")
+
+    def draw_sprinklers(self):
+        s_ids = getattr(self.cad_data_manager, 'sprinkler_s_node_ids', [])
+        if not s_ids:
+            return
+        current_nodes = set(self.projected_coords.keys())
+        for nid in s_ids:
+            if nid not in current_nodes:
+                continue
+            wpos = self.projected_coords.get(nid)
+            if not wpos:
+                continue
+            cx, cy = self.world_to_canvas(*wpos)
+            r = max(6, int(6 * self.scale))
+            self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                    outline="white", width=1, tags="sprinkler")
 
     # ----------------------------------------------------------------------
     # 交互事件

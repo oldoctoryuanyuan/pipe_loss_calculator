@@ -461,55 +461,15 @@ class SettingsPage(ttk.Frame):
         block_frame = ttk.LabelFrame(parent, text="图块设置")
         block_frame.pack(fill="x", padx=5, pady=(0, 10))
 
-        # 创建一个网格布局，4列（供水、用水、阀门、对齐点）
+        # 创建一个网格布局，3列（阀门+消火栓、对齐点、喷头）
         block_row = ttk.Frame(block_frame)
         block_row.pack(fill="x", padx=5, pady=5)
-        for i in range(4):
+        for i in range(3):
             block_row.columnconfigure(i, weight=1)
 
-        # 供水点图块列
-        supply_col = ttk.Frame(block_row)
-        supply_col.grid(row=0, column=0, padx=5, sticky="nsew")
-        supply_row1 = ttk.Frame(supply_col)
-        supply_row1.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(supply_row1, text="供水块名:").pack(side="left")
-        self.supply_block_var = tk.StringVar(value=self.current_config.get("supply_block_name", "supply_node"))
-        supply_entry = ttk.Entry(supply_row1, textvariable=self.supply_block_var)
-        supply_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        supply_entry.bind("<FocusOut>",
-                          lambda e: self.on_config_change("supply_block_name", self.supply_block_var.get()))
-        supply_row2 = ttk.Frame(supply_col)
-        supply_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(supply_row2, text="属性字段:").pack(side="left")
-        self.supply_attr_var = tk.StringVar(value=self.current_config.get("supply_attribute_name", "GroupID"))
-        supply_attr_entry = ttk.Entry(supply_row2, textvariable=self.supply_attr_var)
-        supply_attr_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        supply_attr_entry.bind("<FocusOut>",
-                               lambda e: self.on_config_change("supply_attribute_name", self.supply_attr_var.get()))
-
-        # 用水点图块列（同上，替换为 grid）
-        demand_col = ttk.Frame(block_row)
-        demand_col.grid(row=0, column=1, padx=5, sticky="nsew")
-        demand_row1 = ttk.Frame(demand_col)
-        demand_row1.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(demand_row1, text="用水块名:").pack(side="left")
-        self.demand_block_var = tk.StringVar(value=self.current_config.get("demand_block_name", "demand_node"))
-        demand_entry = ttk.Entry(demand_row1, textvariable=self.demand_block_var)
-        demand_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        demand_entry.bind("<FocusOut>",
-                          lambda e: self.on_config_change("demand_block_name", self.demand_block_var.get()))
-        demand_row2 = ttk.Frame(demand_col)
-        demand_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(demand_row2, text="属性字段:").pack(side="left")
-        self.demand_attr_var = tk.StringVar(value=self.current_config.get("demand_attribute_name", "GroupID"))
-        demand_attr_entry = ttk.Entry(demand_row2, textvariable=self.demand_attr_var)
-        demand_attr_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        demand_attr_entry.bind("<FocusOut>",
-                               lambda e: self.on_config_change("demand_attribute_name", self.demand_attr_var.get()))
-
-        # 阀门图块列（同上）
+        # 阀门图块列
         valve_col = ttk.Frame(block_row)
-        valve_col.grid(row=0, column=2, padx=5, sticky="nsew")
+        valve_col.grid(row=0, column=0, padx=5, sticky="nsew")
         valve_row1 = ttk.Frame(valve_col)
         valve_row1.pack(anchor="w", pady=(0, 2), fill="x")
         ttk.Label(valve_row1, text="阀门块名:").pack(side="left")
@@ -520,16 +480,16 @@ class SettingsPage(ttk.Frame):
                          lambda e: self.on_config_change("valve_block_name", self.valve_block_var.get()))
         valve_row2 = ttk.Frame(valve_col)
         valve_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(valve_row2, text="消火栓名:").pack(side="left")      # 标签改为“消火栓名”
+        ttk.Label(valve_row2, text="消火栓名:").pack(side="left")
         self.hydrant_block_var = tk.StringVar(value=self.current_config.get("hydrant_block_name", "hydrant"))
         hydrant_entry = ttk.Entry(valve_row2, textvariable=self.hydrant_block_var)
         hydrant_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
         hydrant_entry.bind("<FocusOut>",
                         lambda e: self.on_config_change("hydrant_block_name", self.hydrant_block_var.get()))
-        
+
         # 对齐点图块列
         align_col = ttk.Frame(block_row)
-        align_col.grid(row=0, column=3, padx=5, sticky="nsew")
+        align_col.grid(row=0, column=1, padx=5, sticky="nsew")
         align_row1 = ttk.Frame(align_col)
         align_row1.pack(anchor="w", pady=(0, 2), fill="x")
         ttk.Label(align_row1, text="对齐点块:").pack(side="left")
@@ -546,6 +506,26 @@ class SettingsPage(ttk.Frame):
         align_attr_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
         align_attr_entry.bind("<FocusOut>",
                               lambda e: self.on_config_change("align_attribute_name", self.align_attr_var.get()))
+
+        # 喷头图块列
+        sprinkler_col = ttk.Frame(block_row)
+        sprinkler_col.grid(row=0, column=2, padx=5, sticky="nsew")
+        s_row1 = ttk.Frame(sprinkler_col)
+        s_row1.pack(anchor="w", pady=(0, 2), fill="x")
+        ttk.Label(s_row1, text="喷头块名:").pack(side="left")
+        self.sprinkler_block_var = tk.StringVar(value=self.current_config.get("sprinkler_block_name", ""))
+        sprinkler_entry = ttk.Entry(s_row1, textvariable=self.sprinkler_block_var)
+        sprinkler_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
+        sprinkler_entry.bind("<FocusOut>",
+                             lambda e: self.on_config_change("sprinkler_block_name", self.sprinkler_block_var.get()))
+        s_row2 = ttk.Frame(sprinkler_col)
+        s_row2.pack(anchor="w", pady=(0, 2), fill="x")
+        ttk.Label(s_row2, text="喷头短立管长度(m):").pack(side="left")
+        self.sprinkler_len_var = tk.StringVar(value=str(self.current_config.get("sprinkler_short_pipe_length", 0.1)))
+        sprinkler_len_entry = ttk.Entry(s_row2, textvariable=self.sprinkler_len_var, width=8)
+        sprinkler_len_entry.pack(side="left", padx=(5, 0))
+        sprinkler_len_entry.bind("<FocusOut>",
+                                 lambda e: self.on_config_change("sprinkler_short_pipe_length", float(self.sprinkler_len_var.get())))
 
         # 计算公式区域
         formula_frame = ttk.LabelFrame(parent, text="计算公式")
@@ -859,13 +839,11 @@ class SettingsPage(ttk.Frame):
         self.material_var.set(material)
         
         # 更新图块设置
-        self.supply_block_var.set(self.current_config.get("supply_block_name", "supply_node"))
-        self.supply_attr_var.set(self.current_config.get("supply_attribute_name", "GroupID"))
-        self.demand_block_var.set(self.current_config.get("demand_block_name", "demand_node"))
-        self.demand_attr_var.set(self.current_config.get("demand_attribute_name", "GroupID"))
         self.valve_block_var.set(self.current_config.get("valve_block_name", "valve"))
         self.align_block_var.set(self.current_config.get("align_block_name", "Floorbase"))
         self.align_attr_var.set(self.current_config.get("align_attribute_name", "Elevation"))
+        self.sprinkler_block_var.set(self.current_config.get("sprinkler_block_name", ""))
+        self.sprinkler_len_var.set(str(self.current_config.get("sprinkler_short_pipe_length", 0.1)))
         
         # 更新计算设置
         self.tolerance_var.set(str(self.current_config.get("tolerance", 10.0)))
