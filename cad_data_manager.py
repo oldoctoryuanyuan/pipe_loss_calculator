@@ -313,6 +313,9 @@ class CADDataManager:
         self.hydrants: List[HydrantData] = []
         self.hydrant_by_id: Dict[str, HydrantData] = {}
 
+        # 喷头短立管_S节点ID
+        self.sprinkler_s_node_ids: List[str] = []
+
         # 立管数据
         self.risers: List[RiserData] = []
         self.riser_by_id: Dict[str, RiserData] = {}
@@ -492,8 +495,7 @@ class CADDataManager:
         pipe_layers = config.get("pipe_layers", [])
         valve_block_name = config.get("valve_block_name", "")
         hydrant_block_name = config.get("hydrant_block_name", "")
-        supply_block_name = config.get("supply_block_name", "")
-        demand_block_name = config.get("demand_block_name", "")
+        sprinkler_block_name = config.get("sprinkler_block_name", "")
         riser_layers = config.get("riser_layers", [])
         riser_note_layers = config.get("riser_note_layers", [])
         align_block_name = config.get("align_block_name", "")
@@ -503,8 +505,7 @@ class CADDataManager:
             'valve_points': [],
             'valve_raw': [],
             'hydrant_raw': [],
-            'supply_raw': [],
-            'demand_raw': [],
+            'sprinkler_raw': [],
             'riser_circles': [],
             'riser_lines': [],
             'riser_texts': [],
@@ -567,10 +568,8 @@ class CADDataManager:
                         result['valve_raw'].append((ins[0], ins[1], ins[2], handle))
                     elif name == hydrant_block_name:
                         result['hydrant_raw'].append((ins[0], ins[1], ins[2], handle))
-                    elif name == supply_block_name:
-                        result['supply_raw'].append((ins[0], ins[1], ins[2], handle))
-                    elif name == demand_block_name:
-                        result['demand_raw'].append((ins[0], ins[1], ins[2], handle))
+                    elif name == sprinkler_block_name:
+                        result['sprinkler_raw'].append((ins[0], ins[1], ins[2], handle))
                     elif name == align_block_name:
                         result['floor_align_blocks'].append({
                             'point': (ins[0], ins[1], ins[2]),
@@ -630,7 +629,7 @@ class CADDataManager:
 
         logger.info(f"单次遍历收集完成: {len(result['pipe_segments'])}管道段, "
                      f"{len(result['valve_raw'])}阀门, {len(result['hydrant_raw'])}消火栓, "
-                     f"{len(result['supply_raw'])}供水点, {len(result['demand_raw'])}用水点, "
+                     f"{len(result['sprinkler_raw'])}喷头块, "
                      f"{len(result['riser_circles'])}立管圆, {len(result['riser_texts'])}标注文本, "
                      f"{len(result['floor_align_blocks'])}对齐点, {len(result['floor_rect_polylines'])}楼层矩形")
         return result
@@ -653,8 +652,7 @@ class CADDataManager:
         pipe_layers = config.get("pipe_layers", [])
         valve_block_name = config.get("valve_block_name", "")
         hydrant_block_name = config.get("hydrant_block_name", "")
-        supply_block_name = config.get("supply_block_name", "")
-        demand_block_name = config.get("demand_block_name", "")
+        sprinkler_block_name = config.get("sprinkler_block_name", "")
         riser_layers = config.get("riser_layers", [])
         riser_note_layers = config.get("riser_note_layers", [])
         align_block_name = config.get("align_block_name", "")
@@ -664,8 +662,7 @@ class CADDataManager:
             'valve_points': [],
             'valve_raw': [],
             'hydrant_raw': [],
-            'supply_raw': [],
-            'demand_raw': [],
+            'sprinkler_raw': [],
             'riser_circles': [],
             'riser_lines': [],
             'riser_texts': [],
@@ -748,10 +745,8 @@ class CADDataManager:
                             result['valve_raw'].append((ins[0], ins[1], ins[2], handle))
                         elif name == hydrant_block_name:
                             result['hydrant_raw'].append((ins[0], ins[1], ins[2], handle))
-                        elif name == supply_block_name:
-                            result['supply_raw'].append((ins[0], ins[1], ins[2], handle))
-                        elif name == demand_block_name:
-                            result['demand_raw'].append((ins[0], ins[1], ins[2], handle))
+                        elif name == sprinkler_block_name:
+                            result['sprinkler_raw'].append((ins[0], ins[1], ins[2], handle))
                         elif name == align_block_name:
                             result['floor_align_blocks'].append({
                                 'point': (ins[0], ins[1], ins[2]),
@@ -821,7 +816,7 @@ class CADDataManager:
 
             logger.info(f"DXF 解析完成: {len(result['pipe_segments'])}管道段, "
                          f"{len(result['valve_raw'])}阀门, {len(result['hydrant_raw'])}消火栓, "
-                         f"{len(result['supply_raw'])}供水点, {len(result['demand_raw'])}用水点, "
+                         f"{len(result['sprinkler_raw'])}喷头块, "
                          f"{len(result['riser_circles'])}立管圆, {len(result['riser_texts'])}标注文本, "
                          f"{len(result['floor_align_blocks'])}对齐点, {len(result['floor_rect_polylines'])}楼层矩形")
             return result
@@ -883,12 +878,6 @@ class CADDataManager:
             if not self.match_nodes_with_pipes(config.get("tolerance", 10.0)):
                 logger.error("匹配节点与管道失败")
                 return False
-
-            if self.progress_callback:
-                self.progress_callback("正在提取供水点和用水点...")
-            logger.info("正在提取供水点和用水点...")
-            if not self.extract_supply_demand_nodes(config, collected=collected):
-                logger.warning("提取供水点和用水点数据失败或未找到")
 
             if self.progress_callback:
                 self.progress_callback("正在提取阀门...")
@@ -968,10 +957,13 @@ class CADDataManager:
             logger.info("正在更新管道类型...")
             self.update_pipe_types(config)
             
-            if self.progress_callback:
-                self.progress_callback("正在处理喷淋短管...")
-            logger.info("正在处理喷淋短管...")
-            self.add_short_pipes_for_sprinklers(config)
+            if config.get("system_type", "indoor_hydrant") == "sprinkler":
+                if self.progress_callback:
+                    self.progress_callback("正在处理喷淋短管...")
+                logger.info("正在处理喷淋短管...")
+                sprinkler_raw = collected.get('sprinkler_raw', []) if collected else []
+                self._sprinkler_raw = sprinkler_raw
+                self.add_short_pipes_for_sprinklers(config, sprinkler_raw)
             
             logger.info(f"数据提取完成: {len(self.pipes)}管道, {len(self.nodes)}节点")
             return True
@@ -983,14 +975,24 @@ class CADDataManager:
             if collected is not None:
                 del collected
 
-    def add_short_pipes_for_sprinklers(self, config: dict) -> bool:
-        """为喷淋模式下的每个用水点节点添加短管（仅当系统类型为喷淋时）"""
+    def add_short_pipes_for_sprinklers(self, config: dict, sprinkler_raw: list = None) -> bool:
+        """为每个喷头块位置添加向上短立管。
+
+        参数:
+            config: 配置字典
+            sprinkler_raw: 喷头块位置列表 [(x,y,z,handle), ...]
+        """
+        if sprinkler_raw is None:
+            sprinkler_raw = getattr(self, '_sprinkler_raw', [])
+        return self._add_short_pipes_from_sprinkler_raw(config, sprinkler_raw)
+
+    def _add_short_pipes_from_sprinkler_raw(self, config: dict, sprinkler_raw: list) -> bool:
+        """根据喷头块位置列表创建向上短立管。"""
         try:
-            system_type = config.get("system_type", "indoor_hydrant")
-            if system_type != "sprinkler":
+            if not sprinkler_raw:
+                logger.info("无喷头块数据，跳过短管添加")
                 return True
 
-            # 获取DN25管径信息
             material = config.get("pipe_material", "镀锌钢管")
             short_dn = "DN25"
             diameter_info = self.material_manager.get_diameter_info(material, short_dn)
@@ -1000,118 +1002,68 @@ class CADDataManager:
             else:
                 inner_diameter_mm = diameter_info["inner"]
 
-            # 收集所有用水点节点ID（去重）
-            nodes_to_process = set()
-            for group in self.demand_groups.values():
-                for demand_node in group.demand_nodes:
-                    nodes_to_process.add(demand_node.node_id)
-
-            if not nodes_to_process:
-                logger.info("没有用水点节点，跳过短管添加")
-                return True
+            short_len_m = config.get("sprinkler_short_pipe_length", 0.1)
+            drawing_unit = config.get("drawing_unit", "毫米")
+            unit_factor = self.unit_factors.get(drawing_unit, 0.001)
+            height_increment = short_len_m / unit_factor if unit_factor > 0 else short_len_m * 1000
+            tolerance = config.get("tolerance", 10.0) * 0.001
 
             new_pipes = []
             new_nodes = []
-            new_demand_mapping = {}
 
-            # 获取单位转换因子
-            drawing_unit = config.get("drawing_unit", "毫米")
-            if drawing_unit == "毫米":
-                height_increment = 100  # 0.1米 = 100毫米
-            elif drawing_unit == "厘米":
-                height_increment = 10   # 0.1米 = 10厘米
-            else:
-                height_increment = 0.1  # 米
-
-            for node_id in nodes_to_process:
-                original_node = self.node_by_id.get(node_id)
-                if not original_node:
+            for (x, y, z_raw, handle) in sprinkler_raw:
+                nearest_node = self._find_nearest_node((x, y, z_raw), tolerance)
+                if not nearest_node:
+                    logger.debug(f"喷头块({x},{y},{z_raw})附近无管道节点，跳过")
                     continue
 
+                node_id = nearest_node.node_id
                 short_node_id = f"{node_id}_S"
 
-                # 更严格的去重检查：同时检查 node_by_id 和 nodes 列表
                 if short_node_id in self.node_by_id:
-                    # 已存在，只记录映射
-                    new_demand_mapping[node_id] = short_node_id
                     continue
                 if any(n.node_id == short_node_id for n in self.nodes):
                     continue
 
-                # 创建新节点
                 new_node = NodeData(
                     node_id=short_node_id,
-                    x=original_node.x,
-                    y=original_node.y,
-                    z=original_node.z + height_increment,
-                    cad_key=f"{original_node.x:.6f},{original_node.y:.6f},{original_node.z+height_increment:.6f}",
+                    x=nearest_node.x,
+                    y=nearest_node.y,
+                    z=nearest_node.z + height_increment,
+                    cad_key=f"{nearest_node.x:.6f},{nearest_node.y:.6f},{nearest_node.z+height_increment:.6f}",
                     connected_pipes=[]
                 )
-                # 立即添加到索引和列表
                 self.nodes.append(new_node)
                 self.node_by_id[new_node.node_id] = new_node
-                new_nodes.append(new_node)   # 如果你后面还要用到 new_nodes，可以保留，但上面已经添加了
+                new_nodes.append(new_node)
 
-                # 创建短管
                 pipe_id = f"SP_{node_id}"
                 new_pipe = PipeData(
                     pipe_id=pipe_id,
                     start_node_id=node_id,
                     end_node_id=short_node_id,
-                    start_point=(original_node.x, original_node.y, original_node.z),
+                    start_point=(nearest_node.x, nearest_node.y, nearest_node.z),
                     end_point=(new_node.x, new_node.y, new_node.z),
-                    length=0.1,
+                    length=short_len_m,
                     inner_diameter=inner_diameter_mm,
                     nominal_diameter=short_dn,
                     material=material,
                     status="开",
-                    pipe_type="支管" if system_type == "hydrant" else "-"
+                    pipe_type="-"
                 )
                 new_pipes.append(new_pipe)
 
-                # 更新原节点连接管道
-                if pipe_id not in original_node.connected_pipes:
-                    original_node.connected_pipes.append(pipe_id)
-
-                # 新节点连接管道
+                if pipe_id not in nearest_node.connected_pipes:
+                    nearest_node.connected_pipes.append(pipe_id)
                 new_node.connected_pipes.append(pipe_id)
 
-                new_demand_mapping[node_id] = short_node_id
+                self.sprinkler_s_node_ids.append(short_node_id)
 
-            # 将新节点和管道添加到数据中
-            self.nodes.extend(new_nodes)
             self.pipes.extend(new_pipes)
-            for node in new_nodes:
-                self.node_by_id[node.node_id] = node
             for pipe in new_pipes:
                 self.pipe_by_id[pipe.pipe_id] = pipe
 
-            # 更新用水点组：将需求转移到新节点
-            for group in self.demand_groups.values():
-                for demand_node in group.demand_nodes:
-                    if demand_node.node_id in new_demand_mapping:
-                        demand_node.node_id = new_demand_mapping[demand_node.node_id]
-
-            # 修正节点类型设置
-            for node_id, new_id in new_demand_mapping.items():
-                original_node = self.node_by_id.get(node_id)
-                new_node = self.node_by_id.get(new_id)
-                if original_node and new_node:
-                    original_type = original_node.node_type
-                    if original_type.startswith("用水点"):
-                        original_node.node_type = "普通"
-                    new_node.node_type = original_type
-
-            logger.info(f"为 {len(new_demand_mapping)} 个用水点添加了喷淋短管")
-            # 确保节点ID唯一性
-            unique_nodes = {}
-            for node in self.nodes:
-                if node.node_id in unique_nodes:
-                    logger.warning(f"发现重复节点ID: {node.node_id}，移除重复")
-                else:
-                    unique_nodes[node.node_id] = node
-            self.nodes = list(unique_nodes.values())
-            self.node_by_id = unique_nodes
+            logger.info(f"为 {len(new_nodes)} 个喷头块添加了喷淋短管")
             return True
 
         except Exception as e:
@@ -1608,177 +1560,10 @@ class CADDataManager:
         return closest_node
 
     def extract_supply_demand_nodes(self, config: dict, collected: dict = None) -> bool:
-        """
-        提取供水点和用水点图块数据
-        """
-        try:
-            supply_block_name = config.get("supply_block_name", "supply_node")
-            supply_attribute_name = config.get("supply_attribute_name", "GroupID")
-            demand_block_name = config.get("demand_block_name", "demand_node")
-            demand_attribute_name = config.get("demand_attribute_name", "GroupID")
-            tolerance = config.get("tolerance", 10.0) * 0.001
-
-            self.supply_nodes.clear()
-            self.demand_groups.clear()
-
-            supply_dict = {}
-            demand_dict = {}
-
-            # 预收集路径
-            if collected is not None:
-                for (x, y, z, handle) in collected['supply_raw']:
-                    attribute_value = "default_supply"
-                    found_value = self.get_block_attributes_direct(handle, supply_attribute_name)
-                    if found_value:
-                        attribute_value = found_value
-                    group_id = attribute_value if attribute_value != "default_supply" else "default_supply"
-                    nearest_node = self._find_nearest_node((x, y, z), tolerance)
-                    if nearest_node:
-                        if group_id not in supply_dict:
-                            supply_dict[group_id] = SupplyNodeData(
-                                group_id=group_id, node_ids=[],
-                                pressure=0.0, total_flow=0.0,
-                                attribute_value=attribute_value, cad_handle=handle
-                            )
-                        supply_dict[group_id].node_ids.append(nearest_node.node_id)
-                        nearest_node.node_type = f"供水点-{group_id}"
-
-                for (x, y, z, handle) in collected['demand_raw']:
-                    attribute_value = "1#"
-                    found_value = self.get_block_attributes_direct(handle, demand_attribute_name)
-                    if found_value:
-                        attribute_value = found_value
-                    group_id = attribute_value if attribute_value != "1#" else "1#"
-                    nearest_node = self._find_nearest_node((x, y, z), tolerance)
-                    if nearest_node:
-                        if group_id not in demand_dict:
-                            demand_dict[group_id] = DemandGroupData(
-                                group_id=group_id, group_name=group_id,
-                                is_selected=False, total_flow=0.0, demand_nodes=[]
-                            )
-                        demand_node = DemandNodeData(
-                            node_id=nearest_node.node_id, status="关",
-                            flow=0.0, pressure=0.0,
-                            attribute_value=attribute_value, cad_handle=handle
-                        )
-                        demand_dict[group_id].demand_nodes.append(demand_node)
-                        nearest_node.node_type = f"用水点-{group_id}"
-
-                self.supply_nodes = list(supply_dict.values())
-                self.demand_groups = demand_dict
-                logger.info(f"提取了(预收集) {len(self.supply_nodes)} 个供水点组，{len(self.demand_groups)} 个用水点组")
-                return True
-
-            # 回退：从 CAD 直接提取
-            if not CAD_AVAILABLE or not self.acad:
-                logger.warning("CAD未连接，无法提取图块")
-                return True
-
-            model_space = self.acad.doc.ModelSpace
-
-            for entity in model_space:
-                try:
-                    _ = entity.ObjectName
-                except:
-                    continue
-                try:
-                    if entity.ObjectName != "AcDbBlockReference":
-                        continue
-
-                    block_name = entity.Name
-                    insertion_point = (
-                        entity.InsertionPoint[0], entity.InsertionPoint[1], entity.InsertionPoint[2])
-                    block_handle = entity.Handle if hasattr(entity, 'Handle') else ""
-
-                    if block_name == supply_block_name:
-                        attribute_value = "default_supply"
-                        found_value = None
-
-                        found_value = self.get_block_attributes_direct(entity, supply_attribute_name)
-
-                        if not found_value:
-                            try:
-                                if hasattr(entity, 'GetAttributes'):
-                                    attrs = entity.GetAttributes()
-                                    if attrs:
-                                        for attr in attrs:
-                                            for attr_name in dir(attr):
-                                                if not attr_name.startswith('_'):
-                                                    try:
-                                                        attr_val = getattr(attr, attr_name)
-                                                        if attr_name in ['TextString', 'Text', 'Value']:
-                                                            for tag_name in ['TagString', 'Tag']:
-                                                                if hasattr(attr, tag_name):
-                                                                    tag = getattr(attr, tag_name)
-                                                                    if str(tag).strip().upper() == supply_attribute_name.upper():
-                                                                        found_value = str(attr_val).strip()
-                                                                        break
-                                                    except:
-                                                        continue
-                                            if found_value:
-                                                break
-                            except:
-                                pass
-
-                        if found_value:
-                            attribute_value = found_value
-                            logger.info(f"成功读取供水点属性: {attribute_value}")
-
-                        group_id = attribute_value if attribute_value != "default_supply" else "default_supply"
-
-                        nearest_node = self._find_nearest_node(insertion_point, tolerance)
-                        if nearest_node:
-                            if group_id not in supply_dict:
-                                supply_dict[group_id] = SupplyNodeData(
-                                    group_id=group_id, node_ids=[],
-                                    pressure=0.0, total_flow=0.0,
-                                    attribute_value=attribute_value, cad_handle=block_handle
-                                )
-                            supply_dict[group_id].node_ids.append(nearest_node.node_id)
-                            nearest_node.node_type = f"供水点-{group_id}"
-                            logger.info(f"供水点 {group_id} 匹配到节点 {nearest_node.node_id}")
-
-                    elif block_name == demand_block_name:
-                        attribute_value = "1#"
-                        found_value = None
-
-                        found_value = self.get_block_attributes_direct(entity, demand_attribute_name)
-
-                        if found_value:
-                            attribute_value = found_value
-                            logger.info(f"成功读取用水点属性: {attribute_value}")
-
-                        group_id = attribute_value if attribute_value != "1#" else "1#"
-
-                        nearest_node = self._find_nearest_node(insertion_point, tolerance)
-                        if nearest_node:
-                            if group_id not in demand_dict:
-                                demand_dict[group_id] = DemandGroupData(
-                                    group_id=group_id, group_name=group_id,
-                                    is_selected=False, total_flow=0.0, demand_nodes=[]
-                                )
-                            demand_node = DemandNodeData(
-                                node_id=nearest_node.node_id, status="关",
-                                flow=0.0, pressure=0.0,
-                                attribute_value=attribute_value, cad_handle=block_handle
-                            )
-                            demand_dict[group_id].demand_nodes.append(demand_node)
-                            nearest_node.node_type = f"用水点-{group_id}"
-                            logger.info(f"用水点 {group_id} 匹配到节点 {nearest_node.node_id}")
-
-                except Exception as e:
-                    logger.debug(f"处理图块时出错: {e}")
-                    continue
-
-            self.supply_nodes = list(supply_dict.values())
-            self.demand_groups = demand_dict
-
-            logger.info(f"提取了 {len(self.supply_nodes)} 个供水点组，{len(self.demand_groups)} 个用水点组")
-            return True
-
-        except Exception as e:
-            logger.error(f"提取供水点和用水点数据失败: {e}")
-            return False
+        """已废弃：供/用水点不再从 CAD 读取。保留空壳避免外部调用报错。"""
+        self.supply_nodes.clear()
+        self.demand_groups.clear()
+        return True
 
     def get_block_attributes_direct(self, entity_or_handle, attribute_name):
         """直接使用COM接口获取图块属性，接受 entity 或 handle 字符串"""
@@ -3377,6 +3162,7 @@ class CADDataManager:
         self.cad_file_path = None
         self.current_project_dir = None
         self.default_color256_diameter = None
+        self.sprinkler_s_node_ids.clear()
         logger.info("所有数据已完全清空（含立管、楼层）")
 
     def get_summary(self) -> dict:
