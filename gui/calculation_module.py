@@ -887,6 +887,16 @@ class CalculationPage(ttk.Frame):
         else:
             calc_type = "sprinkler"
 
+        # 构建 per-node K 值映射
+        k_value_map: Dict[str, float] = {}
+        default_K = float(K)
+        for node_id, k_val in self.cad_data_manager.sprinkler_k_map.items():
+            k_value_map[node_id] = k_val
+        for group in self.cad_data_manager.demand_groups.values():
+            for demand_node in group.demand_nodes:
+                if demand_node.node_id not in k_value_map:
+                    k_value_map[demand_node.node_id] = default_K
+
         # 导入求解器
         from core.pressure_driven_solver import PressureDrivenSolver
 
@@ -902,6 +912,7 @@ class CalculationPage(ttk.Frame):
             hydrant_Hak=Hak,
             progress_callback=self._update_solver_progress
         )
+        solver.k_value_map = k_value_map
 
         def thread_func():
             success, results, message = solver.solve()
@@ -1670,23 +1681,41 @@ class CalculationPage(ttk.Frame):
         modified = False
         for pipe_res in pipe_results:
             pipe_id = pipe_res.get("pipe_id", "")
-            if not pipe_id.startswith("P_"):
+            # 跳过消火栓支管（始终DN65）
+            if pipe_id.startswith("B_"):
+                continue
+            # 只处理P_、SP_、R_、L_开头管道
+            if not (pipe_id.startswith("P_") or pipe_id.startswith("SP_") or
+                    pipe_id.startswith("R_") or pipe_id.startswith("L_")):
                 continue
             velocity = pipe_res.get("velocity_mps", 0.0)
             if (high and velocity > max_v) or (not high and velocity < min_v):
                 pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
                 if not pipe:
                     continue
-                # 跳过支管（消火栓模式下）
-                if pipe.pipe_type == "支管":
-                    continue
                 current_dn = pipe.nominal_diameter
                 direction = "up" if high else "down"
-                # 使用管道自身的管材
                 material = pipe.material
                 new_dn = self.material_manager.get_next_diameter(
                     current_dn, direction, material, dia_system_type
                 )
+                # 消火栓模式管径保护
+                if raw_system_type in ("indoor_hydrant", "outdoor_hydrant"):
+                    dn_num = 0
+                    if current_dn.startswith("DN"):
+                        try: dn_num = int(current_dn[2:])
+                        except: pass
+                    if dn_num == 65:
+                        continue  # 所有DN65跳过
+                    if pipe_id.startswith("R_") or pipe_id.startswith("L_"):
+                        if dn_num < 100:
+                            continue  # R_/L_只处理DN100+
+                        if not high:
+                            try:
+                                if new_dn.startswith("DN") and int(new_dn[2:]) < 100:
+                                    continue  # 不下调到DN100以下
+                            except:
+                                pass
                 if new_dn != current_dn:
                     new_info = self.material_manager.get_diameter_info(material, new_dn)
                     pipe.nominal_diameter = new_dn

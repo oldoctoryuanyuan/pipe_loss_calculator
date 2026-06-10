@@ -1106,7 +1106,6 @@ class PreviewPage(ttk.Frame):
             self.canvas = canvas
             self.current_floor_name = "单层"
             self._bind_canvas_events(canvas)
-            return
     
         # 获取分组映射
         grouped = getattr(self.cad_data_manager, 'grouped_floors_map', {})
@@ -1174,15 +1173,18 @@ class PreviewPage(ttk.Frame):
 
     def _on_floor_changed(self, event=None):
         """楼层切换时更新当前画布引用并重绘，恢复该楼层视图状态"""
-        # 保存当前楼层视图状态（如果存在当前楼层）
-        if self._current_canvas is not None and self.current_floor_name is not None:
-            self.floor_view_state[self.current_floor_name] = (
-                self.scale, self.translate_x, self.translate_y
-            )
-    
         tab_id = self.floor_notebook.select()
         if not tab_id:
             return
+        tab_text = self.floor_notebook.tab(tab_id, "text")
+
+        # 仅当切换到不同标签页时才保存上一个楼层的视图状态
+        if (self._current_canvas is not None and self.current_floor_name is not None
+            and self.current_floor_name != tab_text):
+            self.floor_view_state[self.current_floor_name] = (
+                self.scale, self.translate_x, self.translate_y
+            )
+
         frame = self.floor_notebook.nametowidget(tab_id)
         new_canvas = None
         for child in frame.winfo_children():
@@ -1203,7 +1205,6 @@ class PreviewPage(ttk.Frame):
     
         self._current_canvas = new_canvas
         self.canvas = new_canvas
-        tab_text = self.floor_notebook.tab(tab_id, "text")
         self.current_floor_name = tab_text
 
         # 对于分组标签页，设置实际显示的第一个楼层
@@ -1229,11 +1230,35 @@ class PreviewPage(ttk.Frame):
             self.scale, self.translate_x, self.translate_y = self.floor_view_state[tab_text]
         else:
             self.update_projection()
+            if self.current_view_mode == "floor":
+                self._filter_projected_to_current_floor()
             self.auto_center()
+            self.floor_view_state[self.current_floor_name] = (self.scale, self.translate_x, self.translate_y)
     
         # 更新投影并重绘（不重置视图）
         self.update_projection()
         self.redraw()
+
+    def _filter_projected_to_current_floor(self):
+        """过滤 projected_coords 只保留当前楼层节点，使 auto_center 以该楼层范围居中。"""
+        canvas = self._current_canvas
+        display_floor = self.current_floor_name
+        if canvas and hasattr(canvas, 'actual_floors'):
+            display_floor = canvas.current_display_floor
+        if display_floor == "单层":
+            return
+        floor = self.cad_data_manager.floor_by_name.get(display_floor)
+        if not floor:
+            return
+        keep_ids = set()
+        for pipe in floor.pipes:
+            keep_ids.add(pipe.start_node_id)
+            keep_ids.add(pipe.end_node_id)
+        for node in floor.nodes:
+            keep_ids.add(node.node_id)
+        for nid in list(self.projected_coords.keys()):
+            if nid not in keep_ids:
+                del self.projected_coords[nid]
 
     def _bind_canvas_events(self, canvas):
         """为指定画布绑定所有交互事件"""
@@ -2855,6 +2880,177 @@ class PreviewPage(ttk.Frame):
             self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
                                     outline="white", width=1, tags="sprinkler")
 
+    def modify_sprinkler(self, sp_pipes=None):
+        """打开喷头修改对话框"""
+        if sp_pipes is None:
+            sp_pipes = [self.cad_data_manager.pipe_by_id[pid]
+                        for pid in self.selected_pipes
+                        if pid.startswith("SP_") and pid in self.cad_data_manager.pipe_by_id]
+        if not sp_pipes:
+            self.show_temp_message("未选中任何喷头短管", 2000)
+            return
+        root = self.winfo_toplevel()
+        self.SprinklerModifyDialog(root, self, sp_pipes)
+
+    # ==================== 喷头修改对话框 ====================
+    class SprinklerModifyDialog:
+        def __init__(self, parent, preview, sp_pipes):
+            self.preview = preview
+            self.cad = preview.cad_data_manager
+            self.config = preview.config_manager
+            self.mm = preview.material_manager
+            self.sp_pipes = sp_pipes
+            self._dn_manual = False
+
+            first_pipe = sp_pipes[0]
+            first_node_id = first_pipe.start_node_id
+            self.default_K = self.cad.sprinkler_k_map.get(
+                first_node_id, self.config.get_live_config().get("sprinkler_K", 80))
+            self.default_dn = first_pipe.nominal_diameter
+            self.default_len = first_pipe.length
+            self.default_up = (first_pipe.end_point[2] > first_pipe.start_point[2])
+
+            params_differ = False
+            for pipe in sp_pipes[1:]:
+                if pipe.nominal_diameter != self.default_dn or abs(pipe.length - self.default_len) > 0.001:
+                    params_differ = True
+                    break
+
+            self.dialog = tk.Toplevel(parent)
+            self.dialog.title("修改喷头和短管")
+            self.dialog.resizable(False, False)
+            self.dialog.transient(parent)
+
+            kf = ttk.Frame(self.dialog)
+            kf.pack(fill="x", padx=10, pady=(10, 5))
+            ttk.Label(kf, text="K值:").pack(side="left")
+            k_values = [80, 115, 161, 200, 202, 242, 320, 363]
+            k_strs = [str(v) for v in k_values]
+            self.k_var = tk.StringVar(value=str(self.default_K))
+            self.k_combo = ttk.Combobox(kf, textvariable=self.k_var, values=k_strs, width=10, state='normal')
+            self.k_combo.pack(side="left", padx=(5, 0))
+            self.k_var.trace('w', lambda *a: self._on_k_changed())
+
+            df = ttk.Frame(self.dialog)
+            df.pack(fill="x", padx=10, pady=(0, 5))
+            ttk.Label(df, text="短立管管径:").pack(side="left")
+            dn_values = self._get_sprinkler_dn_list()
+            self.dn_var = tk.StringVar(value=self.default_dn)
+            self.dn_combo = ttk.Combobox(df, textvariable=self.dn_var, values=dn_values, width=8, state='readonly')
+            self.dn_combo.pack(side="left", padx=(5, 0))
+            self.dn_combo.bind("<<ComboboxSelected>>", lambda e: setattr(self, '_dn_manual', True))
+
+            lf = ttk.Frame(self.dialog)
+            lf.pack(fill="x", padx=10, pady=(0, 5))
+            ttk.Label(lf, text="短立管长度(m):").pack(side="left")
+            self.len_var = tk.StringVar(value=str(self.default_len))
+            self.len_entry = ttk.Entry(lf, textvariable=self.len_var, width=8)
+            self.len_entry.pack(side="left", padx=(5, 0))
+
+            dirf = ttk.Frame(self.dialog)
+            dirf.pack(fill="x", padx=10, pady=(0, 5))
+            ttk.Label(dirf, text="方向:").pack(side="left")
+            self.dir_var = tk.IntVar(value=1 if self.default_up else 0)
+            ttk.Radiobutton(dirf, text="上喷", variable=self.dir_var, value=1).pack(side="left", padx=(10, 0))
+            ttk.Radiobutton(dirf, text="下喷", variable=self.dir_var, value=0).pack(side="left", padx=(10, 0))
+
+            if params_differ:
+                warn = ttk.Label(self.dialog, text="⚠ 选中的喷头参数不一致，将以第一根喷头参数显示",
+                                 foreground="red")
+                warn.pack(pady=(0, 5))
+
+            bf = ttk.Frame(self.dialog)
+            bf.pack(fill="x", padx=10, pady=(5, 10))
+            ttk.Button(bf, text="确定", command=self._on_confirm).pack(side="left", padx=(30, 10))
+            ttk.Button(bf, text="复原", command=self._on_reset).pack(side="left", padx=(0, 10))
+            ttk.Button(bf, text="取消", command=self.dialog.destroy).pack(side="left")
+
+            self.dialog.update_idletasks()
+            w = self.dialog.winfo_width()
+            h = self.dialog.winfo_height()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+            self.dialog.geometry(f"+{x}+{y}")
+
+        def _get_sprinkler_dn_list(self):
+            material = self.config.get_live_config().get("pipe_material", "镀锌钢管")
+            all_dn = self.mm.get_sorted_diameters(material, "sprinkler")
+            result = []
+            for dn in all_dn:
+                if dn.startswith("DN"):
+                    try:
+                        if int(dn[2:]) <= 150:
+                            result.append(dn)
+                    except:
+                        pass
+            return result
+
+        def _on_k_changed(self):
+            if self._dn_manual:
+                return
+            try:
+                K = float(self.k_var.get())
+                new_dn = self.mm.get_sprinkler_dn(K)
+                dn_values = self._get_sprinkler_dn_list()
+                if new_dn in dn_values:
+                    self.dn_var.set(new_dn)
+                self._dn_manual = False
+            except:
+                pass
+
+        def _on_reset(self):
+            config = self.config.get_live_config()
+            default_K = config.get("sprinkler_K", 80)
+            self.k_var.set(str(default_K))
+            self.len_var.set("0.1")
+            self.dir_var.set(1)
+            self._dn_manual = False
+            self._on_k_changed()
+
+        def _on_confirm(self):
+            try:
+                K = float(self.k_var.get())
+                new_len = float(self.len_var.get())
+            except ValueError:
+                self.preview.show_temp_message("输入值非法", 2000)
+                return
+            new_dn = self.dn_var.get()
+            is_up = self.dir_var.get() == 1
+            config = self.config.get_live_config()
+            drawing_unit = config.get("drawing_unit", "毫米")
+            unit_factor = self.cad.unit_factors.get(drawing_unit, 0.001)
+
+            for pipe in self.sp_pipes:
+                material = pipe.material
+                pipe.nominal_diameter = new_dn
+                pipe.length = new_len
+                info = self.mm.get_diameter_info(material, new_dn)
+                pipe.inner_diameter = info.get("inner", pipe.inner_diameter)
+
+                self.cad.manual_dn_pipes.add(pipe.pipe_id)
+
+                base_node = self.cad.node_by_id.get(pipe.start_node_id)
+                s_node = self.cad.node_by_id.get(pipe.end_node_id)
+                if base_node and s_node:
+                    height = new_len / unit_factor if unit_factor > 0 else new_len * 1000
+                    if is_up:
+                        s_node.z = base_node.z + height
+                    else:
+                        s_node.z = base_node.z - height
+                    pipe.end_point = (s_node.x, s_node.y, s_node.z)
+                    pipe.start_point = (base_node.x, base_node.y, base_node.z)
+
+                self.cad.sprinkler_k_map[pipe.start_node_id] = K
+                self.cad.sprinkler_k_overrides.add(pipe.start_node_id)
+
+            self.preview.redraw()
+            self.preview.show_temp_message(f"已修改 {len(self.sp_pipes)} 根喷头短管", 2000)
+            self.dialog.destroy()
+
     # ----------------------------------------------------------------------
     # 交互事件
     # ----------------------------------------------------------------------
@@ -3231,6 +3427,12 @@ class PreviewPage(ttk.Frame):
                                             command=lambda nid=associated_node.node_id, g=gid: self.add_node_to_demand_group(nid, g))
                     menu.add_cascade(label="加入用水点组", menu=submenu)
 
+        # 喷头短管右键菜单
+        if pipe.pipe_id.startswith("SP_"):
+            menu.add_separator()
+            menu.add_command(label="修改喷头和短管",
+                             command=lambda p=pipe: self.modify_sprinkler([p]))
+
         # ===== 检修区操作 =====
         menu.add_separator()
         zone = self._find_maintenance_zone_for_pipe(pipe.pipe_id)
@@ -3283,6 +3485,12 @@ class PreviewPage(ttk.Frame):
             menu.add_command(label="删除用水点（选择集）", command=self.delete_demand_points_selected)
             menu.add_command(label="用水点编组（选择集）", command=self.group_demand_points_selected)
             menu.add_command(label="用水点移出组（选择集）", command=self.ungroup_demand_points_selected)
+
+        # 喷头短管选择集菜单
+        if any(pid.startswith("SP_") for pid in self.selected_pipes
+               if pid in self.cad_data_manager.pipe_by_id):
+            menu.add_separator()
+            menu.add_command(label="修改喷头和短管", command=self.modify_sprinkler)
 
     def group_selected_hydrants(self):
         """将选择集中与消火栓关联的节点编成一个新的用水点组"""

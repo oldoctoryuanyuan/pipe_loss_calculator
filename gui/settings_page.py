@@ -518,14 +518,7 @@ class SettingsPage(ttk.Frame):
         sprinkler_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
         sprinkler_entry.bind("<FocusOut>",
                              lambda e: self.on_config_change("sprinkler_block_name", self.sprinkler_block_var.get()))
-        s_row2 = ttk.Frame(sprinkler_col)
-        s_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(s_row2, text="喷头短立管长度(m):").pack(side="left")
-        self.sprinkler_len_var = tk.StringVar(value=str(self.current_config.get("sprinkler_short_pipe_length", 0.1)))
-        sprinkler_len_entry = ttk.Entry(s_row2, textvariable=self.sprinkler_len_var, width=8)
-        sprinkler_len_entry.pack(side="left", padx=(5, 0))
-        sprinkler_len_entry.bind("<FocusOut>",
-                                 lambda e: self.on_config_change("sprinkler_short_pipe_length", float(self.sprinkler_len_var.get())))
+
 
         # 计算公式区域
         formula_frame = ttk.LabelFrame(parent, text="计算公式")
@@ -566,7 +559,7 @@ class SettingsPage(ttk.Frame):
         self.min_velocity_var = tk.StringVar(value=str(self.current_config.get("min_velocity", 1.0)))
         
         # 喷头K输入框改为Combobox，可输入可选择
-        k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161], width=8, state='normal')
+        k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161, 200, 202, 242, 320, 363], width=8, state='normal')
         k_combo.grid(row=1, column=0, padx=5, pady=2)
 
         # 其他输入框保持Entry
@@ -843,7 +836,7 @@ class SettingsPage(ttk.Frame):
         self.align_block_var.set(self.current_config.get("align_block_name", "Floorbase"))
         self.align_attr_var.set(self.current_config.get("align_attribute_name", "Elevation"))
         self.sprinkler_block_var.set(self.current_config.get("sprinkler_block_name", ""))
-        self.sprinkler_len_var.set(str(self.current_config.get("sprinkler_short_pipe_length", 0.1)))
+
         
         # 更新计算设置
         self.tolerance_var.set(str(self.current_config.get("tolerance", 10.0)))
