@@ -32,6 +32,7 @@ class PressureDrivenSolver:
         self.mode = mode
         # 强制转换为浮点数（防止字符串传入）
         self.sprinkler_K = float(sprinkler_K)
+        self.k_value_map: Dict[str, float] = {}  # node_id→K，per-node覆盖
         self.Ad = float(hydrant_Ad)
         self.Ld = float(hydrant_Ld)
         self.B = float(hydrant_B)
@@ -297,7 +298,7 @@ class PressureDrivenSolver:
             new_demands = {}
             for node_id in selected_node_ids:
                 pressure = self._get_node_pressure(results, node_id)
-                q_computed = self._compute_flow(pressure)
+                q_computed = self._compute_flow(pressure, node_id)
                 # 松弛：新需求 = 松弛因子 * 计算值 + (1-松弛因子) * 旧值
                 # 为避免振荡，采用0.5的松弛
                 prev_q = prev_demands.get(node_id, 0.0)
@@ -318,7 +319,7 @@ class PressureDrivenSolver:
             for node_id in selected_node_ids:
                 pressure = self._get_node_pressure(results, node_id)
                 debug_data["node_pressures"][node_id] = float(pressure)
-                debug_data["computed_flows"][node_id] = float(self._compute_flow(pressure))
+                debug_data["computed_flows"][node_id] = float(self._compute_flow(pressure, node_id))
             with open(debug_file, 'w') as f:
                 json.dump(debug_data, f, indent=2)
             logger.info(f"迭代 {iter_num} 调试数据已保存: {debug_file}")
@@ -367,12 +368,16 @@ class PressureDrivenSolver:
                 return nr["pressure_m"]
         return 0.0
 
-    def _compute_flow(self, pressure: float) -> float:
-        """根据压力和类型计算流量 (L/s)"""
-        pressure = float(pressure)   # 确保为浮点数
+    def _compute_flow(self, pressure: float, node_id: str = None) -> float:
+        """根据压力和类型计算流量 (L/s)，node_id 用于取 per-node K 值"""
+        pressure = float(pressure)
         if self.calc_type == 'sprinkler':
             if pressure <= 0:
                 return 0.0
+            if node_id and node_id in self.k_value_map:
+                k = self.k_value_map[node_id]
+                C = k / 60.0 * np.sqrt(0.1)
+                return C * np.sqrt(pressure)
             return self.C * np.sqrt(pressure)
         else:  # hydrant
             effective_pressure = pressure - self.Hak
