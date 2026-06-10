@@ -316,6 +316,11 @@ class CADDataManager:
         # 喷头短立管_S节点ID
         self.sprinkler_s_node_ids: List[str] = []
 
+        # K值/DN手动修改追踪
+        self.sprinkler_k_map: Dict[str, float] = {}
+        self.sprinkler_k_overrides: Set[str] = set()
+        self.manual_dn_pipes: Set[str] = set()
+
         # 立管数据
         self.risers: List[RiserData] = []
         self.riser_by_id: Dict[str, RiserData] = {}
@@ -986,6 +991,7 @@ class CADDataManager:
             sprinkler_raw = getattr(self, '_sprinkler_raw', [])
         return self._add_short_pipes_from_sprinkler_raw(config, sprinkler_raw)
 
+
     def _add_short_pipes_from_sprinkler_raw(self, config: dict, sprinkler_raw: list) -> bool:
         """根据喷头块位置列表创建向上短立管。"""
         try:
@@ -994,7 +1000,9 @@ class CADDataManager:
                 return True
 
             material = config.get("pipe_material", "镀锌钢管")
-            short_dn = "DN25"
+            short_len_m = 0.1
+            K = config.get("sprinkler_K", 80)
+            short_dn = self.material_manager.get_sprinkler_dn(K)
             diameter_info = self.material_manager.get_diameter_info(material, short_dn)
             if diameter_info.get("inner", 0) == 0:
                 logger.warning(f"无法为喷淋短管找到内径（{short_dn}），使用默认值27.3mm")
@@ -1002,7 +1010,6 @@ class CADDataManager:
             else:
                 inner_diameter_mm = diameter_info["inner"]
 
-            short_len_m = config.get("sprinkler_short_pipe_length", 0.1)
             drawing_unit = config.get("drawing_unit", "毫米")
             unit_factor = self.unit_factors.get(drawing_unit, 0.001)
             height_increment = short_len_m / unit_factor if unit_factor > 0 else short_len_m * 1000
@@ -1058,6 +1065,7 @@ class CADDataManager:
                 new_node.connected_pipes.append(pipe_id)
 
                 self.sprinkler_s_node_ids.append(short_node_id)
+                self.sprinkler_k_map[node_id] = float(K)
 
             self.pipes.extend(new_pipes)
             for pipe in new_pipes:
@@ -3163,6 +3171,9 @@ class CADDataManager:
         self.current_project_dir = None
         self.default_color256_diameter = None
         self.sprinkler_s_node_ids.clear()
+        self.sprinkler_k_map.clear()
+        self.sprinkler_k_overrides.clear()
+        self.manual_dn_pipes.clear()
         logger.info("所有数据已完全清空（含立管、楼层）")
 
     def get_summary(self) -> dict:
