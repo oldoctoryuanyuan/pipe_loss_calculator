@@ -87,7 +87,6 @@ class ConfigManager:
             "valve_attribute_name": "Status",
             "tolerance": 10.0,
             "sprinkler_block_name": "",        # 喷头图块名（喷淋模式，无属性值）
-            "sprinkler_short_pipe_length": 0.1, # 喷头短立管长度(m)
             "sprinkler_K": 80,                # 喷头流量系数
             "hydrant_Ad": 0.00172,            # 水带比阻
             "hydrant_Ld": 25,                 # 水带长度 (m)

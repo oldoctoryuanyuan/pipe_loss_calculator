@@ -1,7 +1,7 @@
 # pipe_loss_calculator/config/material_manager.py
 import json
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 class MaterialManager:
     """管材管理器，管理所有管材数据（包括颜色-管径对照表）"""
@@ -12,6 +12,7 @@ class MaterialManager:
         self.default_materials: Dict[str, Dict] = {}
         self.load_default_materials()
         self.load_materials()
+        self.load_k_dn_map()
         
     def load_default_materials(self):
         """加载默认管材数据（只读）"""
@@ -160,4 +161,41 @@ class MaterialManager:
             if info.get("nominal") == dn:
                 return info
         return {"nominal": dn, "inner": 0.0}
+
+    def load_k_dn_map(self):
+        """加载K-DN映射表，用户文件不存在时从默认文件复制"""
+        base_dir = os.path.dirname(self.materials_file)
+        self.k_dn_map_file = os.path.join(base_dir, "k_dn_map.json")
+        self.k_dn_map_default_file = os.path.join(base_dir, "k_dn_map_default.json")
+        self.k_dn_map: Dict[str, str] = {}
+        if os.path.exists(self.k_dn_map_file):
+            try:
+                with open(self.k_dn_map_file, 'r', encoding='utf-8') as f:
+                    self.k_dn_map = json.load(f)
+            except Exception as e:
+                print(f"加载K-DN映射表失败: {e}")
+        if not self.k_dn_map and os.path.exists(self.k_dn_map_default_file):
+            try:
+                with open(self.k_dn_map_default_file, 'r', encoding='utf-8') as f:
+                    self.k_dn_map = json.load(f)
+            except Exception as e:
+                print(f"加载默认K-DN映射表失败: {e}")
+        # 若用户文件不存在，从默认复制
+        if not os.path.exists(self.k_dn_map_file) and os.path.exists(self.k_dn_map_default_file):
+            try:
+                import shutil
+                shutil.copy(self.k_dn_map_default_file, self.k_dn_map_file)
+            except Exception as e:
+                print(f"复制默认K-DN映射表失败: {e}")
+
+    def get_sprinkler_dn(self, K) -> str:
+        """K值→管径查找，不在映射表中则返 DN25"""
+        return self.k_dn_map.get(str(int(K)), "DN25")
+
+    def reset_k_dn_map(self):
+        """恢复出厂默认"""
+        import shutil
+        if os.path.exists(self.k_dn_map_default_file):
+            shutil.copy(self.k_dn_map_default_file, self.k_dn_map_file)
+            self.load_k_dn_map()
 
