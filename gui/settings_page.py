@@ -268,16 +268,6 @@ class SettingsPage(ttk.Frame):
         row2 = ttk.Frame(cad_frame)
         row2.pack(fill="x", padx=10, pady=(0, 5))
         
-        # DXF读取复选框（放在最左侧，缺省勾选）
-        self.dxf_read_var = tk.BooleanVar(value=self.current_config.get("use_dxf_read", True))
-        dxf_read_check = ttk.Checkbutton(
-            row2,
-            text="DXF读取",
-            variable=self.dxf_read_var,
-            command=lambda: self.on_config_change("use_dxf_read", self.dxf_read_var.get())
-        )
-        dxf_read_check.pack(side="left", padx=(0, 10))
-
         # 预处理复选框（放在左侧）
         self.preprocess_var = tk.BooleanVar(value=self.current_config.get("preprocess_cad", False))
         preprocess_check = ttk.Checkbutton(
@@ -699,7 +689,7 @@ class SettingsPage(ttk.Frame):
         """浏览选择CAD文件"""
         file_path = filedialog.askopenfilename(
             title="选择CAD文件",
-            filetypes=[("CAD Files", "*.dwg *.dxf"), ("All files", "*.*")]
+            filetypes=[("CAD Files", "*.dwg"), ("All files", "*.*")]
         )
         if file_path:
             self.cad_file_var.set(file_path)
@@ -845,7 +835,6 @@ class SettingsPage(ttk.Frame):
         # 更新颜色管径对照表
         self.color_table.set_material(material)
         self.preprocess_var.set(self.current_config.get("preprocess_cad", False))
-        self.dxf_read_var.set(self.current_config.get("use_dxf_read", True))
         
         # 更新新增的配置
         self.hydrant_block_var.set(self.current_config.get("hydrant_block_name", "hydrant"))
