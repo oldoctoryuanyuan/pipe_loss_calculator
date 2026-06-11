@@ -1088,6 +1088,9 @@ class PreviewPage(ttk.Frame):
         if self.canvas is not None:
             self.canvas = None
     
+        # 解绑事件防止中间状态被错误保存
+        self.floor_notebook.unbind("<<NotebookTabChanged>>")
+
         # 清空现有标签页（使用 forget 确保 tab 记录也被移除）
         for tab_id in self.floor_notebook.tabs():
             self.floor_notebook.forget(tab_id)
@@ -5269,10 +5272,11 @@ class PreviewPage(ttk.Frame):
         if self.current_floor_name is None and self.cad_data_manager.floors:
             self.current_floor_name = self.cad_data_manager.floors[0].name
     
-        # 只有在明确要求且尚未保存状态时才自动居中
+        # 加载新数据时强制居中，不依赖 floor_view_state
         if not keep_view and self.current_view_mode != "global":
-            if self.current_floor_name not in self.floor_view_state:
-                self.auto_center()
+            self.auto_center()
+            if self.current_floor_name:
+                self.floor_view_state[self.current_floor_name] = (self.scale, self.translate_x, self.translate_y)
         self.problem_pipes = self.cad_data_manager.validate_problem_pipes()
         # 更新计算结果相关控件状态
         if self.calculation_available:
@@ -5665,6 +5669,8 @@ class PreviewPage(ttk.Frame):
         self.maintenance_zones.clear()
         self._next_zone_id = 0
         self._cached_grouped_floors_map = None
+        self.floor_view_state.clear()
+        self.current_floor_name = None
         self.redraw()
 
     def get_state_for_export(self) -> dict:
