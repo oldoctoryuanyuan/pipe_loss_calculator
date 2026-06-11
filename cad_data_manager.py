@@ -3,7 +3,8 @@ CAD数据管理器模块
 负责读取和处理CAD文件中的管网数据
 """
 import os
-
+import tempfile
+import uuid
 import json
 import math
 import pandas as pd
@@ -638,6 +639,203 @@ class CADDataManager:
                      f"{len(result['floor_align_blocks'])}对齐点, {len(result['floor_rect_polylines'])}楼层矩形")
         return result
 
+    def _collect_entities_from_dxf(self, config: dict) -> dict:
+        """通过 ezdxf 读取 DXF 临时文件收集实体，替代 COM 逐属性遍历"""
+        try:
+            import ezdxf
+            logging.getLogger("ezdxf").setLevel(logging.ERROR)
+        except ImportError:
+            logger.warning("ezdxf 未安装，无法使用 DXF 加速")
+            return None
+
+        if not self.cad_file_path:
+            logger.warning("无 CAD 文件路径，无法导出 DXF")
+            return None
+
+        doc = self.acad.doc
+
+        pipe_layers = config.get("pipe_layers", [])
+        valve_block_name = config.get("valve_block_name", "")
+        hydrant_block_name = config.get("hydrant_block_name", "")
+        sprinkler_block_name = config.get("sprinkler_block_name", "")
+        riser_layers = config.get("riser_layers", [])
+        riser_note_layers = config.get("riser_note_layers", [])
+        align_block_name = config.get("align_block_name", "")
+
+        result = {
+            'pipe_segments': [],
+            'valve_points': [],
+            'valve_raw': [],
+            'hydrant_raw': [],
+            'sprinkler_raw': [],
+            'riser_circles': [],
+            'riser_lines': [],
+            'riser_texts': [],
+            'floor_align_blocks': [],
+            'floor_rect_polylines': [],
+        }
+
+        tmp_path = None
+        try:
+            # 使用 Export 导出 DXF（不改变当前活动文档）
+            tmp_stem = os.path.join(tempfile.gettempdir(), f"ocad_{uuid.uuid4().hex}")
+            if self.progress_callback:
+                self.progress_callback("正在导出 DXF...")
+            ss = doc.SelectionSets.Add(f"ocad_ss_{uuid.uuid4().hex}")
+            ss.Select(5)  # acSelectionSetAll = 5
+            doc.Export(tmp_stem, "DXF", ss)
+            ss.Delete()
+            tmp_path = tmp_stem + ".dxf"
+            import time
+            time.sleep(0.5)
+            if not os.path.exists(tmp_path):
+                logger.error(f"DXF 导出后文件未创建: {tmp_path}")
+                return None
+
+            if self.progress_callback:
+                self.progress_callback("正在解析 DXF...")
+            dxf = ezdxf.readfile(tmp_path)
+            msp = dxf.modelspace()
+
+            if self.progress_callback:
+                self.progress_callback("正在读取实体数据...")
+            for entity in msp:
+                try:
+                    dxftype = entity.dxftype()
+                except Exception:
+                    continue
+                try:
+                    layer = entity.dxf.layer
+                    is_pipe_layer = layer in pipe_layers
+                    is_riser_layer = layer in riser_layers
+                    is_riser_note_layer = layer in riser_note_layers
+                    handle = entity.dxf.handle
+
+                    if dxftype in ("LINE", "LWPOLYLINE", "POLYLINE") and is_pipe_layer:
+                        color = entity.dxf.color
+                        if dxftype == "LINE":
+                            start = entity.dxf.start
+                            end = entity.dxf.end
+                            result['pipe_segments'].append({
+                                'start': (start[0], start[1], start[2]),
+                                'end': (end[0], end[1], end[2]),
+                                'color': color,
+                                'layer': layer,
+                                'handle': handle,
+                            })
+                        else:
+                            if dxftype == "LWPOLYLINE":
+                                pts = entity.get_points()
+                                elev = entity.dxf.elevation if entity.dxf.hasattr('elevation') else 0.0
+                                points = [(p[0], p[1], elev) for p in pts]
+                            else:
+                                points = [(v.dxf.location[0], v.dxf.location[1], v.dxf.location[2])
+                                          for v in entity.vertices]
+                            for i in range(len(points) - 1):
+                                result['pipe_segments'].append({
+                                    'start': points[i],
+                                    'end': points[i + 1],
+                                    'color': color,
+                                    'layer': layer,
+                                    'handle': handle,
+                                })
+                        continue
+
+                    if dxftype == "INSERT":
+                        name = entity.dxf.name
+                        ins = entity.dxf.insert
+                        xyz = (ins[0], ins[1], ins[2])
+                        if name == valve_block_name:
+                            result['valve_points'].append(xyz)
+                            result['valve_raw'].append((ins[0], ins[1], ins[2], handle))
+                        elif name == hydrant_block_name:
+                            result['hydrant_raw'].append((ins[0], ins[1], ins[2], handle))
+                        elif name == sprinkler_block_name:
+                            result['sprinkler_raw'].append((ins[0], ins[1], ins[2], handle))
+                        elif name == align_block_name:
+                            result['floor_align_blocks'].append({
+                                'point': (ins[0], ins[1], ins[2]),
+                                'layer': layer,
+                                'handle': handle,
+                            })
+                        continue
+
+                    if dxftype in ("CIRCLE", "ARC") and is_riser_layer:
+                        center = entity.dxf.center
+                        result['riser_circles'].append({
+                            'center': (center[0], center[1], center[2]),
+                            'radius': entity.dxf.radius,
+                            'layer': layer,
+                            'handle': handle,
+                        })
+                        continue
+
+                    if dxftype == "LINE" and is_riser_note_layer:
+                        start = entity.dxf.start
+                        end = entity.dxf.end
+                        result['riser_lines'].append(
+                            ((start[0], start[1], start[2]),
+                             (end[0], end[1], end[2]),
+                             handle)
+                        )
+                        continue
+
+                    if dxftype == "TEXT":
+                        ins = entity.dxf.insert
+                        result['riser_texts'].append({
+                            'text': entity.dxf.text,
+                            'pos': (ins[0], ins[1], ins[2]),
+                        })
+                        continue
+
+                    if dxftype in ("LWPOLYLINE", "POLYLINE") and not is_pipe_layer:
+                        if dxftype == "LWPOLYLINE":
+                            pts = entity.get_points()
+                            if len(pts) != 4:
+                                continue
+                            points_2d = [(p[0], p[1]) for p in pts]
+                            flat_coords = []
+                            for p in pts:
+                                flat_coords.extend([p[0], p[1]])
+                            coords = tuple(flat_coords)
+                        else:
+                            verts = list(entity.vertices)
+                            if len(verts) != 4:
+                                continue
+                            points_2d = [(v.dxf.location[0], v.dxf.location[1]) for v in verts]
+                            flat_coords = []
+                            for v in verts:
+                                flat_coords.extend([v.dxf.location[0], v.dxf.location[1]])
+                            coords = tuple(flat_coords)
+                        xs = sorted(set(p[0] for p in points_2d))
+                        ys = sorted(set(p[1] for p in points_2d))
+                        if len(xs) == 2 and len(ys) == 2:
+                            result['floor_rect_polylines'].append({
+                                'coords': coords,
+                                'layer': layer,
+                                'handle': handle,
+                            })
+
+                except Exception:
+                    continue
+
+            logger.info(f"DXF 解析完成: {len(result['pipe_segments'])}管道段, "
+                         f"{len(result['valve_raw'])}阀门, {len(result['hydrant_raw'])}消火栓, "
+                         f"{len(result['sprinkler_raw'])}喷头块, "
+                         f"{len(result['riser_circles'])}立管圆, {len(result['riser_texts'])}标注文本, "
+                         f"{len(result['floor_align_blocks'])}对齐点, {len(result['floor_rect_polylines'])}楼层矩形")
+            return result
+
+        except Exception as e:
+            logger.warning(f"DXF 读取失败: {e}，将回退到 COM 模式")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
     def extract_all_data(self, config: dict) -> bool:
         """提取所有管网数据"""
         collected = None
@@ -647,9 +845,20 @@ class CADDataManager:
             self.clear_data()
 
             if self.acad and hasattr(self.acad, 'doc'):
-                if self.progress_callback:
-                    self.progress_callback("正在扫描CAD实体...")
-                collected = self._collect_all_entities(config)
+                use_dxf = config.get("use_dxf_read", False)
+                if use_dxf:
+                    if self.progress_callback:
+                        self.progress_callback("正在扫描CAD实体（DXF模式）...")
+                    collected = self._collect_entities_from_dxf(config)
+                else:
+                    if self.progress_callback:
+                        self.progress_callback("正在扫描CAD实体（COM模式）...")
+                    collected = self._collect_all_entities(config)
+                if collected is None and use_dxf:
+                    logger.info("DXF 模式失败，回退到 COM 模式")
+                    if self.progress_callback:
+                        self.progress_callback("正在扫描CAD实体（COM回退模式）...")
+                    collected = self._collect_all_entities(config)
             else:
                 logger.warning("CAD未连接，无法使用单次遍历优化")
                 collected = None
