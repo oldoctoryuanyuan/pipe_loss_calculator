@@ -263,6 +263,11 @@ class ProjectExporter:
             "is_loaded": cdm.is_loaded,
             "preprocess_enabled": getattr(cdm, "preprocess_enabled", False),
             "default_color256_diameter": cdm.default_color256_diameter,
+            "sprinkler_s_node_ids": copy.deepcopy(cdm.sprinkler_s_node_ids),
+            "sprinkler_k_map": copy.deepcopy(cdm.sprinkler_k_map),
+            "sprinkler_k_overrides": list(cdm.sprinkler_k_overrides),
+            "manual_dn_pipes": list(cdm.manual_dn_pipes),
+            "current_project_dir": cdm.current_project_dir or "",
         }
 
     def _export_config(self) -> dict:
@@ -589,6 +594,13 @@ class ProjectImporter:
         cdm.preprocess_enabled = data.get("preprocess_enabled", False)
         cdm.default_color256_diameter = data.get("default_color256_diameter")
 
+        # 喷头数据恢复（兼容旧版导出文件，使用空默认值）
+        cdm.sprinkler_s_node_ids = data.get("sprinkler_s_node_ids", [])
+        cdm.sprinkler_k_map = data.get("sprinkler_k_map", {})
+        cdm.sprinkler_k_overrides = set(data.get("sprinkler_k_overrides", []))
+        cdm.manual_dn_pipes = set(data.get("manual_dn_pipes", []))
+        cdm.current_project_dir = data.get("current_project_dir") or None
+
     def _load_config(self, data: dict):
         """恢复配置到ConfigManager。"""
         # 用导入的配置覆盖"临时方案"，确保下次启动可见
@@ -674,7 +686,7 @@ class ProjectImporter:
             }
 
         pp._sep_cache_key = None
-        pp._cached_grouped_floors_map = {}
+        pp._cached_grouped_floors_map = None
 
         # 检修区恢复
         if "maintenance_zones" in data:
