@@ -1,0 +1,13 @@
+# 管网水损计算程序依赖
+# Python 3.8+
+
+# CAD连接
+pyautocad>=0.2.0
+pywin32>=227
+
+# 水力计算引擎（WNTR）
+wntr>=0.6.0
+
+# 数据处理
+pandas>=1.3.0
+openpyxl>=3.0.0
