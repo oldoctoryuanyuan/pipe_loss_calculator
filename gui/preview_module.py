@@ -340,6 +340,8 @@ class PreviewPage(ttk.Frame):
     COLOR_PIPE_ACTIVE = "#00BFFF"
     COLOR_PIPE_INACTIVE = "#808080"
     COLOR_PIPE_HIGHLIGHT = "#FF0000"
+    COLOR_PIPE_VELOCITY_NORMAL = "#ADD8E6"   # 校正/优化模式下，流速正常管道淡蓝色
+    COLOR_PIPE_ZERO_FLOW = "#808080"          # 校正/优化模式下，零流量管道深灰色
     COLOR_NODE = "#FFFFFF"
     COLOR_NODE_HIGHLIGHT = "#FF0000"
     COLOR_VALVE = "#00FF00"
@@ -401,6 +403,9 @@ class PreviewPage(ttk.Frame):
         # 计算结果缓存
         self.pipe_results: Dict[str, Dict] = {}
         self.calculation_available = False
+        self.velocity_check_var = tk.BooleanVar(value=False)   # 校正或优化管径模式
+        self.velocity_max = 5.0                                 # 最高流速阈值
+        self.velocity_min = 1.0                                 # 最低流速阈值
         
         # 节点压力缓存
         self.node_pressures: Dict[str, float] = {}
@@ -1405,6 +1410,11 @@ class PreviewPage(ttk.Frame):
         self.hide_invalid_cb.pack(side="left", padx=2)
         self.show_occlusion_cb = ttk.Checkbutton(check_row, text="显示前后遮挡", variable=self.show_occlusion_var, command=self.redraw)
         self.show_occlusion_cb.pack(side="left", padx=2)
+        self.velocity_check_cb = ttk.Checkbutton(check_row, text="校正或优化管径",
+                                                  variable=self.velocity_check_var,
+                                                  command=self.redraw,
+                                                  state="disabled")
+        self.velocity_check_cb.pack(side="left", padx=2)
 
         # 路径高亮   
         path_frame = ttk.LabelFrame(parent, text="路径高亮", padding=5)
@@ -1778,6 +1788,10 @@ class PreviewPage(ttk.Frame):
         self.loss_check.config(state="normal")
         self.arrow_check.config(state="normal")
         self.node_pressure_check.config(state="normal")
+        config = self.config_manager.get_live_config()
+        self.velocity_max = config.get("max_velocity", 5.0)
+        self.velocity_min = config.get("min_velocity", 1.0)
+        self.velocity_check_cb.config(state="normal")
         self.redraw()
 
     def set_node_pressures(self, node_pressures: Dict[str, float]):
@@ -2473,21 +2487,34 @@ class PreviewPage(ttk.Frame):
         ex, ey = self.world_to_canvas(*end_w)
 
         # 确定颜色
-        if not pipe.is_active:
-            color = "purple"   # 紫色
-        elif pipe.pipe_id in self.problem_pipes:
-            color = "red"
-        elif pipe.pipe_id in self.highlight_path_pipes:
-            color = self.COLOR_PIPE_HIGHLIGHT
-        elif pipe.pipe_id in self.reachable_pipes:
-            color = self.COLOR_PIPE_ACTIVE
+        if self.velocity_check_var.get() and self.calculation_available:
+            pipe_flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0.0)
+            if abs(pipe_flow) < 0.001:
+                color = self.COLOR_PIPE_ZERO_FLOW
+            else:
+                pipe_velocity = self.pipe_results.get(pipe.pipe_id, {}).get('velocity_mps', 0.0)
+                if pipe_velocity > self.velocity_max:
+                    color = "red"
+                elif pipe_velocity > 0 and pipe_velocity < self.velocity_min:
+                    color = "blue"
+                else:
+                    color = self.COLOR_PIPE_VELOCITY_NORMAL
         else:
-            color = self.COLOR_PIPE_INACTIVE
+            if not pipe.is_active:
+                color = "purple"   # 紫色
+            elif pipe.pipe_id in self.problem_pipes:
+                color = "red"
+            elif pipe.pipe_id in self.highlight_path_pipes:
+                color = self.COLOR_PIPE_HIGHLIGHT
+            elif pipe.pipe_id in self.reachable_pipes:
+                color = self.COLOR_PIPE_ACTIVE
+            else:
+                color = self.COLOR_PIPE_INACTIVE
 
         line_width = max(3, int(5 * self.scale))  # 固定像素宽度
 
         # 整体管网模式下，对 R_ 开头的竖向管道进行重复立管高亮（基于 CAD 立管编号）
-        if self.current_view_mode == "global" and self.show_riser_warning.get() and not self.hide_invalid_var.get() and pipe.pipe_id.startswith("R_"):
+        if not (self.velocity_check_var.get() and self.calculation_available) and self.current_view_mode == "global" and self.show_riser_warning.get() and not self.hide_invalid_var.get() and pipe.pipe_id.startswith("R_"):
             # 获取映射字典（已在 _draw_global_network 中构建）
             if hasattr(self, 'riser_by_pipe_id'):
                 # 尝试用当前 pipe_id 查找，如果找不到且管道有 original_riser_id 属性，则用 original_riser_id 查找
@@ -2505,7 +2532,7 @@ class PreviewPage(ttk.Frame):
                             line_width = max(3, int(5 * self.scale)) * 1.5  # 加粗为1.5倍
 
         # 分层颜色覆盖（优先级低于立管重复、问题管道、无效管道、高亮路径）
-        if self.layer_colors_enabled.get() and not pipe.pipe_id.startswith('B_'):
+        if not (self.velocity_check_var.get() and self.calculation_available) and self.layer_colors_enabled.get() and not pipe.pipe_id.startswith('B_'):
             floor_name = self.pipe_floor_map.get(pipe.pipe_id)
             if floor_name and floor_name in self.floor_color_map:
                 layer_color = self.floor_color_map[floor_name]
@@ -3354,6 +3381,11 @@ class PreviewPage(ttk.Frame):
         menu.add_command(label="删除管道", command=lambda: self.delete_pipe(pipe.pipe_id))
         menu.add_command(label="放大管径", command=lambda: self.change_pipe_diameter(pipe.pipe_id, "up"))
         menu.add_command(label="缩小管径", command=lambda: self.change_pipe_diameter(pipe.pipe_id, "down"))
+        if self.velocity_check_var.get() and self.calculation_available:
+            menu.add_command(label="校正管径",
+                             command=lambda pid=pipe.pipe_id: self.correct_single_pipe_diameter(pid, "up"))
+            menu.add_command(label="优化管径",
+                             command=lambda pid=pipe.pipe_id: self.correct_single_pipe_diameter(pid, "down"))
         
         # 支管链缩小管径（仅消火栓模式，且管道为支管链的一部分）
         config = self.config_manager.get_live_config()
@@ -3463,6 +3495,11 @@ class PreviewPage(ttk.Frame):
         menu.add_command(label="使有效（选择集）", command=lambda: self.set_selected_pipes_active(True))
         menu.add_command(label="删除（选择集）", command=self.delete_selected_pipes)
         menu.add_command(label="消火栓编成用水点组", command=self.group_selected_hydrants)
+        if self.velocity_check_var.get() and self.calculation_available:
+            menu.add_command(label="校正管径（选择集）",
+                             command=lambda: self.correct_selected_pipes_diameter("up"))
+            menu.add_command(label="优化管径（选择集）",
+                             command=lambda: self.correct_selected_pipes_diameter("down"))
         menu.add_separator()
         # ===== 新增：供水点/用水点操作（选择集） =====
         # 获取所有选中管道对应的自由端节点
@@ -4395,6 +4432,97 @@ class PreviewPage(ttk.Frame):
             self._refresh_after_modification(keep_view=True)
         else:
             self.show_temp_message("没有可调整的管道", 2000)
+
+    def correct_single_pipe_diameter(self, pipe_id, direction):
+        """校正(up放大)或优化(down缩小)单个管道管径，按流速条件和消火栓豁免规则过滤"""
+        pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
+        if not pipe or not self.calculation_available:
+            return
+        config = self.config_manager.get_live_config()
+        system_type = config.get("system_type", "outdoor_hydrant")
+
+        velocity = self.pipe_results.get(pipe_id, {}).get('velocity_mps', 0.0)
+
+        if direction == "up" and velocity <= self.velocity_max:
+            return
+        if direction == "down" and velocity >= self.velocity_min:
+            return
+
+        if system_type in ("indoor_hydrant", "outdoor_hydrant"):
+            current_dn = pipe.nominal_diameter
+            dn_num = int(current_dn[2:]) if current_dn.startswith("DN") else 0
+            if dn_num == 65:
+                return
+            if direction == "down" and dn_num == 100:
+                return
+            if direction == "down" and dn_num > 100:
+                material = config.get("pipe_material", "镀锌钢管")
+                new_dn = self.material_manager.get_next_diameter(
+                    current_dn, direction, material, system_type
+                )
+                new_num = int(new_dn[2:]) if new_dn.startswith("DN") else 0
+                if new_num < 100:
+                    return
+
+        self.change_pipe_diameter(pipe_id, direction)
+
+    def correct_selected_pipes_diameter(self, direction):
+        """校正(up)或优化(down)选择集中的管道管径，按流速条件和消火栓豁免规则过滤"""
+        if not self.selected_pipes or not self.calculation_available:
+            return
+        config = self.config_manager.get_live_config()
+        system_type = config.get("system_type", "outdoor_hydrant")
+        material = config.get("pipe_material", "镀锌钢管")
+        modified = False
+
+        for pipe_id in list(self.selected_pipes):
+            pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
+            if not pipe:
+                continue
+
+            velocity = self.pipe_results.get(pipe_id, {}).get('velocity_mps', 0.0)
+
+            if direction == "up" and velocity <= self.velocity_max:
+                continue
+            if direction == "down" and velocity >= self.velocity_min:
+                continue
+
+            current_dn = pipe.nominal_diameter
+
+            if system_type in ("indoor_hydrant", "outdoor_hydrant"):
+                dn_num = int(current_dn[2:]) if current_dn.startswith("DN") else 0
+                if dn_num == 65:
+                    continue
+                if direction == "down" and dn_num == 100:
+                    continue
+                if direction == "down" and dn_num > 100:
+                    new_dn = self.material_manager.get_next_diameter(
+                        current_dn, direction, material, system_type
+                    )
+                    new_num = int(new_dn[2:]) if new_dn.startswith("DN") else 0
+                    if new_num < 100:
+                        continue
+
+            new_dn = self.material_manager.get_next_diameter(
+                current_dn, direction, material, system_type
+            )
+            if new_dn == current_dn:
+                continue
+
+            new_info = self.material_manager.get_diameter_info(material, new_dn)
+            if not new_info.get("inner", 0):
+                continue
+
+            self._record_change('attr', pipe, 'nominal_diameter', current_dn, new_dn)
+            pipe.nominal_diameter = new_dn
+            pipe.inner_diameter = new_info["inner"]
+            modified = True
+
+        if modified:
+            self.cad_data_manager.update_pipe_types(config)
+            self._refresh_after_modification(keep_view=True)
+        else:
+            self.show_temp_message("选择集中没有可调整的管道", 2000)
 
     def change_selected_to_hydrant_branch(self):
         """将选中的管道改为消火栓支管（管径设为DN65，并尝试在端点创建消火栓）"""
@@ -5657,6 +5785,8 @@ class PreviewPage(ttk.Frame):
         self.loss_check.config(state="disabled")
         self.arrow_check.config(state="disabled")
         self.node_pressure_check.config(state="disabled")
+        self.velocity_check_var.set(False)
+        self.velocity_check_cb.config(state="disabled")
         self.highlight_path_pipes = set()
         self.highlight_path_nodes = set()
         self.selected_pipes.clear()

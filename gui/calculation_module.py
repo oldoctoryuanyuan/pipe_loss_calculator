@@ -1086,7 +1086,8 @@ class CalculationPage(ttk.Frame):
             # 去掉过滤条件，所有管道都传递
             pipe_dict[pipe_id] = {
                 "flow_lps": pipe.get("raw_flow", 0.0),   # 原始流量带符号
-                "total_loss": pipe.get("sort_loss", 0.0)
+                "total_loss": pipe.get("sort_loss", 0.0),
+                "velocity_mps": pipe.get("velocity", 0.0)  # 流速用于预览页面着色
             }
         root = self.winfo_toplevel()
         main_app = getattr(root, 'main_app', None)
