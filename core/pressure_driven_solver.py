@@ -209,6 +209,13 @@ class PressureDrivenSolver:
             else:
                 # 压力不足，提高下界
                 low = mid
+                # 当区间过小时扩大上界，避免死锁
+                if low >= high:
+                    high = low + 20.0
+                    logger.info(f"  low >= high，扩大上界至 {high:.2f}")
+                elif high - low < 1.0:
+                    high = low + 20.0
+                    logger.info(f"  区间过小({high - low:.2f}<1.0)，扩大上界至 {high:.2f}")
 
             # 区间足够小，提前终止
             if high - low < 0.001:
