@@ -1096,8 +1096,9 @@ class CalculationPage(ttk.Frame):
             if preview_page:
                 preview_page.set_calculation_results(pipe_dict)
                 logger.info(f"已传递 {len(pipe_dict)} 条管道计算结果到预览页面")
-        # 传递节点压力
+        # 传递节点压力 和 节点流量
         node_pressure_dict = {}
+        node_flow_dict = {}
         for node_res in results.get("node_results", []):
             node_id = node_res["node_id"]
             if node_id.startswith(("D_", "VD_", "RESERVOIR")):
@@ -1115,11 +1116,13 @@ class CalculationPage(ttk.Frame):
                     if not has_open:
                         continue
             node_pressure_dict[node_id] = node_res.get("pressure_m", 0.0)
+            node_flow_dict[node_id] = node_res.get("demand_lps", 0.0)
         if main_app and hasattr(main_app, 'pages'):
             preview_page = main_app.pages.get("管网预览")
             if preview_page:
                 preview_page.set_node_pressures(node_pressure_dict)
-                logger.info(f"已传递 {len(node_pressure_dict)} 个节点压力到预览页面")                
+                preview_page.set_node_flows(node_flow_dict)
+                logger.info(f"已传递 {len(node_pressure_dict)} 个节点压力和 {len(node_flow_dict)} 个节点流量到预览页面")                
 
 
     def update_nodes_table(self, node_results: list):

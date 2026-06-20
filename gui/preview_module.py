@@ -412,7 +412,18 @@ class PreviewPage(ttk.Frame):
         
         # 节点压力缓存
         self.node_pressures: Dict[str, float] = {}
-        self.show_node_pressure = tk.BooleanVar(value=False)  # 节点压力显示开关        
+        self.show_node_pressure = tk.BooleanVar(value=False)  # 节点压力显示开关
+
+        # 节点流量缓存（从 calculation_module 传入）
+        self.node_flows: Dict[str, float] = {}
+
+        # Alt 悬停信息框
+        self.alt_pressed = False
+        self._hover_tooltip_id = None
+        self._hover_tooltip_win = None
+        self._hover_info = None          # (info_type, lines)
+        self._hover_canvas_pos = None    # (canvasx, canvasy)
+        self._hover_screen_pos = None    # (root_x, root_y)        
 
         # 高亮数据
         self.highlight_path_pipes: Set[str] = set()
@@ -427,6 +438,12 @@ class PreviewPage(ttk.Frame):
 
         # 连通性缓存
         self.reachable_pipes: Set[str] = set()
+
+        # Alt 悬停信息框的全局键绑定
+        self.bind("<KeyPress-Alt_L>", self._on_alt_press)
+        self.bind("<KeyPress-Alt_R>", self._on_alt_press)
+        self.bind("<KeyRelease-Alt_L>", self._on_alt_release)
+        self.bind("<KeyRelease-Alt_R>", self._on_alt_release)
 
         # 创建界面
         self.create_widgets()
@@ -1534,7 +1551,13 @@ class PreviewPage(ttk.Frame):
         canvas.bind("<KeyPress-Escape>", self.on_escape)
         canvas.bind("<Control-z>", self.undo)
         canvas.bind("<Control-Z>", self.undo)
+        canvas.bind("<Motion>", self.on_mouse_move)
+        canvas.bind("<Leave>", self.on_mouse_leave)
         canvas.bind("<Configure>", self._on_canvas_configure)
+        canvas.bind("<KeyPress-Alt_L>", self._on_alt_press)
+        canvas.bind("<KeyPress-Alt_R>", self._on_alt_press)
+        canvas.bind("<KeyRelease-Alt_L>", self._on_alt_release)
+        canvas.bind("<KeyRelease-Alt_R>", self._on_alt_release)
         canvas.focus_set()
 
     def _unbind_canvas_events(self, canvas):
@@ -1552,6 +1575,8 @@ class PreviewPage(ttk.Frame):
             canvas.unbind("<KeyPress-Escape>")
             canvas.unbind("<Control-z>")
             canvas.unbind("<Control-Z>")
+            canvas.unbind("<Motion>")
+            canvas.unbind("<Leave>")
         except tk.TclError:
             # 窗口已销毁，忽略
             pass
@@ -2074,6 +2099,10 @@ class PreviewPage(ttk.Frame):
         """接收计算页面传递的节点压力结果"""
         self.node_pressures = node_pressures
         self.redraw()
+
+    def set_node_flows(self, node_flows: Dict[str, float]):
+        """接收计算页面传递的节点流量结果"""
+        self.node_flows = node_flows
 
     # ----------------------------------------------------------------------
     # 绘制
@@ -3369,6 +3398,7 @@ class PreviewPage(ttk.Frame):
     # 交互事件
     # ----------------------------------------------------------------------
     def on_mouse_wheel(self, event):
+        self._destroy_hover_tooltip()
         scale_factor = 1.1 if event.delta > 0 else 0.9
         self.scale *= scale_factor
         mouse_x = self.canvas.canvasx(event.x)
@@ -3378,6 +3408,7 @@ class PreviewPage(ttk.Frame):
         self.redraw()
 
     def on_mouse_middle_down(self, event):
+        self._destroy_hover_tooltip()
         self.drag_start = (event.x, event.y)
     
     def on_mouse_middle_drag(self, event):
@@ -3390,6 +3421,7 @@ class PreviewPage(ttk.Frame):
             self.redraw()
 
     def on_left_click(self, event):
+        self._destroy_hover_tooltip()
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
         # 使用画布像素坐标进行最近对象查找，阈值统一为50像素
@@ -3552,6 +3584,7 @@ class PreviewPage(ttk.Frame):
         return False
 
     def on_right_click(self, event):
+        self._destroy_hover_tooltip()
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
         threshold = 10  # 像素阈值
@@ -3623,6 +3656,141 @@ class PreviewPage(ttk.Frame):
                 min_dist = dist
                 nearest_node = node
         return min_dist, nearest_node
+
+    # ----------------------------------------------------------------------
+    # Alt 悬停信息框
+    # ----------------------------------------------------------------------
+    def _on_alt_press(self, event):
+        self.alt_pressed = True
+
+    def _on_alt_release(self, event):
+        self.alt_pressed = False
+        self._destroy_hover_tooltip()
+
+    def on_mouse_move(self, event):
+        self._destroy_hover_tooltip()
+        if not self.alt_pressed:
+            return
+        if self._hover_tooltip_id:
+            self.after_cancel(self._hover_tooltip_id)
+        self._hover_canvas_pos = (self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self._hover_screen_pos = (event.x_root, event.y_root)
+        self._hover_tooltip_id = self.after(500, self._show_hover_tooltip)
+
+    def on_mouse_leave(self, event):
+        self._destroy_hover_tooltip()
+
+    def _destroy_hover_tooltip(self):
+        if self._hover_tooltip_id:
+            self.after_cancel(self._hover_tooltip_id)
+            self._hover_tooltip_id = None
+        if self._hover_tooltip_win:
+            try:
+                self._hover_tooltip_win.destroy()
+            except tk.TclError:
+                pass
+            self._hover_tooltip_win = None
+        self._hover_canvas_pos = None
+        self._hover_screen_pos = None
+        self._hover_info = None
+
+    def _show_hover_tooltip(self):
+        self._hover_tooltip_id = None
+        if not self.alt_pressed or not self._hover_canvas_pos:
+            return
+        if not self.canvas or not self.canvas.winfo_exists():
+            return
+        info_type, lines = self._get_hover_info(self._hover_canvas_pos)
+        if not lines:
+            return
+        self._hover_info = (info_type, lines)
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes('-alpha', 0.9)
+        win.attributes('-topmost', True)
+        label = tk.Label(win, text="\n".join(lines),
+                         justify=tk.LEFT,
+                         background="#FFFFE8",
+                         relief=tk.SOLID, borderwidth=1,
+                         font=("Microsoft YaHei", 9),
+                         padx=6, pady=4)
+        label.pack()
+        win.update_idletasks()
+        rx, ry = self._hover_screen_pos
+        win_w = win.winfo_width()
+        win_h = win.winfo_height()
+        screen_w = win.winfo_screenwidth()
+        screen_h = win.winfo_screenheight()
+        pos_x = rx + 15
+        pos_y = ry + 15
+        if pos_x + win_w > screen_w:
+            pos_x = rx - win_w - 10
+        if pos_y + win_h > screen_h:
+            pos_y = ry - win_h - 10
+        pos_x = max(pos_x, 0)
+        pos_y = max(pos_y, 0)
+        win.geometry(f"+{pos_x}+{pos_y}")
+        self._hover_tooltip_win = win
+
+    def _get_hover_info(self, canvas_pt):
+        threshold = 10
+        # 优先级：节点 > 阀门 > 管道
+        dist, node = self._find_nearest_node(canvas_pt)
+        if node and dist < threshold:
+            node_id = node.node_id
+            pressure_val = self.node_pressures.get(node_id, 0.0)
+            # 节点流量：取所有连接管道中流量的最大绝对值
+            node_obj = self.cad_data_manager.node_by_id.get(node_id)
+            if node_obj and node_obj.connected_pipes:
+                flow_val = max(
+                    (abs(self.pipe_results.get(pid, {}).get('flow_lps', 0.0))
+                     for pid in node_obj.connected_pipes),
+                    default=0.0
+                )
+            else:
+                flow_val = 0.0
+            node_lines = [
+                f"节点编号: {node_id}",
+                f"节点流量: {flow_val:.2f}L/s",
+                f"节点压力: {pressure_val:.2f}m"
+            ]
+            # 消火栓（优先于喷头）
+            if node.hydrants:
+                hyd_id = node.hydrants[0]
+                hyd = self.cad_data_manager.hydrant_by_id.get(hyd_id)
+                hyd_label = hyd.hydrant_id if hyd else hyd_id
+                lines = [f"消火栓编号: {hyd_label}"] + node_lines
+                return ("hydrant", lines)
+            # 喷头：sprinkler_s_node_ids 存的是 {base_id}_S，
+            # 而 sprinkler_k_map 的键是 base_id（不带 _S）
+            s_ids = getattr(self.cad_data_manager, 'sprinkler_s_node_ids', [])
+            if node_id in s_ids:
+                base_id = node_id[:-2] if node_id.endswith('_S') else node_id
+                k_val = self.cad_data_manager.sprinkler_k_map.get(base_id, 0)
+                lines = [f"喷头K值: {k_val}"] + node_lines
+                return ("sprinkler", lines)
+            # 普通节点
+            return ("node", node_lines)
+        dist, valve = self._find_nearest_valve(canvas_pt)
+        if valve and dist < threshold:
+            lines = [f"阀门编号: {valve.valve_id}"]
+            return ("valve", lines)
+        dist, pipe = self._find_nearest_pipe(canvas_pt)
+        if pipe and dist < threshold:
+            lines = [f"管道编号: {pipe.pipe_id}"]
+            if pipe.riser_number:
+                lines.append(f"立管编号: {pipe.riser_number}")
+            lines.append(f"公称管径: {pipe.nominal_diameter or '0'}")
+            lines.append(f"管长: {pipe.length:.2f}m")
+            pres = self.pipe_results.get(pipe.pipe_id, {})
+            flow = pres.get('flow_lps', 0.0)
+            vel = pres.get('velocity_mps', 0.0)
+            loss = pres.get('total_loss', 0.0)
+            lines.append(f"流量: {abs(flow):.2f}L/s")
+            lines.append(f"流速: {vel:.2f}m/s")
+            lines.append(f"水损: {loss:.2f}m")
+            return ("pipe", lines)
+        return (None, None)
 
     def _build_pipe_menu(self, menu, pipe):
         # 添加阀门（如果无阀门）
@@ -6097,6 +6265,10 @@ class PreviewPage(ttk.Frame):
         self._cached_grouped_floors_map = None
         self.floor_view_state.clear()
         self.current_floor_name = None
+        self.node_pressures = {}
+        self.node_flows = {}
+        self._destroy_hover_tooltip()
+        self.alt_pressed = False
         self.redraw()
 
     def get_state_for_export(self) -> dict:
