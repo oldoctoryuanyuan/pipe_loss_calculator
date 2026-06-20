@@ -5,10 +5,12 @@ import tkinter as tk
 import json
 import os
 import sys
+import shutil
 from tkinter import ttk, simpledialog, messagebox
 import math
 import logging
 from typing import List, Dict, Tuple, Optional, Set
+from collections import defaultdict, deque
 from cad_data_manager import HydrantData, ValveData, DemandGroupData, DemandNodeData, PipeData, NodeData, SupplyNodeData
 # from tkinter import messagebox
 
@@ -383,6 +385,7 @@ class PreviewPage(ttk.Frame):
         self.show_nominal = tk.BooleanVar(value=True)
         self.show_length = tk.BooleanVar(value=False)
         self.show_flow = tk.BooleanVar(value=False)
+        self.show_velocity = tk.BooleanVar(value=False)
         self.show_loss = tk.BooleanVar(value=False)
         self.show_arrow = tk.BooleanVar(value=False)
         self.show_node_ids = tk.BooleanVar(value=False)
@@ -1006,6 +1009,257 @@ class PreviewPage(ttk.Frame):
         ttk.Button(btn_frame, text="清除分离", command=clear_separation).pack(side="right", padx=5)
         ttk.Button(btn_frame, text="应用分离", command=apply_separation).pack(side="right", padx=5)
 
+    def show_sprinkler_table_dialog(self):
+        """打开喷淋管径表编辑对话框"""
+        root_dir = _get_exe_dir()
+        file_path = os.path.join(root_dir, "sprinkler_k_factor_pipe_capacity.json")
+        default_path = os.path.join(root_dir, "sprinkler_k_factor_pipe_capacity_default.json")
+        SprinklerCapacityDialog(self.winfo_toplevel(), file_path, default_path)
+
+    def assign_diameter_to_pipes(self):
+        """根据喷淋管径表对喷淋管网赋予管径"""
+        if getattr(self, '_sprinkler_assign_dialog_active', False):
+            return
+        self._sprinkler_assign_dialog_active = True
+        try:
+            self._do_assign_diameter()
+        finally:
+            self._sprinkler_assign_dialog_active = False
+
+    def _do_assign_diameter(self):
+        cad = self.cad_data_manager
+        config = self.config_manager.get_live_config()
+
+        system_type = config.get("system_type", "outdoor_hydrant")
+        if system_type != "sprinkler":
+            messagebox.showwarning("不支持", "赋予管径功能仅在喷淋模式下可用。")
+            return
+
+        K = int(float(config.get("sprinkler_K", 80)))
+        K_str = str(K)
+        root_dir = _get_exe_dir()
+        file_path = os.path.join(root_dir, "sprinkler_k_factor_pipe_capacity.json")
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                capacity = json.load(f)
+        except Exception:
+            messagebox.showerror("错误", "无法读取喷淋管径表文件。")
+            return
+
+        if K_str not in capacity:
+            messagebox.showwarning("K值未找到",
+                f"喷淋管径表中未找到 K={K} 对应的数据。\n"
+                f"请检查设置页面的K值或编辑喷淋管径表。")
+            return
+
+        supply_nodes = cad.supply_nodes
+        if not supply_nodes:
+            messagebox.showwarning("缺少供水点", "请先在管网预览页设置供水点。")
+            return
+
+        supply_node = supply_nodes[0]
+        if len(supply_node.node_ids) > 1:
+            selected = self._select_supply_point(supply_node.node_ids)
+            if selected is None:
+                return
+            supply_node_id = selected
+        else:
+            supply_node_id = supply_node.node_ids[0]
+
+        if not supply_node_id or supply_node_id not in cad.node_by_id:
+            messagebox.showerror("错误", "供水点节点ID无效。")
+            return
+
+        adjacency = defaultdict(list)
+        edge_to_pipe = {}
+
+        for pipe in cad.pipes:
+            if not pipe.is_active:
+                continue
+            if pipe.pipe_id.startswith("SP_"):
+                continue
+            a, b = pipe.start_node_id, pipe.end_node_id
+            adjacency[a].append(b)
+            adjacency[b].append(a)
+            edge_to_pipe[tuple(sorted((a, b)))] = pipe
+
+        if supply_node_id not in adjacency:
+            messagebox.showwarning("供水点未连接",
+                "供水点节点没有连接到任何管道，无法进行遍历。")
+            return
+
+        try:
+            tree_edges = _bfs_tree_and_detect_loops(adjacency, supply_node_id, edge_to_pipe)
+        except ValueError as e:
+            self._show_loop_warning(e.args[0])
+            return
+
+        visited_nodes = {supply_node_id}
+        for parent, child in tree_edges:
+            visited_nodes.add(parent)
+            visited_nodes.add(child)
+
+        node_sprinklers = {}
+        for nid in visited_nodes:
+            node_sprinklers[nid] = 1 if nid in cad.sprinkler_k_map else 0
+
+        children = defaultdict(list)
+        for parent, child in tree_edges:
+            children[parent].append(child)
+
+        accumulated = {}
+        stack = [(supply_node_id, 0)]
+        while stack:
+            node, state = stack.pop()
+            if state == 0:
+                stack.append((node, 1))
+                for child in reversed(children.get(node, [])):
+                    stack.append((child, 0))
+            else:
+                total = node_sprinklers.get(node, 0)
+                for child in children.get(node, []):
+                    total += accumulated.get(child, 0)
+                accumulated[node] = total
+
+        cap = capacity[K_str]
+        dns = sorted(cap.keys(), key=lambda x: int(x[2:]) if x.startswith('DN') else 0)
+        material = config.get("pipe_material", "镀锌钢管")
+
+        modified_pipes = []
+
+        for parent, child in tree_edges:
+            downstream = accumulated.get(child, 0)
+            assigned_dn = None
+            for dn in dns:
+                if cap[dn] > 0 and cap[dn] >= downstream:
+                    assigned_dn = dn
+                    break
+            if assigned_dn is None:
+                for dn in reversed(dns):
+                    if cap[dn] > 0:
+                        assigned_dn = dn
+                        break
+            if assigned_dn is None:
+                assigned_dn = "DN25"
+
+            pipe = edge_to_pipe.get(tuple(sorted((parent, child))))
+            if pipe and pipe.nominal_diameter != assigned_dn:
+                modified_pipes.append((pipe, pipe.nominal_diameter, pipe.inner_diameter))
+                pipe.nominal_diameter = assigned_dn
+                info = self.material_manager.get_diameter_info(material, assigned_dn)
+                if info.get("inner", 0) > 0:
+                    pipe.inner_diameter = info["inner"]
+                cad.manual_dn_pipes.add(pipe.pipe_id)
+
+        if modified_pipes:
+            self.undo_stack.append({
+                'type': 'batch_attr',
+                'changes': [{'pipe': p, 'old_dn': old_dn, 'old_inner': old_in}
+                            for p, old_dn, old_in in modified_pipes]
+            })
+            self.redo_stack.clear()
+            if len(self.undo_stack) > self.max_undo:
+                self.undo_stack.pop(0)
+
+        if modified_pipes:
+            cad.update_pipe_types(config)
+        self.refresh_data(keep_view=True)
+        self._refresh_other_pages()
+
+        if modified_pipes:
+            self.show_temp_message(f"已为 {len(modified_pipes)} 根管道赋予管径（按 Ctrl+Z 可撤销）", 3000)
+        else:
+            self.show_temp_message("所有管道管径已符合喷淋管径表，无需修改。", 2000)
+
+    def _select_supply_point(self, node_ids):
+        """多供水节点时弹出选择对话框，返回选中的 node_id 或 None"""
+        parent = self.winfo_toplevel()
+        dialog = tk.Toplevel(parent)
+        dialog.title("选择供水点")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        ttk.Label(dialog, text="检测到多个供水节点，请选择其中一个作为遍历起点：").pack(padx=15, pady=(10, 5))
+        listbox = tk.Listbox(dialog, height=min(len(node_ids), 8), width=40)
+        listbox.pack(padx=15, pady=5)
+        for nid in node_ids:
+            listbox.insert(tk.END, f"节点 {nid}")
+        listbox.selection_set(0)
+        result = [None]
+        def on_ok():
+            sel = listbox.curselection()
+            if sel:
+                result[0] = node_ids[sel[0]]
+            dialog.destroy()
+        def on_cancel():
+            dialog.destroy()
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(0, 10))
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=on_cancel).pack(side="left", padx=5)
+        self.center_dialog(dialog)
+        dialog.bind("<Escape>", lambda e: on_cancel())
+        dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+        dialog.lift()
+        dialog.focus_set()
+        self.wait_window(dialog)
+        return result[0]
+
+    def _show_loop_warning(self, cycle_pipe_ids):
+        """显示环路警告并高亮环路管道"""
+        if hasattr(self, 'loop_highlight_pipe_ids'):
+            self.loop_highlight_pipe_ids.clear()
+        self.loop_highlight_pipe_ids = set(cycle_pipe_ids)
+        self._zoom_to_pipes(cycle_pipe_ids)
+
+        parent = self.winfo_toplevel()
+        dialog = tk.Toplevel(parent)
+        dialog.title("检测到环路")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        msg = f"管网中存在环路，无法进行树状遍历。\n环路包含以下 {len(cycle_pipe_ids)} 根管道：\n"
+        msg += ", ".join(cycle_pipe_ids)
+        ttk.Label(dialog, text=msg, wraplength=400).pack(padx=20, pady=10)
+        ttk.Label(dialog, text="请在关闭本窗口后，手动修复环路结构。", foreground="gray").pack(pady=(0, 10))
+        def on_close():
+            dialog.destroy()
+        ttk.Button(dialog, text="确定", command=on_close).pack(pady=(0, 10))
+        dialog.bind("<Escape>", lambda e: on_close())
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+        self.center_dialog(dialog)
+        dialog.lift()
+        dialog.focus_set()
+        self.wait_window(dialog)
+
+        self.loop_highlight_pipe_ids.clear()
+        self.redraw()
+
+    def _zoom_to_pipes(self, pipe_ids):
+        """定位画布到指定管道集，使其占据画布中央一半区域"""
+        nodes_x, nodes_y = [], []
+        cad = self.cad_data_manager
+        for pid in pipe_ids:
+            pipe = cad.pipe_by_id.get(pid)
+            if pipe:
+                for nid in (pipe.start_node_id, pipe.end_node_id):
+                    pt = self.projected_coords.get(nid)
+                    if pt:
+                        nodes_x.append(pt[0])
+                        nodes_y.append(pt[1])
+        if not nodes_x:
+            return
+        cx, cy = (min(nodes_x) + max(nodes_x)) / 2, (min(nodes_y) + max(nodes_y)) / 2
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw <= 0 or ch <= 0:
+            return
+        pw = max(max(nodes_x) - min(nodes_x), 1)
+        ph = max(max(nodes_y) - min(nodes_y), 1)
+        new_scale = min((cw * 0.5) / pw, (ch * 0.5) / ph)
+        self.scale = new_scale
+        self.translate_x = (cw / 2) - cx * new_scale
+        self.translate_y = (ch / 2) - cy * new_scale
+        self.redraw()
+
     def center_dialog(self, dialog):
         """将对话框居中于父窗口"""
         dialog.update_idletasks()
@@ -1317,7 +1571,7 @@ class PreviewPage(ttk.Frame):
         ttk.Checkbutton(left_col, text="公称管径",
                         variable=self.show_nominal,
                         command=self.redraw).pack(anchor="w")
-        ttk.Checkbutton(left_col, text="管长",
+        ttk.Checkbutton(left_col, text="管段长度",
                         variable=self.show_length,
                         command=self.redraw).pack(anchor="w")
         ttk.Checkbutton(left_col, text="管道编号",
@@ -1344,12 +1598,17 @@ class PreviewPage(ttk.Frame):
                                            command=self.redraw,
                                            state="disabled")
         self.flow_check.pack(anchor="w")
-        self.loss_check = ttk.Checkbutton(right_col, text="管道总水损",
+        self.velocity_check = ttk.Checkbutton(right_col, text="管道流速",
+                                               variable=self.show_velocity,
+                                               command=self.redraw,
+                                               state="disabled")
+        self.velocity_check.pack(anchor="w")
+        self.loss_check = ttk.Checkbutton(right_col, text="管道水损",
                                            variable=self.show_loss,
                                            command=self.redraw,
                                            state="disabled")
         self.loss_check.pack(anchor="w")
-        self.arrow_check = ttk.Checkbutton(right_col, text="流向",
+        self.arrow_check = ttk.Checkbutton(right_col, text="水流方向",
                                            variable=self.show_arrow,
                                            command=self.redraw,
                                            state="disabled")
@@ -1372,9 +1631,17 @@ class PreviewPage(ttk.Frame):
         self.height_btn = ttk.Button(display_frame, text="楼层与管网标高", command=self.show_floor_height_dialog)
         self.height_btn.pack(fill="x", pady=5)
 
+        # 喷淋管径相关按钮（喷淋模式下显示）
+        self.sprinkler_table_btn = ttk.Button(display_frame, text="喷淋管径表",
+            command=self.show_sprinkler_table_dialog)
+        self.sprinkler_table_btn.pack(fill="x", pady=2)
+        self.assign_diameter_btn = ttk.Button(display_frame, text="赋予管径",
+            command=self.assign_diameter_to_pipes)
+        self.assign_diameter_btn.pack(fill="x", pady=2)
+
         # 创建一行用于放置两个复选框的框架
-        check_frame = ttk.Frame(display_frame)
-        check_frame.pack(anchor="w", fill="x")
+        self.check_frame = ttk.Frame(display_frame)
+        self.check_frame.pack(anchor="w", fill="x")
 
         # 立管重复标记复选框（默认勾选）
         self.show_riser_warning = tk.BooleanVar(value=True)
@@ -1461,7 +1728,7 @@ class PreviewPage(ttk.Frame):
         self.update_invalid_controls_state()
 
     def update_invalid_controls_state(self):
-        """根据当前系统类型更新无效管相关控件的启用/禁用状态"""
+        """根据当前系统类型更新无效管/喷淋相关控件的启用/禁用状态"""
         config = self.config_manager.get_live_config()
         system_type = config.get("system_type", "outdoor_hydrant")
         is_indoor = (system_type == "indoor_hydrant")
@@ -1469,6 +1736,14 @@ class PreviewPage(ttk.Frame):
         self.mark_invalid_btn.config(state=state)
         self.delete_invalid_btn.config(state=state)
         self.hide_invalid_cb.config(state=state)
+
+        # 喷淋按钮可见性
+        if system_type == "sprinkler":
+            self.sprinkler_table_btn.pack(fill="x", pady=2, before=self.check_frame)
+            self.assign_diameter_btn.pack(fill="x", pady=2, before=self.check_frame)
+        else:
+            self.sprinkler_table_btn.pack_forget()
+            self.assign_diameter_btn.pack_forget()
 
     def _on_hide_invalid_toggle(self):
         """隐藏无效管复选框的回调：自动清除当前选中集中已变为无效的管道"""
@@ -1787,6 +2062,7 @@ class PreviewPage(ttk.Frame):
         self.flow_check.config(state="normal")
         self.loss_check.config(state="normal")
         self.arrow_check.config(state="normal")
+        self.velocity_check.config(state="normal")
         self.node_pressure_check.config(state="normal")
         config = self.config_manager.get_live_config()
         self.velocity_max = config.get("max_velocity", 5.0)
@@ -2462,7 +2738,7 @@ class PreviewPage(ttk.Frame):
                         outline="white", width=1, tags="compass")
 
         # 高亮使用存储的导航角
-        nav = getattr(self, 'nav_angle', 0.0)
+        nav = getattr(self, 'nav_angle', self.global_view_angle)
         active_block = round(nav / 15) % 24
         # print(f"罗盘绘制: 导航角={nav:.1f}°, 高亮扇区={active_block}")
 
@@ -2542,8 +2818,12 @@ class PreviewPage(ttk.Frame):
                 if not high_priority:
                     color = layer_color
 
-        # 虚线样式：选中的管道使用虚线
-        dash = (4, 4) if pipe.pipe_id in self.selected_pipes else None
+        # 虚线样式：选中的管道使用虚线；环路高亮覆盖（最高优先级）
+        if hasattr(self, 'loop_highlight_pipe_ids') and pipe.pipe_id in self.loop_highlight_pipe_ids:
+            color = "red"
+            dash = (6, 3)
+        else:
+            dash = (4, 4) if pipe.pipe_id in self.selected_pipes else None
 
         # 检查是否需要断开绘制（整体管网模式且开启遮挡显示）
         breaks_data = self.occlusion_breaks.get(pipe.pipe_id, [])
@@ -2647,6 +2927,10 @@ class PreviewPage(ttk.Frame):
                 if flow_unit == 'm³/h':
                     flow_abs = flow_abs * 3.6
                 text_parts.append(f"{flow_abs:.2f}{flow_unit}")
+        if self.calculation_available and self.show_velocity.get() and not pipe.pipe_id.startswith('L_'):
+            vel = self.pipe_results.get(pipe.pipe_id, {}).get('velocity_mps', 0.0)
+            if abs(vel) > 0.001 or self.show_zero_flow_label_var.get():
+                text_parts.append(f"{vel:.2f}m/s")
         if self.calculation_available and self.show_loss.get() and not pipe.pipe_id.startswith('L_'):
             loss = self.pipe_results.get(pipe.pipe_id, {}).get('total_loss', 0)
             if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
@@ -5400,20 +5684,23 @@ class PreviewPage(ttk.Frame):
         if self.current_floor_name is None and self.cad_data_manager.floors:
             self.current_floor_name = self.cad_data_manager.floors[0].name
     
-        # 加载新数据时强制居中，不依赖 floor_view_state
+        # 加载新数据时强制居中（仅该楼层从未访问过才居中）
         if not keep_view and self.current_view_mode != "global":
-            self.auto_center()
-            if self.current_floor_name:
-                self.floor_view_state[self.current_floor_name] = (self.scale, self.translate_x, self.translate_y)
+            if self.current_floor_name not in self.floor_view_state:
+                self.auto_center()
+                if self.current_floor_name:
+                    self.floor_view_state[self.current_floor_name] = (self.scale, self.translate_x, self.translate_y)
         self.problem_pipes = self.cad_data_manager.validate_problem_pipes()
         # 更新计算结果相关控件状态
         if self.calculation_available:
             self.flow_check.config(state="normal")
             self.loss_check.config(state="normal")
             self.arrow_check.config(state="normal")
+            self.velocity_check.config(state="normal")
             self.node_pressure_check.config(state="normal")
         else:
             self.flow_check.config(state="disabled")
+            self.velocity_check.config(state="disabled")
             self.loss_check.config(state="disabled")
             self.arrow_check.config(state="disabled")
             self.node_pressure_check.config(state="disabled")
@@ -5626,6 +5913,13 @@ class PreviewPage(ttk.Frame):
             self.duplicate_risers_by_floor = self.cad_data_manager.duplicate_risers_by_floor
 
             self.redo_stack.append(cmd)
+        elif cmd['type'] == 'batch_attr':
+            changes = cmd['changes']
+            for item in changes:
+                pipe = item['pipe']
+                pipe.nominal_diameter = item['old_dn']
+                pipe.inner_diameter = item['old_inner']
+            self.redo_stack.append(cmd)
         else:
             return
     
@@ -5778,10 +6072,12 @@ class PreviewPage(ttk.Frame):
         self.pipe_results = {}
         self.calculation_available = False
         self.show_flow.set(False)
+        self.show_velocity.set(False)
         self.show_loss.set(False)
         self.show_arrow.set(False)
         self.show_node_pressure.set(False)
         self.flow_check.config(state="disabled")
+        self.velocity_check.config(state="disabled")
         self.loss_check.config(state="disabled")
         self.arrow_check.config(state="disabled")
         self.node_pressure_check.config(state="disabled")
@@ -5938,4 +6234,226 @@ class PreviewPage(ttk.Frame):
 
         # 重新绘制
         self.redraw()
+
+
+def _bfs_tree_and_detect_loops(adjacency, start_node, edge_to_pipe):
+    """BFS 遍历，返回树边列表 (parent, child)；检测到环路时抛出 ValueError(pipe_ids)"""
+    visited = {start_node: None}
+    queue = deque([start_node])
+    tree_edges = []
+    while queue:
+        u = queue.popleft()
+        for v in adjacency.get(u, []):
+            if v not in visited:
+                visited[v] = u
+                queue.append(v)
+                tree_edges.append((u, v))
+            elif v != visited.get(u):
+                cycle_pipes = _find_cycle_pipe_ids(visited, u, v, edge_to_pipe)
+                raise ValueError(cycle_pipes)
+    return tree_edges
+
+
+def _find_cycle_pipe_ids(visited, u, v, edge_to_pipe):
+    """从 BFS parent 表与检测到的跨边 (u,v) 重建环路管道 ID 列表"""
+    u_ancestors = {u: 0}
+    curr = visited.get(u)
+    depth = 1
+    while curr is not None:
+        u_ancestors[curr] = depth
+        curr = visited.get(curr)
+        depth += 1
+    curr = v
+    lca = None
+    while curr is not None:
+        if curr in u_ancestors:
+            lca = curr
+            break
+        curr = visited.get(curr)
+    if lca is None:
+        return []
+    u_path = [u]
+    curr = visited.get(u)
+    while curr is not None and curr != lca:
+        u_path.append(curr)
+        curr = visited.get(curr)
+    u_path.append(lca)
+    v_path = [v]
+    curr = visited.get(v)
+    while curr is not None and curr != lca:
+        v_path.append(curr)
+        curr = visited.get(curr)
+    v_path.append(lca)
+    cycle_nodes = u_path + list(reversed(v_path[:-1]))
+    cycle_nodes.append(u)
+    pipe_ids = []
+    for i in range(len(cycle_nodes) - 1):
+        a, b = cycle_nodes[i], cycle_nodes[i + 1]
+        pipe = edge_to_pipe.get(tuple(sorted((a, b))))
+        if pipe:
+            pipe_ids.append(pipe.pipe_id)
+    return pipe_ids
+
+
+class SprinklerCapacityDialog(tk.Toplevel):
+    """喷淋管径表编辑对话框"""
+
+    def __init__(self, parent, file_path, default_path):
+        super().__init__(parent)
+        self.parent = parent
+        self.file_path = file_path
+        self.default_path = default_path
+
+        self.title("喷淋管径表")
+        self.transient(parent)
+        self.resizable(False, False)
+
+        self.data = self._load_data()
+        self._build_ui()
+        self._center_on_parent()
+
+        self.grab_set()
+        self.focus_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.bind("<Escape>", lambda e: self._on_cancel())
+        self.wait_window()
+
+    def _load_data(self):
+        with open(self.file_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        k_vals = sorted(raw.keys(), key=int)
+        dns = sorted(raw[k_vals[0]].keys(),
+                     key=lambda x: int(x[2:]) if x.startswith('DN') else 0)
+        return {k: {d: raw[k][d] for d in dns} for k in k_vals}
+
+    def _build_ui(self):
+        main_frame = ttk.Frame(self, padding=10)
+        main_frame.pack(fill="both", expand=True)
+
+        table_frame = ttk.Frame(main_frame)
+        table_frame.pack()
+
+        cw = 7
+        k_vals = list(self.data.keys())
+        dns = list(self.data[k_vals[0]].keys())
+
+        # A1: "K="
+        ttk.Label(table_frame, text="K=", width=cw, anchor="center",
+                  relief="solid", borderwidth=1).grid(row=0, column=0, sticky="nsew")
+
+        # B1-J1: K值 只读
+        for j, k in enumerate(k_vals):
+            ttk.Label(table_frame, text=k, width=cw, anchor="center",
+                      relief="solid", borderwidth=1).grid(row=0, column=j+1, sticky="nsew")
+
+        self.entry_vars = {}
+        self.entries = {}
+
+        for i, dn in enumerate(dns):
+            # A2-A12: 管径 只读
+            ttk.Label(table_frame, text=dn, width=cw, anchor="center",
+                      relief="solid", borderwidth=1).grid(row=i+1, column=0, sticky="nsew")
+
+            for j, k in enumerate(k_vals):
+                var = tk.StringVar(value=str(self.data[k][dn]))
+                entry = ttk.Entry(table_frame, textvariable=var, width=cw, justify="center")
+                entry.grid(row=i+1, column=j+1, sticky="nsew")
+
+                entry._valid_value = str(self.data[k][dn])
+                entry._k = k
+                entry._dn = dn
+                entry.bind("<FocusOut>", self._on_cell_focusout, add="+")
+
+                self.entry_vars[(dn, k)] = var
+                self.entries[(dn, k)] = entry
+
+        # 按钮行
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(btn_frame, text="恢复默认", command=self._on_restore_default).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="保存", command=self._on_save).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=self._on_cancel).pack(side="left", padx=5)
+
+    def _on_cell_focusout(self, event):
+        entry = event.widget
+        val = entry.get().strip()
+        k = entry._k
+        dn = entry._dn
+
+        if val == "":
+            entry.delete(0, tk.END)
+            entry.insert(0, entry._valid_value)
+            return
+
+        try:
+            num_str = val.lstrip('-')
+            if not num_str.isdigit():
+                raise ValueError
+            num = int(val)
+            if num < 0:
+                raise ValueError
+        except ValueError:
+            entry.delete(0, tk.END)
+            entry.insert(0, entry._valid_value)
+            return
+
+        self.data[k][dn] = num
+        entry._valid_value = str(num)
+
+    def _on_restore_default(self):
+        if not messagebox.askyesno("确认",
+                "确定要从默认文件恢复喷淋管径表吗？\n当前修改将被丢弃。"):
+            return
+        try:
+            shutil.copy2(self.default_path, self.file_path)
+        except Exception as e:
+            messagebox.showerror("错误", f"恢复默认失败：{e}")
+            return
+        self.data = self._load_data()
+        for (dn, k), entry in self.entries.items():
+            val = str(self.data[k][dn])
+            entry._valid_value = val
+            self.entry_vars[(dn, k)].set(val)
+
+    def _on_save(self):
+        # 校验并同步所有单元格到 data
+        for (dn, k), entry in self.entries.items():
+            val = entry.get().strip()
+            try:
+                if val == "" or not val.lstrip('-').isdigit():
+                    raise ValueError
+                num = int(val)
+                if num < 0:
+                    raise ValueError
+            except ValueError:
+                entry.delete(0, tk.END)
+                entry.insert(0, entry._valid_value)
+                entry.focus_set()
+                messagebox.showerror("输入错误",
+                    f"K={k}, {dn} 的数值无效，请输入非负整数。")
+                return
+            self.data[k][dn] = int(val)
+        try:
+            with open(self.file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            messagebox.showerror("错误", f"保存失败：{e}")
+            return
+        self.destroy()
+
+    def _on_cancel(self):
+        self.destroy()
+
+    def _center_on_parent(self):
+        self.update_idletasks()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        pw = self.parent.winfo_width()
+        ph = self.parent.winfo_height()
+        px = self.parent.winfo_rootx()
+        py = self.parent.winfo_rooty()
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.geometry(f"+{x}+{y}")
 
