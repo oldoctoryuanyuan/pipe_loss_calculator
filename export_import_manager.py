@@ -585,7 +585,13 @@ class ProjectImporter:
 
         # 4. 恢复其他状态
         cdm.grouped_floors_map = data.get("grouped_floors_map", {})
-        cdm.duplicate_risers_by_floor = data.get("duplicate_risers_by_floor", {})
+        dup_riser_ids = data.get("duplicate_risers_by_floor", {})
+        cdm.duplicate_risers_by_floor = {}
+        for fname, rid_list in dup_riser_ids.items():
+            cdm.duplicate_risers_by_floor[fname] = [
+                cdm.riser_by_id[rid] for rid in rid_list
+                if rid in cdm.riser_by_id
+            ]
         cdm.duplicate_pipe_ids_by_floor = {}
         for fname, pids in data.get("duplicate_pipe_ids_by_floor", {}).items():
             cdm.duplicate_pipe_ids_by_floor[fname] = set(pids)
