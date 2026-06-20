@@ -559,7 +559,7 @@ class SettingsPage(ttk.Frame):
         self.min_velocity_var = tk.StringVar(value=str(self.current_config.get("min_velocity", 1.0)))
         
         # 喷头K输入框改为Combobox，可输入可选择
-        k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161, 200, 202, 242, 320, 363], width=8, state='normal')
+        k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161, 200, 202, 242, 320, 363], width=8, state='readonly')
         k_combo.grid(row=1, column=0, padx=5, pady=2)
 
         # 其他输入框保持Entry
