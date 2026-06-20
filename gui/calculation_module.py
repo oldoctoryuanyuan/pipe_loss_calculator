@@ -231,7 +231,7 @@ class CalculationPage(ttk.Frame):
 
     def on_show_zero_flow_changed(self):
         """显示无流量节点和管道选项改变时刷新表格"""
-        if hasattr(self, 'original_results'):
+        if getattr(self, 'original_results', None) is not None:
             node_results = self.original_results.get("node_results", [])
             self.update_nodes_table(node_results)
             pipe_results = self.original_results.get("pipe_results", [])
@@ -420,7 +420,7 @@ class CalculationPage(ttk.Frame):
         else:
             self.nodes_sort_column = col
             self.nodes_sort_reverse = False
-        if hasattr(self, 'original_results'):
+        if getattr(self, 'original_results', None) is not None:
             node_results = self.original_results.get("node_results", [])
             self.update_nodes_table(node_results)
 
@@ -1007,7 +1007,7 @@ class CalculationPage(ttk.Frame):
         }
 
         # 1. 节点结果（从 original_results 中提取）
-        if hasattr(self, 'original_results'):
+        if getattr(self, 'original_results', None) is not None:
             node_results = self.original_results.get("node_results", [])
             save_data["节点结果"] = convert_to_serializable(node_results)
 
@@ -1463,7 +1463,7 @@ class CalculationPage(ttk.Frame):
                 logger.info("已调用预览页面的 set_path_list")
         
         # 刷新节点表格以更新实际压力
-        if hasattr(self, 'original_results'):
+        if getattr(self, 'original_results', None) is not None:
             self.update_nodes_table(self.original_results.get("node_results", []))
 
     def find_directed_paths(self, graph, start, end, max_paths=10):
@@ -1498,7 +1498,7 @@ class CalculationPage(ttk.Frame):
         self.show_flow_in_m3h = self.flow_unit_var.get()
         self.show_pressure_in_mpa = self.pressure_unit_var.get()
         self.update_table_headers()
-        if hasattr(self, 'original_results'):
+        if getattr(self, 'original_results', None) is not None:
             node_results = self.original_results.get("node_results", [])
             self.update_nodes_table(node_results)
             pipe_results = self.original_results.get("pipe_results", [])
