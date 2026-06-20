@@ -3956,7 +3956,7 @@ class CADDataManager:
             # ★ 关键：下端节点绝不能加入 floor.nodes，否则后续 assign_node_z_coordinates 会将其 Z 覆盖为管网标高
 
             # ---------- 管径 ----------
-            dn = riser.nominal_diameter if riser.nominal_diameter else "DN100"
+            dn = riser.nominal_diameter if riser.nominal_diameter else (self.default_color256_diameter or "DN100")
             info = self.material_manager.get_diameter_info(pipe_material, dn)
             inner_d = info.get("inner", 100.0) if info else 100.0
             if not info:
@@ -4048,7 +4048,7 @@ class CADDataManager:
                 bottom_node = self.node_by_id[bottom_node_id]
 
                 # 连接管管径：上层立管管径，无则 DN100
-                dn_conn = ru.nominal_diameter if ru.nominal_diameter else "DN100"
+                dn_conn = ru.nominal_diameter if ru.nominal_diameter else (self.default_color256_diameter or "DN100")
                 info_conn = self.material_manager.get_diameter_info(pipe_material, dn_conn)
                 inner_conn = info_conn.get("inner", 100.0) if info_conn else 100.0
 
