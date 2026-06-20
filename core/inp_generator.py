@@ -4,7 +4,8 @@ INP文件生成器
 """
 import os
 import json
-from typing import Dict, List, Tuple
+from collections import deque
+from typing import Dict, List, Tuple, Set
 from dataclasses import dataclass
 import logging
 from datetime import datetime
@@ -115,6 +116,45 @@ class INPGenerator:
             
         return models
     
+    def _get_reachable_nodes(self, cad_data_manager) -> Set[str]:
+        """BFS从所有供水点出发遍历开启管道，返回可达节点集合"""
+        # 收集关闭阀门对应的管道
+        closed_pipes = set()
+        for valve in cad_data_manager.valves:
+            if valve.status == "CLOSED":
+                closed_pipes.add(valve.pipe_id)
+
+        # 构建无向邻接表
+        adj = {}
+        for pipe in cad_data_manager.pipes:
+            if not pipe.is_active or pipe.pipe_id in closed_pipes:
+                continue
+            sn = cad_data_manager.node_by_id.get(pipe.start_node_id)
+            en = cad_data_manager.node_by_id.get(pipe.end_node_id)
+            if not sn or not en or not sn.is_active or not en.is_active:
+                continue
+            adj.setdefault(pipe.start_node_id, set()).add(pipe.end_node_id)
+            adj.setdefault(pipe.end_node_id, set()).add(pipe.start_node_id)
+
+        # 收集所有供水点节点
+        starts: Set[str] = set()
+        for supply in cad_data_manager.supply_nodes:
+            starts.update(supply.node_ids)
+
+        if not starts:
+            return {n.node_id for n in cad_data_manager.nodes if n.is_active}
+
+        # BFS
+        visited = set(starts)
+        q = deque(starts)
+        while q:
+            u = q.popleft()
+            for v in adj.get(u, set()):
+                if v not in visited:
+                    visited.add(v)
+                    q.append(v)
+        return visited
+
     def _generate_inp_content(self, cad_data_manager, demand_group_models,
                             flow_factor, pressure_factor, no_virtual=False) -> str:
         """生成完整的INP文件内容 - 修正节点重复定义问题"""
@@ -140,7 +180,11 @@ class INPGenerator:
         for valve in cad_data_manager.valves:
             if valve.status == "CLOSED":
                 pipes_to_close.add(valve.pipe_id)
-        
+
+        # ===== BFS 从供水点出发，找出可达节点 =====
+        reachable_nodes = self._get_reachable_nodes(cad_data_manager)
+        logger.info(f"INP生成: 供水点可达节点 {len(reachable_nodes)} 个")
+
         # ===== 节点段 - 移除重复的水源节点 =====
         lines.append("[JUNCTIONS]")
         lines.append(";ID               Elev         Demand      Pattern")
@@ -153,6 +197,8 @@ class INPGenerator:
             if not node.is_active:
                 continue   # 跳过无效节点
             node_id = node.node_id
+            if node_id not in reachable_nodes:
+                continue
             if node_id not in written_nodes:
                 # 高程转换为米
                 elev_m = node.z / 1000.0
@@ -166,9 +212,11 @@ class INPGenerator:
                 lines.append(f"{node_id:15} {elev_m:<10.3f} {demand_val:<10.3f} Pattern1")
                 written_nodes.add(node_id)
         
-        # 2. 写入虚拟用水点节点（每个激活的用水点组）
+        # 2. 写入虚拟用水点节点（每个激活的用水点组，仅当组内有可达节点）
         if not no_virtual:
             for group_model in demand_group_models.values():
+                if not any(nid in reachable_nodes for nid in group_model.actual_node_ids):
+                    continue
                 virtual_node_id = group_model.demand_node_id  # 格式如 "D_1#"
                 if virtual_node_id not in written_nodes:
                     # 设置组总流量作为需求
@@ -222,7 +270,11 @@ class INPGenerator:
             end_node = cad_data_manager.node_by_id.get(pipe.end_node_id)
             if not start_node or not end_node or not start_node.is_active or not end_node.is_active:
                 logger.warning(f"管道 {pipe.pipe_id} 的端点节点无效或不存在，跳过写入")
-                continue    
+                continue
+            if (pipe.start_node_id not in reachable_nodes
+                or pipe.end_node_id not in reachable_nodes):
+                logger.debug(f"管道 {pipe.pipe_id} 端点不在供水点可达集合中，跳过写入")
+                continue
             
             # 如果管道上有阀门关闭，则管道状态为Closed
             if pipe.pipe_id in pipes_to_close:
@@ -253,11 +305,13 @@ class INPGenerator:
             lines.append(f"VP_S{virtual_pipe_id:04d}   {virtual_supply_id:15} {supply_node_id:15} "
                         f"{virtual_length_m:<8.3f}    {virtual_diameter_mm:<8.3f}  {virtual_roughness:<8.1f} 0.0      Open")
         
-        # 2. 虚拟用水点 -> 实际用水点
+        # 2. 虚拟用水点 -> 实际用水点（仅可达节点）
         if not no_virtual:
             for group_model in demand_group_models.values():
                 virtual_node_id = group_model.demand_node_id
                 for actual_node_id in group_model.actual_node_ids:
+                    if actual_node_id not in reachable_nodes:
+                        continue
                     virtual_pipe_id += 1
                     lines.append(f"VP_D{virtual_pipe_id:04d}   {virtual_node_id:15} {actual_node_id:15} "
                                 f"{virtual_length_m:<8.3f}    {virtual_diameter_mm:<8.3f}  {virtual_roughness:<8.1f} 0.0      Open")
@@ -291,7 +345,8 @@ class INPGenerator:
         for node in cad_data_manager.nodes:
             if not node.is_active:
                 continue
-                
+            if node.node_id not in reachable_nodes:
+                continue
             # 坐标单位：米
             x_m = node.x / 1000.0  # 毫米转米
             y_m = node.y / 1000.0
@@ -319,6 +374,8 @@ class INPGenerator:
         # 写入所有节点（包括虚拟水源）
         for node in cad_data_manager.nodes:
             if not node.is_active:
+                continue
+            if node.node_id not in reachable_nodes:
                 continue
             lines.append(f"{node.node_id:15} 0.0")
         lines.append(f"{virtual_supply_id:15} 0.0")
