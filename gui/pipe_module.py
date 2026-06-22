@@ -82,13 +82,21 @@ class PipePage(ttk.Frame):
         )
         self.context_menu.add_separator()
         self.context_menu.add_command(
+            label="跳转至整体预览",
+            command=self.jump_to_pipe_global
+        )
+        self.context_menu.add_command(
+            label="跳转至楼层预览",
+            command=self.jump_to_pipe_floor
+        )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(
             label="刷新",
             command=self.refresh_data
         )
         
         # 绑定右键事件
         self.tree.bind("<Button-3>", self.show_context_menu)
-
     def refresh_data(self):
         """刷新管道数据"""
         if not self.cad_data_manager.is_loaded:
@@ -195,3 +203,37 @@ class PipePage(ttk.Frame):
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.context_menu.grab_release()
+
+    def _switch_to_preview(self):
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if not main_app:
+            return None
+        notebook = main_app.notebook
+        for tab_id in notebook.tabs():
+            if notebook.tab(tab_id, "text") == "管网预览":
+                notebook.select(tab_id)
+                break
+        return main_app.pages.get("管网预览")
+
+    def jump_to_pipe_global(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_pipe(values[0], to_global=True)
+
+    def jump_to_pipe_floor(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_pipe(values[0], to_global=False)

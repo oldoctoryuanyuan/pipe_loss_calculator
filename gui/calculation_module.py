@@ -434,6 +434,9 @@ class CalculationPage(ttk.Frame):
         pipes_context_menu.add_separator()
         pipes_context_menu.add_command(label="复制选中项", command=self.copy_selected_pipes)
         pipes_context_menu.add_separator()
+        pipes_context_menu.add_command(label="跳转至整体预览", command=self.jump_to_pipe_global)
+        pipes_context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_pipe_floor)
+        pipes_context_menu.add_separator()
         pipes_context_menu.add_command(
             label="校正管径（全管网）",
             command=self.correct_all_pipe_diameters
@@ -649,6 +652,9 @@ class CalculationPage(ttk.Frame):
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="复制选中项", command=self.copy_selected)
         self.context_menu.add_command(label="导出选中路径", command=self.export_selected_path)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="跳转至整体预览", command=self.jump_to_node_global)
+        self.context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_node_floor)
         self.nodes_tree.bind("<Button-3>", self.show_context_menu)
         self.paths_tree.bind("<Button-3>", self.show_context_menu)
 
@@ -1630,6 +1636,62 @@ class CalculationPage(ttk.Frame):
             self.context_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.context_menu.grab_release()
+
+    def _switch_to_preview(self):
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if not main_app:
+            return None
+        notebook = main_app.notebook
+        for tab_id in notebook.tabs():
+            if notebook.tab(tab_id, "text") == "管网预览":
+                notebook.select(tab_id)
+                break
+        return main_app.pages.get("管网预览")
+
+    def jump_to_node_global(self):
+        selection = self.nodes_tree.selection()
+        if not selection:
+            return
+        values = self.nodes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_node(values[0], to_global=True)
+
+    def jump_to_node_floor(self):
+        selection = self.nodes_tree.selection()
+        if not selection:
+            return
+        values = self.nodes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_node(values[0], to_global=False)
+
+    def jump_to_pipe_global(self):
+        selection = self.pipes_tree.selection()
+        if not selection:
+            return
+        values = self.pipes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_pipe(values[0], to_global=True)
+
+    def jump_to_pipe_floor(self):
+        selection = self.pipes_tree.selection()
+        if not selection:
+            return
+        values = self.pipes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_pipe(values[0], to_global=False)
 
     def show_temp_message(self, message: str, duration: int = 2000):
         root = self.winfo_toplevel()

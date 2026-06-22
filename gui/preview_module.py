@@ -424,7 +424,8 @@ class PreviewPage(ttk.Frame):
         self._hover_info = None          # (info_type, lines)
         self._hover_canvas_pos = None    # (canvasx, canvasy)
         self._hover_screen_pos = None    # (root_x, root_y)        
-
+        self._pending_jump = None         # 待执行的跳转缩放 (type, entity_id, extra)
+        
         # 高亮数据
         self.highlight_path_pipes: Set[str] = set()
         self.highlight_path_nodes: Set[str] = set()
@@ -1423,9 +1424,8 @@ class PreviewPage(ttk.Frame):
         if not nodes_x:
             return
         cx, cy = (min(nodes_x) + max(nodes_x)) / 2, (min(nodes_y) + max(nodes_y)) / 2
-        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
-        if cw <= 0 or ch <= 0:
-            return
+        cw = max(self.canvas.winfo_width(), 800)
+        ch = max(self.canvas.winfo_height(), 600)
         pw = max(max(nodes_x) - min(nodes_x), 1)
         ph = max(max(nodes_y) - min(nodes_y), 1)
         new_scale = min((cw * 0.5) / pw, (ch * 0.5) / ph)
@@ -1433,6 +1433,138 @@ class PreviewPage(ttk.Frame):
         self.translate_x = (cw / 2) - cx * new_scale
         self.translate_y = (ch / 2) - cy * new_scale
         self.redraw()
+
+    def _switch_to_floor_tab(self, tab_text):
+        current_idx = self.floor_notebook.index(self.floor_notebook.select())
+        for i, tab_id in enumerate(self.floor_notebook.tabs()):
+            if self.floor_notebook.tab(tab_id, "text") == tab_text:
+                self.floor_notebook.select(tab_id)
+                return i != current_idx
+        return False
+
+    def jump_to_pipe(self, pipe_id, to_global=False):
+        self._pending_jump = ('pipe', pipe_id, None)
+        if to_global:
+            switched = self._switch_to_floor_tab("整体管网")
+        else:
+            floor_name = self.pipe_floor_map.get(pipe_id)
+            switched = self._switch_to_floor_tab(floor_name) if floor_name else False
+        if not switched:
+            self._execute_jump_zoom()
+
+    def jump_to_node(self, node_id, to_global=False):
+        cad = self.cad_data_manager
+        longest_pipe_id = None
+        longest_len = -1
+        for pipe in cad.pipes:
+            if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+                continue
+            if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
+                if pipe.length > longest_len:
+                    longest_len = pipe.length
+                    longest_pipe_id = pipe.pipe_id
+        self._pending_jump = ('node', node_id, longest_pipe_id)
+        if to_global:
+            switched = self._switch_to_floor_tab("整体管网")
+        else:
+            switched = False
+            for pipe in cad.pipes:
+                if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+                    continue
+                if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
+                    floor_name = self.pipe_floor_map.get(pipe.pipe_id)
+                    if floor_name:
+                        switched = self._switch_to_floor_tab(floor_name)
+                        break
+        if not switched:
+            self._execute_jump_zoom()
+
+    def jump_to_valve(self, valve_id, to_global=False):
+        cad = self.cad_data_manager
+        valve = cad.valve_by_id.get(valve_id)
+        if not valve or not valve.pipe_id:
+            return
+        self._pending_jump = ('valve', valve_id, None)
+        if to_global:
+            switched = self._switch_to_floor_tab("整体管网")
+        else:
+            floor_name = valve.floor_name or self.pipe_floor_map.get(valve.pipe_id)
+            switched = self._switch_to_floor_tab(floor_name) if floor_name else False
+        if not switched:
+            self._execute_jump_zoom()
+
+    def _jump_zoom_pipe(self, pipe_id):
+        self.update_projection()
+        if self.current_view_mode == "floor":
+            self._filter_projected_to_current_floor()
+        self._zoom_to_pipes([pipe_id])
+
+    def _jump_zoom_node(self, node_id, longest_pipe_id):
+        self.update_projection()
+        if self.current_view_mode == "floor":
+            self._filter_projected_to_current_floor()
+        if longest_pipe_id:
+            self._zoom_to_pipes([longest_pipe_id])
+        self.scale *= 2.0
+        pt = self.projected_coords.get(node_id)
+        if pt:
+            cw = max(self.canvas.winfo_width(), 800)
+            ch = max(self.canvas.winfo_height(), 600)
+            self.translate_x = (cw / 2) - pt[0] * self.scale
+            self.translate_y = (ch / 2) - pt[1] * self.scale
+            self.redraw()
+
+    def _jump_zoom_valve(self, valve_id):
+        cad = self.cad_data_manager
+        valve = cad.valve_by_id.get(valve_id)
+        if not valve or not valve.pipe_id:
+            return
+        self.update_projection()
+        if self.current_view_mode == "floor":
+            self._filter_projected_to_current_floor()
+        self._zoom_to_pipes([valve.pipe_id])
+        pipe = cad.pipe_by_id.get(valve.pipe_id)
+        if pipe:
+            s = self.projected_coords.get(pipe.start_node_id)
+            e = self.projected_coords.get(pipe.end_node_id)
+            if s and e:
+                t = valve.distance_on_pipe
+                vx = s[0] + t * (e[0] - s[0])
+                vy = s[1] + t * (e[1] - s[1])
+                cw = max(self.canvas.winfo_width(), 800)
+                ch = max(self.canvas.winfo_height(), 600)
+                self.translate_x = (cw / 2) - vx * self.scale
+                self.translate_y = (ch / 2) - vy * self.scale
+                self.redraw()
+
+    def _execute_jump_zoom(self):
+        """执行待处理的跳转缩放，并更新 floor_view_state"""
+        info = self._pending_jump
+        self._pending_jump = None
+        if not info:
+            return
+        etype = info[0]
+        if etype == 'pipe':
+            self._jump_zoom_pipe(info[1])
+        elif etype == 'node':
+            node_id = info[1]
+            longest_pipe_id = info[2]
+            if longest_pipe_id is None:
+                cad = self.cad_data_manager
+                longest_len = -1
+                for pipe in cad.pipes:
+                    if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+                        continue
+                    if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
+                        if pipe.length > longest_len:
+                            longest_len = pipe.length
+                            longest_pipe_id = pipe.pipe_id
+            self._jump_zoom_node(node_id, longest_pipe_id)
+        elif etype == 'valve':
+            self._jump_zoom_valve(info[1])
+        self.floor_view_state[self.current_floor_name] = (
+            self.scale, self.translate_x, self.translate_y
+        )
 
     def center_dialog(self, dialog):
         """将对话框居中于父窗口"""
@@ -1673,7 +1805,13 @@ class PreviewPage(ttk.Frame):
     
         # 更新投影并重绘（不重置视图）
         self.update_projection()
+        if self.current_view_mode == "floor":
+            self._filter_projected_to_current_floor()
         self.redraw()
+        
+        # 执行待处理的跳转缩放
+        if self._pending_jump:
+            self._execute_jump_zoom()
 
     def _filter_projected_to_current_floor(self):
         """过滤 projected_coords 只保留当前楼层节点，使 auto_center 以该楼层范围居中。"""
@@ -3196,6 +3334,15 @@ class PreviewPage(ttk.Frame):
                                  tags="arrow")
 
     def draw_node(self, node):
+        # 隐藏无效管模式下，跳过无有效管道连接的节点
+        if self.hide_invalid_var.get():
+            connected = getattr(node, 'connected_pipes', []) or []
+            has_valid = any(
+                p is not None and p.is_active
+                for p in (self.cad_data_manager.pipe_by_id.get(pid) for pid in connected)
+            )
+            if not has_valid:
+                return
         wpos = self.projected_coords.get(node.node_id)
         if not wpos:
             return
@@ -3313,7 +3460,7 @@ class PreviewPage(ttk.Frame):
             text_x = vx + 12 * self.scale
             text_y = vy
             # 根据缩放调整字体大小
-            font_size = max(8, int(10 * self.scale))
+            font_size = max(10, int(10 * self.scale))
             self.canvas.create_text(text_x, text_y, text=valve.valve_id, fill="white",
                                     font=("Arial", font_size), anchor="w", tags="valve_text")
             
