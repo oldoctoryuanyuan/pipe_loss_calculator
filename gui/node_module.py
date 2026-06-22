@@ -61,10 +61,6 @@ class NodePage(ttk.Frame):
     def setup_context_menu(self):
         """设置右键菜单"""
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(
-            label="反写节点ID到CAD",
-            command=self.write_back_to_cad
-        )
         self.context_menu.add_separator()
         self.context_menu.add_command(
             label="跳转至整体预览",
@@ -162,34 +158,6 @@ class NodePage(ttk.Frame):
         # 6. 强制刷新布局（确保滚动条更新）
         self.tree.update_idletasks()
            
-    def write_back_to_cad(self):
-        """将节点ID反写到CAD"""
-        if not self.node_data:
-            logger.warning("没有可反写的节点数据")
-            return
-        
-        try:
-            success, fail, message, _ = self.cad_data_manager.write_back_to_cad("nodes", self.node_data)
-            
-            logger.info(f"节点反写结果: {message}")
-            
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(message, 2000)
-            except:
-                pass
-                
-        except Exception as e:
-            error_msg = f"反写异常: {str(e)}"
-            logger.error(error_msg)
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(error_msg, 3000)
-            except:
-                pass
-
     
     def show_context_menu(self, event):
         """显示右键菜单"""

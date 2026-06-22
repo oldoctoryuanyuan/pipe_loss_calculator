@@ -67,10 +67,6 @@ class ValvePage(ttk.Frame):
     def setup_context_menu(self):
         """设置右键菜单"""
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(
-            label="反写阀门ID到CAD",
-            command=self.write_back_to_cad
-        )
         self.context_menu.add_separator()
         self.context_menu.add_command(
             label="跳转至整体预览",
@@ -125,35 +121,7 @@ class ValvePage(ttk.Frame):
             )
             self.tree.insert("", tk.END, values=values)
     
-    def write_back_to_cad(self):
-        """将阀门ID反写到CAD"""
-        if not self.valve_data:
-            logger.warning("没有可反写的阀门数据")
-            return
-        
-        try:
-            success, fail, message, _ = self.cad_data_manager.write_back_to_cad("valves", self.valve_data)
-            
-            logger.info(f"阀门反写结果: {message}")
-            
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(message, 2000)
-            except:
-                pass
-                
-        except Exception as e:
-            error_msg = f"反写异常: {str(e)}"
-            logger.error(error_msg)
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(error_msg, 3000)
-            except:
-                pass
-
-   
+    
     def on_double_click(self, event):
         """双击编辑阀门状态"""
         item = self.tree.selection()

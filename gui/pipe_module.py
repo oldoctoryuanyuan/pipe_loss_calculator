@@ -72,14 +72,6 @@ class PipePage(ttk.Frame):
     def setup_context_menu(self):
         """设置右键菜单"""
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(
-            label="导出为CSV",
-            command=self.export_to_csv
-        )
-        self.context_menu.add_command(
-            label="反写管道ID到CAD",
-            command=self.write_back_to_cad
-        )
         self.context_menu.add_separator()
         self.context_menu.add_command(
             label="跳转至整体预览",
@@ -139,64 +131,7 @@ class PipePage(ttk.Frame):
             if not pipe.is_active:
                 self.tree.item(item, tags=('inactive',))
     
-    def export_to_csv(self):
-        """导出为CSV文件"""
-        if not self.pipe_data:
-            messagebox.showwarning("无数据", "没有可导出的管道数据")
-            return
-        
-        try:
-            # 获取保存路径
-            default_dir = os.path.dirname(self.cad_data_manager.cad_file_path) \
-                if self.cad_data_manager.cad_file_path else os.getcwd()
-            
-            file_path = filedialog.asksaveasfilename(
-                defaultextension=".csv",
-                filetypes=[("CSV文件", "*.csv")],
-                initialdir=default_dir,
-                initialfile="管道数据.csv"
-            )
-            
-            if file_path:
-                import pandas as pd
-                df = self.cad_data_manager.export_to_dataframe("pipes")
-                df.to_csv(file_path, index=False, encoding='utf-8-sig')
-                messagebox.showinfo("导出成功", f"已导出到:\n{file_path}")
-                
-        except Exception as e:
-            messagebox.showerror("导出失败", f"导出失败:\n{str(e)}")
     
-    def write_back_to_cad(self):
-        """将管道ID和管径反写到CAD"""
-        if not self.pipe_data:
-            logger.warning("没有可反写的管道数据")
-            return
-        
-        try:
-            success, fail, message, _ = self.cad_data_manager.write_back_to_cad("pipes", self.pipe_data)
-            
-            # ✅ 简单地通过日志和状态栏显示
-            logger.info(f"管道反写结果: {message}")
-            
-            # 尝试获取主程序并显示消息
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(message, 2000)
-            except:
-                pass
-                
-        except Exception as e:
-            error_msg = f"反写异常: {str(e)}"
-            logger.error(error_msg)
-            try:
-                root = self.winfo_toplevel()
-                if hasattr(root, 'show_temp_message'):
-                    root.show_temp_message(error_msg, 3000)
-            except:
-                pass
-
-
     def show_context_menu(self, event):
         """显示右键菜单"""
         try:

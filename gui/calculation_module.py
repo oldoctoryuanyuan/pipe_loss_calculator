@@ -427,13 +427,6 @@ class CalculationPage(ttk.Frame):
     def show_pipes_context_menu(self, event):
         """显示管道表格的右键菜单"""
         pipes_context_menu = tk.Menu(self, tearoff=0)
-        pipes_context_menu.add_command(
-            label="反写管道ID和水损到CAD",
-            command=self.write_back_pipe_loss_to_cad
-        )
-        pipes_context_menu.add_separator()
-        pipes_context_menu.add_command(label="复制选中项", command=self.copy_selected_pipes)
-        pipes_context_menu.add_separator()
         pipes_context_menu.add_command(label="跳转至整体预览", command=self.jump_to_pipe_global)
         pipes_context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_pipe_floor)
         pipes_context_menu.add_separator()
@@ -450,65 +443,8 @@ class CalculationPage(ttk.Frame):
         finally:
             pipes_context_menu.grab_release()
 
-    def write_back_pipe_loss_to_cad(self):
-        """将管道ID、流量和总水损反写到CAD - 修正版"""
-        if not hasattr(self, 'pipe_display_data') or not self.pipe_display_data:
-            messagebox.showwarning("无数据", "没有管道结果数据可反写")
-            return
-        
-        try:
-            pipes_to_write = []
-            flow_unit_str = "m³/h" if self.show_flow_in_m3h else "L/s"
-            pressure_unit_str = "MPa" if self.show_pressure_in_mpa else "m"
-            
-            for pipe in self.pipe_display_data:
-                pipe_id = pipe["pipe_id"]
-                if not pipe_id.startswith("P_"):
-                    continue
-                pipe_data = self.cad_data_manager.pipe_by_id.get(pipe_id)
-                if not pipe_data:
-                    continue
-                
-                flow = pipe.get("raw_flow", 0.0)          # 原始流量带符号
-                total_loss = pipe.get("sort_loss", 0.0)   # 原始水损（未转换单位）
-                if self.show_flow_in_m3h:
-                    flow_display = abs(flow * 3.6)
-                else:
-                    flow_display = abs(flow)
-                data_line = f"{pipe_id}_{flow_display:.2f}{flow_unit_str}_{total_loss:.3f}{pressure_unit_str}"
-                pipe_data.display_text = data_line
-                pipe_data.flow_value = flow
-                pipe_data.show_arrow = (flow != 0)
-                pipes_to_write.append(pipe_data)
-            
-            if not pipes_to_write:
-                messagebox.showwarning("无数据", "没有找到可反写的管道数据")
-                return
-            
-            success, fail, message, _ = self.cad_data_manager.write_back_to_cad("pipes", pipes_to_write)
-            if success > 0:
-                self.show_temp_message(f"成功反写 {success} 条管道的数据和箭头到CAD")
-                logger.info(f"管道反写结果: {message}")
-                for pipe in pipes_to_write:
-                    for attr_name in ['display_text', 'flow_value', 'show_arrow']:
-                        if hasattr(pipe, attr_name):
-                            delattr(pipe, attr_name)
-            else:
-                messagebox.showwarning("反写失败", message)
-                
-        except Exception as e:
-            error_msg = f"反写异常: {str(e)}"
-            logger.error(error_msg)
-            messagebox.showerror("错误", error_msg)
-
     def on_units_changed(self):
         self.on_unit_check_changed()
-
-    def copy_selected_pipes(self):
-        selection = self.pipes_tree.selection()
-        if not selection:
-            return
-        self.show_temp_message(f"已复制 {len(selection)} 条管道数据")
 
     def update_pipes_table(self, pipe_results: list):
         self.pipe_results_data = pipe_results.copy()
@@ -650,9 +586,6 @@ class CalculationPage(ttk.Frame):
 
     def setup_bindings(self):
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(label="复制选中项", command=self.copy_selected)
-        self.context_menu.add_command(label="导出选中路径", command=self.export_selected_path)
-        self.context_menu.add_separator()
         self.context_menu.add_command(label="跳转至整体预览", command=self.jump_to_node_global)
         self.context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_node_floor)
         self.nodes_tree.bind("<Button-3>", self.show_context_menu)
@@ -1617,19 +1550,6 @@ class CalculationPage(ttk.Frame):
                 df_settings.to_excel(writer, sheet_name='计算设置', index=False)
         except ImportError:
             messagebox.showerror("导出失败", "导出Excel需要pandas库，请先安装：\npip install pandas openpyxl")
-
-    def export_selected_path(self):
-        selection = self.paths_tree.selection()
-        if not selection:
-            return
-        item = self.paths_tree.item(selection[0])
-        values = item["values"]
-        messagebox.showinfo("导出路径", f"将导出路径: {values[0]}")
-
-    def copy_selected(self):
-        selection = self.paths_tree.selection()
-        if selection:
-            self.show_temp_message(f"已复制 {len(selection)} 条路径数据")
 
     def show_context_menu(self, event):
         try:
