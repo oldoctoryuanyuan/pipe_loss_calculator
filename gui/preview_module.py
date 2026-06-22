@@ -1052,8 +1052,6 @@ class PreviewPage(ttk.Frame):
             messagebox.showwarning("不支持", "赋予管径功能仅在喷淋模式下可用。")
             return
 
-        K = int(float(config.get("sprinkler_K", 80)))
-        K_str = str(K)
         root_dir = _get_exe_dir()
         file_path = os.path.join(root_dir, "sprinkler_k_factor_pipe_capacity.json")
 
@@ -1062,12 +1060,6 @@ class PreviewPage(ttk.Frame):
                 capacity = json.load(f)
         except Exception:
             messagebox.showerror("错误", "无法读取喷淋管径表文件。")
-            return
-
-        if K_str not in capacity:
-            messagebox.showwarning("K值未找到",
-                f"喷淋管径表中未找到 K={K} 对应的数据。\n"
-                f"请检查设置页面的K值或编辑喷淋管径表。")
             return
 
         supply_nodes = cad.supply_nodes
@@ -1112,82 +1104,247 @@ class PreviewPage(ttk.Frame):
             self._show_loop_warning(e.args[0])
             return
 
+        if not tree_edges:
+            messagebox.showwarning("无管道", "未找到可以赋予管径的管道。")
+            return
+
         visited_nodes = {supply_node_id}
         for parent, child in tree_edges:
             visited_nodes.add(parent)
             visited_nodes.add(child)
 
+        # 统计全树喷头 K 值
+        k_counter = defaultdict(int)
+        for nid in visited_nodes:
+            k = cad.sprinkler_k_map.get(nid)
+            if k:
+                k_counter[int(k)] += 1
+
+        if not k_counter:
+            messagebox.showwarning("无喷头", "管网中未检测到任何喷头，无法赋予管径。")
+            return
+
+        max_count = max(k_counter.values())
+        global_K = max(k for k, v in k_counter.items() if v == max_count)
+        global_K_str = str(global_K)
+
+        if global_K_str not in capacity:
+            messagebox.showwarning("K值未找到",
+                f"喷淋管径表中未找到 K={global_K} 对应的数据。\n"
+                f"请检查设置页面的K值或编辑喷淋管径表。")
+            return
+
+        has_multi_k = len(k_counter) > 1
+
+        material = config.get("pipe_material", "镀锌钢管")
+
+        children = defaultdict(list)
+        parent_of = {}
+        for parent, child in tree_edges:
+            children[parent].append(child)
+            parent_of[child] = parent
+
+        # ---------- 辅助函数 ----------
+        def _lookup_dn(cap_dict, dn_list, downstream_count):
+            for dn in dn_list:
+                if cap_dict[dn] > 0 and cap_dict[dn] >= downstream_count:
+                    return dn
+            for dn in reversed(dn_list):
+                if cap_dict[dn] > 0:
+                    return dn
+            return "DN25"
+
+        def _record_and_set(pipe, assigned_dn, modified_list, mat):
+            if pipe and pipe.nominal_diameter != assigned_dn:
+                modified_list.append((pipe, pipe.nominal_diameter, pipe.inner_diameter))
+                pipe.nominal_diameter = assigned_dn
+                info = self.material_manager.get_diameter_info(mat, assigned_dn)
+                if info.get("inner", 0) > 0:
+                    pipe.inner_diameter = info["inner"]
+                cad.manual_dn_pipes.add(pipe.pipe_id)
+
+        def _post_order_accum(root, ch_map, spr_map):
+            acc = {}
+            stk = [(root, 0)]
+            while stk:
+                nd, state = stk.pop()
+                if state == 0:
+                    stk.append((nd, 1))
+                    for cc in reversed(ch_map.get(nd, [])):
+                        stk.append((cc, 0))
+                else:
+                    total = spr_map.get(nd, 0)
+                    for cc in ch_map.get(nd, []):
+                        total += acc.get(cc, 0)
+                    acc[nd] = total
+            return acc
+
+        # ============ 第一遍：全局 K 赋值 ============
         node_sprinklers = {}
         for nid in visited_nodes:
             node_sprinklers[nid] = 1 if nid in cad.sprinkler_k_map else 0
 
-        children = defaultdict(list)
-        for parent, child in tree_edges:
-            children[parent].append(child)
+        accumulated = _post_order_accum(supply_node_id, children, node_sprinklers)
 
-        accumulated = {}
-        stack = [(supply_node_id, 0)]
-        while stack:
-            node, state = stack.pop()
-            if state == 0:
-                stack.append((node, 1))
-                for child in reversed(children.get(node, [])):
-                    stack.append((child, 0))
-            else:
-                total = node_sprinklers.get(node, 0)
-                for child in children.get(node, []):
-                    total += accumulated.get(child, 0)
-                accumulated[node] = total
-
-        cap = capacity[K_str]
+        cap = capacity[global_K_str]
         dns = sorted(cap.keys(), key=lambda x: int(x[2:]) if x.startswith('DN') else 0)
-        material = config.get("pipe_material", "镀锌钢管")
 
         modified_pipes = []
 
         for parent, child in tree_edges:
             downstream = accumulated.get(child, 0)
-            assigned_dn = None
-            for dn in dns:
-                if cap[dn] > 0 and cap[dn] >= downstream:
-                    assigned_dn = dn
-                    break
-            if assigned_dn is None:
-                for dn in reversed(dns):
-                    if cap[dn] > 0:
-                        assigned_dn = dn
-                        break
-            if assigned_dn is None:
-                assigned_dn = "DN25"
-
+            assigned_dn = _lookup_dn(cap, dns, downstream)
             pipe = edge_to_pipe.get(tuple(sorted((parent, child))))
-            if pipe and pipe.nominal_diameter != assigned_dn:
-                modified_pipes.append((pipe, pipe.nominal_diameter, pipe.inner_diameter))
-                pipe.nominal_diameter = assigned_dn
-                info = self.material_manager.get_diameter_info(material, assigned_dn)
-                if info.get("inner", 0) > 0:
-                    pipe.inner_diameter = info["inner"]
-                cad.manual_dn_pipes.add(pipe.pipe_id)
+            _record_and_set(pipe, assigned_dn, modified_pipes, material)
 
-        if modified_pipes:
+        # ============ 第二遍和修正（仅多 K 值管网） ============
+        if has_multi_k:
+            # ---- 收集用水点（有 K 值的 demand node） ----
+            water_use_ids = set()
+            for g in cad.demand_groups.values():
+                for dn in g.demand_nodes:
+                    if dn.node_id in cad.sprinkler_k_map:
+                        water_use_ids.add(dn.node_id)
+
+            if water_use_ids:
+                # ---- 后序标记：节点下游是否有用水点 ----
+                has_water_use = {}
+                stk = [(supply_node_id, 0)]
+                while stk:
+                    nd, state = stk.pop()
+                    if state == 0:
+                        stk.append((nd, 1))
+                        for cc in reversed(children.get(nd, [])):
+                            stk.append((cc, 0))
+                    else:
+                        marked = nd in water_use_ids
+                        for cc in children.get(nd, []):
+                            marked = marked or has_water_use.get(cc, False)
+                        has_water_use[nd] = marked
+
+                reduced_edges = [(p, c) for p, c in tree_edges
+                                 if has_water_use.get(c, False)]
+
+                if reduced_edges:
+                    # ---- 统计用水点 K 值 ----
+                    wu_k_counter = defaultdict(int)
+                    for nid in water_use_ids:
+                        k_val = int(cad.sprinkler_k_map[nid])
+                        wu_k_counter[k_val] += 1
+
+                    max_wu_count = max(wu_k_counter.values())
+                    water_use_K = max(k for k, v in wu_k_counter.items()
+                                      if v == max_wu_count)
+                    water_use_K_str = str(water_use_K)
+
+                    # ---- 第二遍赋值（仅当 K 不同时） ----
+                    if water_use_K_str != global_K_str and water_use_K_str in capacity:
+                        reduced_children = defaultdict(list)
+                        for p, c in reduced_edges:
+                            reduced_children[p].append(c)
+
+                        reduced_sprinklers = {}
+                        for nid in has_water_use:
+                            reduced_sprinklers[nid] = 1 if nid in water_use_ids else 0
+
+                        reduced_accum = _post_order_accum(
+                            supply_node_id, reduced_children, reduced_sprinklers)
+
+                        wu_cap = capacity[water_use_K_str]
+                        wu_dns = sorted(wu_cap.keys(),
+                                        key=lambda x: int(x[2:]) if x.startswith('DN') else 0)
+
+                        for parent, child in reduced_edges:
+                            downstream = reduced_accum.get(child, 0)
+                            assigned_dn = _lookup_dn(wu_cap, wu_dns, downstream)
+                            pipe = edge_to_pipe.get(tuple(sorted((parent, child))))
+                            _record_and_set(pipe, assigned_dn, modified_pipes, material)
+
+            # ============ 上游 ≥ 下游修正 ============
+            depth = {supply_node_id: 0}
+            for p, c in tree_edges:
+                depth[c] = depth.get(p, 0) + 1
+            sorted_edges = sorted(tree_edges,
+                                  key=lambda x: depth[x[1]], reverse=True)
+
+            sp_pipes = [p for p in cad.pipes
+                        if p.pipe_id.startswith("SP_") and p.is_active]
+
+            changed = True
+            while changed:
+                changed = False
+                # a) BFS 树边上下游检查
+                for p, c in sorted_edges:
+                    pipe = edge_to_pipe.get(tuple(sorted((p, c))))
+                    if not pipe or not pipe.nominal_diameter:
+                        continue
+                    try:
+                        p_dn_int = int(pipe.nominal_diameter[2:])
+                    except ValueError:
+                        continue
+                    for gc in children.get(c, []):
+                        c_pipe = edge_to_pipe.get(tuple(sorted((c, gc))))
+                        if c_pipe and c_pipe.nominal_diameter:
+                            try:
+                                c_dn_int = int(c_pipe.nominal_diameter[2:])
+                            except ValueError:
+                                continue
+                            if c_dn_int > p_dn_int:
+                                _record_and_set(pipe, c_pipe.nominal_diameter,
+                                                modified_pipes, material)
+                                changed = True
+                                break
+                # b) SP_ 管道与其上游管道的比较
+                for sp_pipe in sp_pipes:
+                    if not sp_pipe.nominal_diameter:
+                        continue
+                    base_node = sp_pipe.start_node_id
+                    parent_node = parent_of.get(base_node)
+                    if parent_node is None:
+                        continue
+                    feed_pipe = edge_to_pipe.get(
+                        tuple(sorted((parent_node, base_node))))
+                    if not feed_pipe or not feed_pipe.nominal_diameter:
+                        continue
+                    try:
+                        sp_dn_int = int(sp_pipe.nominal_diameter[2:])
+                        feed_dn_int = int(feed_pipe.nominal_diameter[2:])
+                    except ValueError:
+                        continue
+                    if sp_dn_int > feed_dn_int:
+                        _record_and_set(feed_pipe, sp_pipe.nominal_diameter,
+                                        modified_pipes, material)
+                        changed = True
+
+        # ============ 汇总 undo（保留每根管道首次修改记录） ============
+        first_mod = {}
+        for p, old_dn, old_in in modified_pipes:
+            pid = p.pipe_id
+            if pid not in first_mod:
+                first_mod[pid] = (p, old_dn, old_in)
+        unique_modified = list(first_mod.values())
+
+        if unique_modified:
             self.undo_stack.append({
                 'type': 'batch_attr',
                 'changes': [{'pipe': p, 'old_dn': old_dn, 'old_inner': old_in}
-                            for p, old_dn, old_in in modified_pipes]
+                            for p, old_dn, old_in in unique_modified]
             })
             self.redo_stack.clear()
             if len(self.undo_stack) > self.max_undo:
                 self.undo_stack.pop(0)
 
-        if modified_pipes:
+        if unique_modified:
             cad.update_pipe_types(config)
         self.refresh_data(keep_view=True)
         self._refresh_other_pages()
 
-        if modified_pipes:
-            self.show_temp_message(f"已为 {len(modified_pipes)} 根管道赋予管径（按 Ctrl+Z 可撤销）", 3000)
+        if unique_modified:
+            self.show_temp_message(
+                f"已为 {len(unique_modified)} 根管道赋予管径（按 Ctrl+Z 可撤销）", 3000)
         else:
-            self.show_temp_message("所有管道管径已符合喷淋管径表，无需修改。", 2000)
+            self.show_temp_message(
+                "所有管道管径已符合喷淋管径表，无需修改。", 2000)
 
     def _select_supply_point(self, node_ids):
         """多供水节点时弹出选择对话框，返回选中的 node_id 或 None"""
