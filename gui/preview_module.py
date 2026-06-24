@@ -413,6 +413,9 @@ class PreviewPage(ttk.Frame):
         # 节点压力缓存
         self.node_pressures: Dict[str, float] = {}
         self.show_node_pressure = tk.BooleanVar(value=False)  # 节点压力显示开关
+        
+        # 消火栓支管向左展开（仅整体管网）
+        self.hydrant_branch_flat_var = tk.BooleanVar(value=False)
 
         # 节点流量缓存（从 calculation_module 传入）
         self.node_flows: Dict[str, float] = {}
@@ -1785,11 +1788,12 @@ class PreviewPage(ttk.Frame):
         else:
             self.current_view_mode = "floor"
     
-        # 控制罗盘显隐
+        # 控制罗盘显隐和消火栓支管展开复选框状态
         if self.current_view_mode == "global":
             self.compass_frame.pack(fill="x", padx=5, pady=5)
         else:
             self.compass_frame.pack_forget()
+        self._update_hydrant_flat_state()
     
         logger.info(f"切换到楼层: {self.current_floor_name}")
     
@@ -1989,7 +1993,7 @@ class PreviewPage(ttk.Frame):
         self.delete_invalid_btn = ttk.Button(button_row, text="删除无效管", command=self.delete_invalid_pipes)
         self.delete_invalid_btn.pack(side="left", expand=True, fill="x", padx=2)
         
-        # 隐藏无效管和显示前后遮挡复选框（同一行）
+        # 隐藏无效管和显示前后遮挡复选框（第一行）
         check_row = ttk.Frame(pipe_op_frame)
         check_row.pack(fill="x", pady=2)
         self.hide_invalid_var = tk.BooleanVar(value=False)
@@ -1997,11 +2001,19 @@ class PreviewPage(ttk.Frame):
         self.hide_invalid_cb.pack(side="left", padx=2)
         self.show_occlusion_cb = ttk.Checkbutton(check_row, text="显示前后遮挡", variable=self.show_occlusion_var, command=self.redraw)
         self.show_occlusion_cb.pack(side="left", padx=2)
-        self.velocity_check_cb = ttk.Checkbutton(check_row, text="校正或优化管径",
+
+        # 校正或优化管径和消火栓支管向左展开（第二行）
+        check_row2 = ttk.Frame(pipe_op_frame)
+        check_row2.pack(fill="x", pady=2)
+        self.velocity_check_cb = ttk.Checkbutton(check_row2, text="校正或优化管径",
                                                   variable=self.velocity_check_var,
                                                   command=self.redraw,
                                                   state="disabled")
         self.velocity_check_cb.pack(side="left", padx=2)
+        self.hydrant_flat_cb = ttk.Checkbutton(check_row2, text="消火栓支管向左展开",
+                                                variable=self.hydrant_branch_flat_var,
+                                                command=self.redraw)
+        self.hydrant_flat_cb.pack(side="left", padx=2)
 
         # 路径高亮   
         path_frame = ttk.LabelFrame(parent, text="路径高亮", padding=5)
@@ -2044,8 +2056,9 @@ class PreviewPage(ttk.Frame):
         note = ttk.Label(parent, text="左键点击管道/阀门选择\n右键弹出菜单",
                          justify="left", foreground="gray")
         note.pack(side="bottom", pady=10)
-        # 初始化无效管相关控件的状态（根据当前系统类型）
+        # 初始化无效管相关控件和消火栓支管展开复选框的状态
         self.update_invalid_controls_state()
+        self._update_hydrant_flat_state()
 
     def update_invalid_controls_state(self):
         """根据当前系统类型更新无效管/喷淋相关控件的启用/禁用状态"""
@@ -2064,6 +2077,13 @@ class PreviewPage(ttk.Frame):
         else:
             self.sprinkler_table_btn.pack_forget()
             self.assign_diameter_btn.pack_forget()
+
+    def _update_hydrant_flat_state(self):
+        """根据当前视图模式更新消火栓支管向左展开复选框状态（仅整体管网可用）"""
+        if self.current_view_mode == "global":
+            self.hydrant_flat_cb.config(state="normal")
+        else:
+            self.hydrant_flat_cb.config(state="disabled")
 
     def _on_hide_invalid_toggle(self):
         """隐藏无效管复选框的回调：自动清除当前选中集中已变为无效的管道"""
@@ -2559,6 +2579,12 @@ class PreviewPage(ttk.Frame):
         self.projected_coords = self._global_projected_coords
         self.projected_depth = self._global_projected_depth
 
+        # 消火栓支管向左展开（复选框控制）
+        if self.hydrant_branch_flat_var.get():
+            self._build_hydrant_visual_offsets()
+        else:
+            self._hydrant_visual_offsets = None
+
         # 遮挡处理
         if self.show_occlusion_var.get():
             if not self.occlusion_cache_valid:
@@ -2599,6 +2625,15 @@ class PreviewPage(ttk.Frame):
 
         # 绘制颜色图例表（如果启用分层颜色）
         self.draw_color_legend()    
+        # 清理消火栓支管视觉偏移
+        self._hydrant_visual_offsets = None
+
+    def _build_hydrant_visual_offsets(self):
+        """构建 B_ 消火栓支管末端节点的视觉偏移映射 {end_node_id: start_node_id}"""
+        self._hydrant_visual_offsets = {}
+        for pipe in self.cad_data_manager.pipes:
+            if pipe.pipe_id.startswith('B_') and getattr(pipe, 'is_hydrant_branch', False):
+                self._hydrant_visual_offsets[pipe.end_node_id] = pipe.start_node_id
 
     # ======================================================================
     # 以下三个方法实现楼层分离显示（需求94-111）
@@ -2772,6 +2807,12 @@ class PreviewPage(ttk.Frame):
 
             self.projected_coords = primary_sep_coords.copy()
 
+            # 消火栓支管向左展开（复选框控制）
+            if self.hydrant_branch_flat_var.get():
+                self._build_hydrant_visual_offsets()
+            else:
+                self._hydrant_visual_offsets = None
+
             for pipe in self.cad_data_manager.pipes:
                 if self.hide_invalid_var.get() and not pipe.is_active:
                     continue
@@ -2880,6 +2921,7 @@ class PreviewPage(ttk.Frame):
         finally:
             self.project_point = _orig_proj
             self.compute_depth = _orig_depth
+            self._hydrant_visual_offsets = None
 
     def _draw_separation_dashed_lines(self, cumulative_offsets_mm, floor_elev_order,
                                        pipe_to_floor, node_connected_floors,
@@ -3083,6 +3125,15 @@ class PreviewPage(ttk.Frame):
         end_w = self.projected_coords.get(pipe.end_node_id)
         if not start_w or not end_w:
             return
+
+        # B_消火栓支管视觉覆盖：从中间节点向左 0.3m（300mm）
+        if getattr(self, '_hydrant_visual_offsets', None) and pipe.pipe_id.startswith('B_'):
+            mid_id = self._hydrant_visual_offsets.get(pipe.end_node_id)
+            if mid_id:
+                mid_pos = self.projected_coords.get(mid_id)
+                if mid_pos:
+                    end_w = (mid_pos[0] - 300.0, mid_pos[1])
+
         sx, sy = self.world_to_canvas(*start_w)
         ex, ey = self.world_to_canvas(*end_w)
 
@@ -3149,9 +3200,10 @@ class PreviewPage(ttk.Frame):
         else:
             dash = (4, 4) if pipe.pipe_id in self.selected_pipes else None
 
-        # 检查是否需要断开绘制（整体管网模式且开启遮挡显示）
+        # 检查是否需要断开绘制（整体管网模式且开启遮挡显示，B_管豁免）
         breaks_data = self.occlusion_breaks.get(pipe.pipe_id, [])
-        if breaks_data and self.current_view_mode == "global" and self.show_occlusion_var.get():
+        if breaks_data and self.current_view_mode == "global" and self.show_occlusion_var.get() \
+           and not (getattr(self, '_hydrant_visual_offsets', None) and pipe.pipe_id.startswith('B_')):
             # 如果隐藏了无效管，则过滤掉遮挡源是无效管的断点
             if self.hide_invalid_var.get():
                 breaks_t = [t for t, occluder_id in breaks_data if self._is_pipe_active(occluder_id)]
@@ -3346,6 +3398,15 @@ class PreviewPage(ttk.Frame):
         wpos = self.projected_coords.get(node.node_id)
         if not wpos:
             return
+
+        # B_消火栓支管末端节点视觉覆盖：跟随中间节点向左 0.3m
+        if getattr(self, '_hydrant_visual_offsets', None):
+            mid_id = self._hydrant_visual_offsets.get(node.node_id)
+            if mid_id:
+                mid_pos = self.projected_coords.get(mid_id)
+                if mid_pos:
+                    wpos = (mid_pos[0] - 300.0, mid_pos[1])
+
         cx, cy = self.world_to_canvas(*wpos)
         radius = max(3, int(3 * self.scale))
         if node.node_id in self.highlight_path_nodes:
@@ -3478,6 +3539,12 @@ class PreviewPage(ttk.Frame):
                 node = self.cad_data_manager.node_by_id.get(node_id)
                 if node:
                     wpos = self.projected_coords.get(node_id)
+                    if getattr(self, '_hydrant_visual_offsets', None):
+                        mid_id = self._hydrant_visual_offsets.get(node_id)
+                        if mid_id:
+                            mid_pos = self.projected_coords.get(mid_id)
+                            if mid_pos:
+                                wpos = (mid_pos[0] - 300.0, mid_pos[1])
                     if wpos:
                         cx, cy = self.world_to_canvas(*wpos)
                         size = max(4, int(5 * self.scale))
@@ -3497,6 +3564,12 @@ class PreviewPage(ttk.Frame):
                 node = self.cad_data_manager.node_by_id.get(node_id)
                 if node:
                     wpos = self.projected_coords.get(node_id)
+                    if getattr(self, '_hydrant_visual_offsets', None):
+                        mid_id = self._hydrant_visual_offsets.get(node_id)
+                        if mid_id:
+                            mid_pos = self.projected_coords.get(mid_id)
+                            if mid_pos:
+                                wpos = (mid_pos[0] - 300.0, mid_pos[1])
                     if wpos:
                         cx, cy = self.world_to_canvas(*wpos)
                         radius = max(4, int(5 * self.scale))
@@ -5530,6 +5603,15 @@ class PreviewPage(ttk.Frame):
         wpos = self.projected_coords.get(node.node_id)
         if not wpos:
             return
+
+        # B_消火栓支管末端消火栓视觉覆盖：跟随中间节点向左 0.3m
+        if getattr(self, '_hydrant_visual_offsets', None):
+            mid_id = self._hydrant_visual_offsets.get(hydrant.node_id)
+            if mid_id:
+                mid_pos = self.projected_coords.get(mid_id)
+                if mid_pos:
+                    wpos = (mid_pos[0] - 300.0, mid_pos[1])
+
         cx, cy = self.world_to_canvas(*wpos)
         r = max(8, int(8 * self.scale))   # 半径
         # 画圆（白色轮廓）
@@ -6555,6 +6637,7 @@ class PreviewPage(ttk.Frame):
         self.node_pressure_check.config(state="disabled")
         self.velocity_check_var.set(False)
         self.velocity_check_cb.config(state="disabled")
+        self._update_hydrant_flat_state()
         self.highlight_path_pipes = set()
         self.highlight_path_nodes = set()
         self.selected_pipes.clear()
