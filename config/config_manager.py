@@ -96,7 +96,7 @@ class ConfigManager:
             "align_attribute_name": "Elevation",
             "hydrant_block_name": "hydrant",  # 消火栓图块名
             "max_velocity": 5.0,              # 最高流速 (m/s)
-            "min_velocity": 1.0,              # 最低流速 (m/s)
+            "min_velocity": 2.0,              # 最低流速 (m/s)
             "system_type": "outdoor_hydrant",   # 管网类型："室外消火栓" "室内消火栓" 或 "喷淋",可选值 "outdoor_hydrant" / "indoor_hydrant" / "sprinkler"       
         }
     
