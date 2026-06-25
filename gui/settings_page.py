@@ -291,7 +291,7 @@ class SettingsPage(ttk.Frame):
         # 读取按钮
         self.load_button = ttk.Button(
             row2,
-            text="读取文件",
+            text="读取单体管网",
             command=self.load_cad_data,
             width=10
         )
@@ -556,7 +556,7 @@ class SettingsPage(ttk.Frame):
         self.b_var = tk.StringVar(value=str(self.current_config.get("hydrant_B", 1.577)))
         self.hak_var = tk.StringVar(value=str(self.current_config.get("hydrant_Hak", 2.0)))
         self.max_velocity_var = tk.StringVar(value=str(self.current_config.get("max_velocity", 5.0)))
-        self.min_velocity_var = tk.StringVar(value=str(self.current_config.get("min_velocity", 1.0)))
+        self.min_velocity_var = tk.StringVar(value=str(self.current_config.get("min_velocity", 2.0)))
         
         # 喷头K输入框改为Combobox，可输入可选择
         k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161, 200, 202, 242, 320, 363], width=8, state='readonly')
@@ -850,7 +850,7 @@ class SettingsPage(ttk.Frame):
         # 更新新增的配置
         self.hydrant_block_var.set(self.current_config.get("hydrant_block_name", "hydrant"))
         self.max_velocity_var.set(str(self.current_config.get("max_velocity", 5.0)))
-        self.min_velocity_var.set(str(self.current_config.get("min_velocity", 1.0)))
+        self.min_velocity_var.set(str(self.current_config.get("min_velocity", 2.0)))
         self.system_type_var.set(self.current_config.get("system_type", "outdoor_hydrant"))
         
 
@@ -1569,14 +1569,14 @@ class SettingsPage(ttk.Frame):
                 messagebox.showerror("输入错误", "最高流速不能低于最低流速！")
                 # 恢复原值
                 self.max_velocity_var.set(str(self.current_config.get("max_velocity", 5.0)))
-                self.min_velocity_var.set(str(self.current_config.get("min_velocity", 1.0)))
+                self.min_velocity_var.set(str(self.current_config.get("min_velocity", 2.0)))
                 return
             self.on_config_change("max_velocity", max_v)
             self.on_config_change("min_velocity", min_v)
         except ValueError:
             messagebox.showerror("输入错误", "流速必须为数字")
             self.max_velocity_var.set(str(self.current_config.get("max_velocity", 5.0)))
-            self.min_velocity_var.set(str(self.current_config.get("min_velocity", 1.0)))
+            self.min_velocity_var.set(str(self.current_config.get("min_velocity", 2.0)))
     
     def on_system_type_changed(self):
         """系统类型变化时保存配置"""

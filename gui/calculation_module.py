@@ -548,7 +548,7 @@ class CalculationPage(ttk.Frame):
 
         config = self.config_manager.get_live_config()
         max_v = config.get("max_velocity", 5.0)
-        min_v = config.get("min_velocity", 1.0)
+        min_v = config.get("min_velocity", 2.0)
 
         for pipe in pipe_display_data:
             # 根据复选框决定是否跳过流量为零的管道
@@ -1661,7 +1661,7 @@ class CalculationPage(ttk.Frame):
         else:
             dia_system_type = "hydrant"  # 室外消火栓默认按室内消火栓处理（但实际不应调用此方法）
         max_v = config.get("max_velocity", 5.0)
-        min_v = config.get("min_velocity", 1.0)
+        min_v = config.get("min_velocity", 2.0)
 
         pipe_results = self.original_results.get("pipe_results", [])
         modified = False

@@ -12,9 +12,17 @@ import logging
 from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict, deque
 from cad_data_manager import HydrantData, ValveData, DemandGroupData, DemandNodeData, PipeData, NodeData, SupplyNodeData
-# from tkinter import messagebox
-
 logger = logging.getLogger(__name__)
+try:
+    from pyautocad import Autocad, APoint, aDouble
+    CAD_AVAILABLE = True
+except ImportError:
+    CAD_AVAILABLE = False
+    logger.warning("pyautocad未安装，CAD写回功能不可用")
+try:
+    import pythoncom
+except ImportError:
+    pythoncom = None
 
 def _get_exe_dir():
     if getattr(sys, 'frozen', False):
@@ -407,8 +415,11 @@ class PreviewPage(ttk.Frame):
         self.pipe_results: Dict[str, Dict] = {}
         self.calculation_available = False
         self.velocity_check_var = tk.BooleanVar(value=False)   # 校正或优化管径模式
-        self.velocity_max = 5.0                                 # 最高流速阈值
-        self.velocity_min = 1.0                                 # 最低流速阈值
+        # 流速阈值从 config_manager 读取，见 set_calculation_results
+
+        # 跳过短管DN标注（显示选项 + CAD反写共用）
+        self.skip_dn_short_pipe = tk.BooleanVar(value=True)
+        self.skip_dn_min_length = 1.0
         
         # 节点压力缓存
         self.node_pressures: Dict[str, float] = {}
@@ -2015,6 +2026,22 @@ class PreviewPage(ttk.Frame):
                                                 command=self.redraw)
         self.hydrant_flat_cb.pack(side="left", padx=2)
 
+        # 短管跳过DN标注（第三行）
+        skip_dn_row = ttk.Frame(pipe_op_frame)
+        skip_dn_row.pack(fill="x", pady=2)
+        ttk.Checkbutton(skip_dn_row, text="短管跳过DN",
+                        variable=self.skip_dn_short_pipe,
+                        command=self.redraw).pack(side="left", padx=2)
+        self.skip_dn_min_entry = ttk.Entry(skip_dn_row, width=5)
+        self.skip_dn_min_entry.insert(0, f"{self.skip_dn_min_length:.1f}")
+        self.skip_dn_min_entry.pack(side="left", padx=2)
+        ttk.Label(skip_dn_row, text="m").pack(side="left")
+
+        # CAD反写按钮
+        self.cad_export_btn = ttk.Button(pipe_op_frame, text="反写整体管网到CAD",
+                                          command=self.write_global_network_to_cad)
+        self.cad_export_btn.pack(fill="x", pady=3)
+
         # 路径高亮   
         path_frame = ttk.LabelFrame(parent, text="路径高亮", padding=5)
         path_frame.pack(fill="x", padx=5, pady=5)
@@ -2079,11 +2106,19 @@ class PreviewPage(ttk.Frame):
             self.assign_diameter_btn.pack_forget()
 
     def _update_hydrant_flat_state(self):
-        """根据当前视图模式更新消火栓支管向左展开复选框状态（仅整体管网可用）"""
-        if self.current_view_mode == "global":
+        """根据当前视图模式和系统类型更新消火栓支管展开复选框及CAD反写按钮状态"""
+        config = self.config_manager.get_live_config()
+        if config.get("system_type") == "sprinkler":
+            self.hydrant_flat_cb.config(state="disabled")
+        elif self.current_view_mode == "global":
             self.hydrant_flat_cb.config(state="normal")
         else:
             self.hydrant_flat_cb.config(state="disabled")
+        # CAD反写按钮仅整体管网可用
+        if self.current_view_mode == "global":
+            self.cad_export_btn.config(state="normal")
+        else:
+            self.cad_export_btn.config(state="disabled")
 
     def _on_hide_invalid_toggle(self):
         """隐藏无效管复选框的回调：自动清除当前选中集中已变为无效的管道"""
@@ -2406,7 +2441,7 @@ class PreviewPage(ttk.Frame):
         self.node_pressure_check.config(state="normal")
         config = self.config_manager.get_live_config()
         self.velocity_max = config.get("max_velocity", 5.0)
-        self.velocity_min = config.get("min_velocity", 1.0)
+        self.velocity_min = config.get("min_velocity", 2.0)
         self.velocity_check_cb.config(state="normal")
         self.redraw()
 
@@ -3132,7 +3167,7 @@ class PreviewPage(ttk.Frame):
             if mid_id:
                 mid_pos = self.projected_coords.get(mid_id)
                 if mid_pos:
-                    end_w = (mid_pos[0] - 300.0, mid_pos[1])
+                    end_w = (mid_pos[0] - 600.0, mid_pos[1])
 
         sx, sy = self.world_to_canvas(*start_w)
         ex, ey = self.world_to_canvas(*end_w)
@@ -3277,7 +3312,16 @@ class PreviewPage(ttk.Frame):
         # B_ 开头的消火栓支管不显示公称管径和管长
         if not pipe.pipe_id.startswith('B_'):
             if self.show_nominal.get() and not pipe.pipe_id.startswith('L_'):
-                text_parts.append(pipe.nominal_diameter)
+                skip_dn = False
+                if self.skip_dn_short_pipe.get():
+                    try:
+                        threshold = float(self.skip_dn_min_entry.get())
+                    except ValueError:
+                        threshold = self.skip_dn_min_length
+                    if pipe.length < threshold:
+                        skip_dn = True
+                if not skip_dn:
+                    text_parts.append(pipe.nominal_diameter)
             if self.show_length.get():
                 length_m = pipe.length
                 text_parts.append(f"{length_m:.2f}m")
@@ -3405,7 +3449,7 @@ class PreviewPage(ttk.Frame):
             if mid_id:
                 mid_pos = self.projected_coords.get(mid_id)
                 if mid_pos:
-                    wpos = (mid_pos[0] - 300.0, mid_pos[1])
+                    wpos = (mid_pos[0] - 600.0, mid_pos[1])
 
         cx, cy = self.world_to_canvas(*wpos)
         radius = max(3, int(3 * self.scale))
@@ -3515,6 +3559,10 @@ class PreviewPage(ttk.Frame):
         # 三角形2（指向反方向）：顶点 (vx,vy)，底边 left2-right2
         self.canvas.create_polygon(vx, vy, left2[0], left2[1], right2[0], right2[1],
                                    fill=fill, outline=outline, width=2, tags=("valve", valve.valve_id))
+        # 中心竖线（与三角形底边平行，等长）
+        self.canvas.create_line(vx - perp_x * tri_base, vy - perp_y * tri_base,
+                                vx + perp_x * tri_base, vy + perp_y * tri_base,
+                                fill=outline, width=2, tags=("valve", valve.valve_id))
         # 显示阀门编号（如果勾选）
         if self.show_valve_id.get():
             # 阀门编号文字放置于阀门符号右侧偏移位置
@@ -3544,7 +3592,7 @@ class PreviewPage(ttk.Frame):
                         if mid_id:
                             mid_pos = self.projected_coords.get(mid_id)
                             if mid_pos:
-                                wpos = (mid_pos[0] - 300.0, mid_pos[1])
+                                wpos = (mid_pos[0] - 600.0, mid_pos[1])
                     if wpos:
                         cx, cy = self.world_to_canvas(*wpos)
                         size = max(4, int(5 * self.scale))
@@ -3569,7 +3617,7 @@ class PreviewPage(ttk.Frame):
                         if mid_id:
                             mid_pos = self.projected_coords.get(mid_id)
                             if mid_pos:
-                                wpos = (mid_pos[0] - 300.0, mid_pos[1])
+                                wpos = (mid_pos[0] - 600.0, mid_pos[1])
                     if wpos:
                         cx, cy = self.world_to_canvas(*wpos)
                         radius = max(4, int(5 * self.scale))
@@ -3589,6 +3637,67 @@ class PreviewPage(ttk.Frame):
         if not s_ids:
             return
         current_nodes = set(self.projected_coords.keys())
+
+        # 整体管网模式：等腰三角形 + 顶点横线
+        if self.current_view_mode == "global":
+            for nid in s_ids:
+                if nid not in current_nodes:
+                    continue
+                wpos = self.projected_coords.get(nid)
+                if not wpos:
+                    continue
+                cx, cy = self.world_to_canvas(*wpos)
+
+                # 查找 SP_ 管，获取方向
+                base_id = nid[:-2] if nid.endswith('_S') else nid
+                sp_pipe = self.cad_data_manager.pipe_by_id.get("SP_" + base_id)
+                if sp_pipe:
+                    start_w = self.projected_coords.get(sp_pipe.start_node_id)
+                else:
+                    start_w = None
+
+                side_px = max(13, int(13 * self.scale))  # 固定像素，不随比例缩放
+                half_side = side_px / 2.0
+
+                if start_w:
+                    sx, sy = self.world_to_canvas(*start_w)
+                    dx = cx - sx
+                    dy = cy - sy
+                    length = math.hypot(dx, dy)
+                    if length < 0.01:
+                        dx, dy, length = 0, -1, 1  # 默认向上
+                    udx = dx / length
+                    udy = dy / length
+                else:
+                    udx, udy = 0, -1  # 默认向上
+
+                # 垂直方向
+                perp_x = -udy
+                perp_y = udx
+
+                # 三角形底边两端点（底边中点 = 喷头节点）
+                bx1 = cx - perp_x * half_side
+                by1 = cy - perp_y * half_side
+                bx2 = cx + perp_x * half_side
+                by2 = cy + perp_y * half_side
+                # 顶点（沿管道方向，高=250mm）
+                tx = cx + udx * side_px
+                ty = cy + udy * side_px
+                # 顶点横线
+                hx1 = tx - perp_x * half_side
+                hy1 = ty - perp_y * half_side
+                hx2 = tx + perp_x * half_side
+                hy2 = ty + perp_y * half_side
+
+                self.canvas.create_polygon(bx1, by1, bx2, by2, tx, ty,
+                                           outline="white", fill="", width=1,
+                                           tags="sprinkler")
+                self.canvas.create_line(hx1, hy1, hx2, hy2,
+                                        fill="white", width=1,
+                                        tags="sprinkler")
+            return
+
+        # 楼层模式：保持圆形不变
         for nid in s_ids:
             if nid not in current_nodes:
                 continue
@@ -3599,6 +3708,393 @@ class PreviewPage(ttk.Frame):
             r = max(6, int(6 * self.scale))
             self.canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
                                     outline="white", width=1, tags="sprinkler")
+
+    def write_global_network_to_cad(self):
+        """反写整体管网到CAD（含块定义、多段线、字体样式）"""
+        if self.current_view_mode != "global":
+            self.show_temp_message("仅整体管网模式支持反写CAD", 2000)
+            return
+        if not CAD_AVAILABLE:
+            messagebox.showerror("错误", "pyautocad未安装，CAD写回功能不可用")
+            return
+        config = self.config_manager.get_live_config()
+        system_type = config.get("system_type", "outdoor_hydrant")
+        pipe_layer_color = 1 if system_type in ("indoor_hydrant", "outdoor_hydrant") else 6
+        pipe_layer_name = "PipeLoss_管道"
+
+        filepath = tk.filedialog.asksaveasfilename(
+            title="保存CAD图纸",
+            defaultextension=".dwg",
+            filetypes=[("AutoCAD 图形", "*.dwg"), ("所有文件", "*.*")])
+        if not filepath:
+            return
+
+        try:
+            if pythoncom:
+                pythoncom.CoInitialize()
+            acad = Autocad(create_if_not_exists=True)
+            _ = acad.doc.Name
+        except Exception as e:
+            messagebox.showerror("CAD错误", f"无法连接AutoCAD: {e}")
+            return
+
+        doc = acad.doc
+        ms = doc.ModelSpace
+        old_doc_name = doc.Name
+
+        try:
+            new_doc = acad.app.Documents.Add()
+            ms = new_doc.ModelSpace
+        except Exception as e:
+            messagebox.showerror("CAD错误", f"新建图纸失败: {e}")
+            return
+
+        try:
+            # 创建图层
+            self._cad_ensure_layer(new_doc, pipe_layer_name, pipe_layer_color)
+            self._cad_ensure_layer(new_doc, "PipeLoss_设备", 7)
+            self._cad_ensure_layer(new_doc, "PipeLoss_标注", 7)
+
+            # 创建字体样式
+            try:
+                ts = new_doc.TextStyles.Add("shui")
+                ts.fontFile = "gbenor.shx"
+                ts.bigFontFile = "gbcbig.shx"
+                ts.width = 0.7
+            except Exception:
+                pass
+
+            # 创建块定义
+            self._cad_create_blocks(new_doc)
+
+            # 准备投影坐标
+            proj = self.projected_coords
+            if not proj:
+                self.show_temp_message("无投影坐标，请先绘制整体管网", 2000)
+                return
+
+            # 构建消火栓偏移映射
+            hydrant_offsets = {}
+            if self.hydrant_branch_flat_var.get():
+                for pipe in self.cad_data_manager.pipes:
+                    if pipe.pipe_id.startswith('B_') and getattr(pipe, 'is_hydrant_branch', False):
+                        hydrant_offsets[pipe.end_node_id] = pipe.start_node_id
+
+            def cad_pos(node_id):
+                wp = proj.get(node_id)
+                if not wp:
+                    return None
+                return APoint(wp[0], -wp[1], 0)
+
+            # --- 管道 ---
+            occlusion_breaks = {}
+            if self.show_occlusion_var.get():
+                if not self.occlusion_cache_valid:
+                    self.build_occlusion_cache()
+                occlusion_breaks = self.occlusion_breaks
+
+            for pipe in self.cad_data_manager.pipes:
+                if self.hide_invalid_var.get() and not pipe.is_active:
+                    continue
+                p1 = cad_pos(pipe.start_node_id)
+                p2 = cad_pos(pipe.end_node_id)
+                if not p1 or not p2:
+                    continue
+
+                # 消火栓支管偏移
+                if hydrant_offsets and pipe.pipe_id.startswith('B_'):
+                    mid_id = hydrant_offsets.get(pipe.end_node_id)
+                    if mid_id:
+                        mp = proj.get(mid_id)
+                        if mp:
+                            p2 = APoint(mp[0] - 600.0, -(mp[1]), 0)
+
+                # 遮挡断线
+                breaks_raw = occlusion_breaks.get(pipe.pipe_id, [])
+                if breaks_raw and self.show_occlusion_var.get() \
+                   and not (hydrant_offsets and pipe.pipe_id.startswith('B_')):
+                    if self.hide_invalid_var.get():
+                        breaks_t = [t for t, oid in breaks_raw if self._is_pipe_active(oid)]
+                    else:
+                        breaks_t = [t for t, _ in breaks_raw]
+                    if breaks_t:
+                        segs = self._calc_cad_break_segments(p1, p2, breaks_t, 100)
+                        for s in segs:
+                            self._cad_add_pipe(ms, s[0], s[1], pipe_layer_name)
+                        continue
+
+                self._cad_add_pipe(ms, p1, p2, pipe_layer_name)
+
+            # --- 消火栓（程序化块，固定比例1.0，直径600mm） ---
+            for hydrant in self.cad_data_manager.hydrants:
+                if not hasattr(hydrant, 'hydrant_id'):
+                    continue
+                pos = cad_pos(hydrant.node_id)
+                if not pos:
+                    continue
+                if hydrant_offsets:
+                    mid_id = hydrant_offsets.get(hydrant.node_id)
+                    if mid_id:
+                        mp = proj.get(mid_id)
+                        if mp:
+                            pos = APoint(mp[0] - 600.0, -(mp[1]), 0)
+                try:
+                    br = ms.InsertBlock(pos, "PipeLoss_消火栓", 1.0, 1.0, 1.0, 0)
+                    br.Layer = "PipeLoss_设备"
+                except Exception as e:
+                    logger.exception(f"消火栓 {hydrant.node_id} InsertBlock 失败")
+
+            # --- 喷头 ---
+            s_ids = getattr(self.cad_data_manager, 'sprinkler_s_node_ids', [])
+            for nid in s_ids:
+                base_id = nid[:-2] if nid.endswith('_S') else nid
+                sp_pipe = self.cad_data_manager.pipe_by_id.get("SP_" + base_id)
+                pos = cad_pos(nid)
+                if not pos:
+                    continue
+                if sp_pipe:
+                    s1 = cad_pos(sp_pipe.start_node_id)
+                    s2 = cad_pos(sp_pipe.end_node_id)
+                    if s1 and s2:
+                        dx = s2[0] - s1[0]
+                        dy = s2[1] - s1[1]
+                    else:
+                        dx, dy = 0, -250
+                else:
+                    dx, dy = 0, -250
+                if math.hypot(dx, dy) < 0.01:
+                    dx, dy = 0, -250
+                rot = math.atan2(dy, dx)
+                try:
+                    br = ms.InsertBlock(pos, "PipeLoss_喷头", 1, 1, 1, rot)
+                    br.Layer = "PipeLoss_设备"
+                except Exception:
+                    pass
+
+            # --- 阀门 ---
+            for valve in self.cad_data_manager.valves:
+                if not valve.pipe_id:
+                    continue
+                vw = self.project_point(valve.x, valve.y, valve.z)
+                vp = APoint(vw[0], -vw[1], 0)
+                pipe = self.cad_data_manager.pipe_by_id.get(valve.pipe_id)
+                if pipe:
+                    s1 = cad_pos(pipe.start_node_id)
+                    s2 = cad_pos(pipe.end_node_id)
+                    if s1 and s2:
+                        dx = s2[0] - s1[0]
+                        dy = s2[1] - s1[1]
+                        if math.hypot(dx, dy) > 0.01:
+                            rot = math.atan2(dy, dx)
+                        else:
+                            rot = 0.0
+                    else:
+                        rot = 0.0
+                else:
+                    rot = 0.0
+                try:
+                    br = ms.InsertBlock(vp, "PipeLoss_阀门", 1, 1, 1, rot)
+                    br.Layer = "PipeLoss_设备"
+                except Exception:
+                    pass
+
+            # --- 标注文字 ---
+            self._cad_write_annotations(ms, proj, hydrant_offsets)
+
+            # 保存
+            new_doc.SaveAs(filepath)
+            try:
+                new_doc.SendCommand("_.zoom _e ")
+            except Exception:
+                pass
+            messagebox.showinfo("反写完成", f"整体管网已成功反写到\n{filepath}")
+
+        except Exception as e:
+            messagebox.showerror("反写失败", f"CAD反写出错: {e}")
+            logger.exception("CAD写回异常")
+
+    def _cad_ensure_layer(self, doc, name, color_index):
+        try:
+            layer = doc.Layers.Add(name)
+        except Exception:
+            layer = doc.Layers.Item(name)
+        layer.color = color_index
+
+    def _cad_create_blocks(self, doc):
+        blocks = doc.Blocks
+
+        # 喷头块：等腰三角形(底250×高250) + 顶点横线；指向+X
+        try:
+            blk = blocks.Add(APoint(0, 0, 0), "PipeLoss_喷头")
+            h = 125.0  # 半高
+            blk.AddLine(APoint(0, -h, 0), APoint(0, h, 0))       # 底边
+            blk.AddLine(APoint(0, h, 0), APoint(250, 0, 0))       # 右边
+            blk.AddLine(APoint(250, 0, 0), APoint(0, -h, 0))      # 左边
+            blk.AddLine(APoint(250, -h, 0), APoint(250, h, 0))    # 顶点横线
+        except Exception as e:
+            logger.warning(f"喷头块定义失败: {e}")
+
+        # 阀门块：两个对顶三角形(底200×间距300) + 中心竖线；指向+X
+        try:
+            blk = blocks.Add(APoint(0, 0, 0), "PipeLoss_阀门")
+            w = 100.0  # 半宽
+            off = 150.0
+            blk.AddLine(APoint(-off, -w, 0), APoint(-off, w, 0))  # 左三角形底边
+            blk.AddLine(APoint(-off, w, 0), APoint(0, 0, 0))      # 左三角形右斜边
+            blk.AddLine(APoint(0, 0, 0), APoint(-off, -w, 0))     # 左三角形左斜边
+            blk.AddLine(APoint(off, -w, 0), APoint(off, w, 0))    # 右三角形底边
+            blk.AddLine(APoint(off, w, 0), APoint(0, 0, 0))       # 右三角形左斜边
+            blk.AddLine(APoint(0, 0, 0), APoint(off, -w, 0))      # 右三角形右斜边
+            blk.AddLine(APoint(0, -w, 0), APoint(0, w, 0))        # 中心竖线
+        except Exception as e:
+            logger.warning(f"阀门块定义失败: {e}")
+
+        # 消火栓块：圆(ø600) + 45°对角线 + 半圆填充
+        try:
+            blk = blocks.Add(APoint(0, 0, 0), "PipeLoss_消火栓")
+            R = 300.0
+            d = R / math.sqrt(2)
+            blk.AddCircle(APoint(0, 0, 0), R)
+            blk.AddLine(APoint(-d, -d, 0), APoint(d, d, 0))
+            # AppendOuterLoop 在 AutoCAD 2014 COM 下不可用，用8段AddSolid扇形逼近半圆
+            N = 8
+            for i in range(N):
+                a1 = math.radians(45 + i * 180 / N)
+                a2 = math.radians(45 + (i + 1) * 180 / N)
+                x1 = R * math.cos(a1)
+                y1 = R * math.sin(a1)
+                x2 = R * math.cos(a2)
+                y2 = R * math.sin(a2)
+                blk.AddSolid(APoint(0, 0, 0), APoint(x1, y1, 0),
+                             APoint(x2, y2, 0), APoint(x2, y2, 0))
+        except Exception as e:
+            logger.warning(f"消火栓块定义失败: {e}")
+
+    def _cad_add_pipe(self, ms, p1, p2, layer_name):
+        pts = aDouble([p1[0], p1[1], p2[0], p2[1]])
+        pline = ms.AddLightWeightPolyline(pts)
+        pline.SetWidth(0, 50, 50)
+        pline.Layer = layer_name
+
+    def _calc_cad_break_segments(self, p1, p2, breaks, gap):
+        """计算CAD多段线的断开片段（breaks = List[float] 遮挡位置 t ∈ [0,1]）"""
+        dx = p2[0] - p1[0]
+        dy = p2[1] - p1[1]
+        L = math.hypot(dx, dy)
+        if L < 1:
+            return [(p1, p2)]
+        gap_t = gap / L
+        intervals = [(max(0, t - gap_t), min(1, t + gap_t)) for t in breaks]
+        intervals.sort()
+        merged = []
+        for lo, hi in intervals:
+            if not merged or lo > merged[-1][1]:
+                merged.append([lo, hi])
+            else:
+                merged[-1][1] = max(merged[-1][1], hi)
+        segs = []
+        cur = 0.0
+        for lo, hi in merged:
+            if lo > cur:
+                segs.append((
+                    APoint(p1[0] + cur * dx, p1[1] + cur * dy, 0),
+                    APoint(p1[0] + lo * dx, p1[1] + lo * dy, 0)
+                ))
+            cur = max(cur, hi)
+        if cur < 1.0:
+            segs.append((
+                APoint(p1[0] + cur * dx, p1[1] + cur * dy, 0),
+                p2
+            ))
+        return segs
+
+    def _cad_write_annotations(self, ms, proj, hydrant_offsets):
+        """反写标注文字"""
+        for pipe in self.cad_data_manager.pipes:
+            if self.hide_invalid_var.get() and not pipe.is_active:
+                continue
+            # 跳过短管DN标注
+            skip_dn = False
+            if self.skip_dn_short_pipe.get():
+                try:
+                    threshold = float(self.skip_dn_min_entry.get())
+                except ValueError:
+                    threshold = self.skip_dn_min_length
+                if pipe.length < threshold:
+                    skip_dn = True
+            p1 = proj.get(pipe.start_node_id)
+            p2 = proj.get(pipe.end_node_id)
+            if not p1 or not p2:
+                continue
+            sx, sy = p1
+            ex, ey = p2
+            if hydrant_offsets and pipe.pipe_id.startswith('B_'):
+                mid_id = hydrant_offsets.get(pipe.end_node_id)
+                if mid_id:
+                    mp = proj.get(mid_id)
+                    if mp:
+                        ex = mp[0] - 600.0
+                        ey = mp[1]
+
+            text_parts = []
+            flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0) if self.calculation_available else 0
+            if self.show_pipe_id.get():
+                text_parts.append(pipe.pipe_id)
+            if not pipe.pipe_id.startswith('B_'):
+                if self.show_nominal.get() and not pipe.pipe_id.startswith('L_') and not skip_dn:
+                    text_parts.append(pipe.nominal_diameter)
+                if self.show_length.get():
+                    text_parts.append(f"{pipe.length:.2f}m")
+            if self.calculation_available and self.show_flow.get() and not pipe.pipe_id.startswith('L_'):
+                flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0)
+                if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
+                    text_parts.append(f"{flow:.2f}L/s")
+            if self.calculation_available and self.show_velocity.get() and not pipe.pipe_id.startswith('L_'):
+                vel = self.pipe_results.get(pipe.pipe_id, {}).get('velocity_mps', 0.0)
+                if abs(vel) > 0.001 or self.show_zero_flow_label_var.get():
+                    text_parts.append(f"{vel:.2f}m/s")
+            if self.calculation_available and self.show_loss.get() and not pipe.pipe_id.startswith('L_'):
+                loss = self.pipe_results.get(pipe.pipe_id, {}).get('total_loss', 0)
+                if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
+                    text_parts.append(f"{loss:.2f}m")
+
+            if not text_parts:
+                continue
+
+            text = "_".join(text_parts)
+            mx = (sx + ex) / 2
+            my = (sy + ey) / 2
+            dx = ex - sx
+            dy = ey - sy
+            L = math.hypot(dx, dy)
+            if L < 0.01:
+                continue
+            # 在CAD坐标系中（Y取反）计算法线偏移
+            cad_mx = mx
+            cad_my = -my
+            cad_nx = dy / L * 175.0  # CAD管线方向(dx,-dy)垂直向量X
+            cad_ny = dx / L * 175.0  # CAD管线方向(dx,-dy)垂直向量Y
+            angle = math.degrees(math.atan2(-dy, dx))
+            flip = (angle > 90 or angle < -90)
+            if flip:
+                tx = cad_mx - cad_nx
+                ty = cad_my - cad_ny
+                angle += 180
+            else:
+                tx = cad_mx + cad_nx
+                ty = cad_my + cad_ny
+            angle = angle % 360
+
+            try:
+                txt = ms.AddText(text, APoint(tx, ty, 0), 350.0)
+                txt.rotation = math.radians(angle)
+                txt.Layer = "PipeLoss_标注"
+                try:
+                    txt.StyleName = "shui"
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
     def modify_sprinkler(self, sp_pipes=None):
         """打开喷头修改对话框"""
@@ -5610,7 +6106,7 @@ class PreviewPage(ttk.Frame):
             if mid_id:
                 mid_pos = self.projected_coords.get(mid_id)
                 if mid_pos:
-                    wpos = (mid_pos[0] - 300.0, mid_pos[1])
+                    wpos = (mid_pos[0] - 600.0, mid_pos[1])
 
         cx, cy = self.world_to_canvas(*wpos)
         r = max(8, int(8 * self.scale))   # 半径
@@ -6679,6 +7175,8 @@ class PreviewPage(ttk.Frame):
             "show_occlusion_var": self.show_occlusion_var.get(),
             "show_riser_warning": self.show_riser_warning.get(),
             "show_zero_flow_label_var": self.show_zero_flow_label_var.get(),
+            "skip_dn_short_pipe": self.skip_dn_short_pipe.get(),
+            "skip_dn_min_length": float(self.skip_dn_min_entry.get()) if hasattr(self, 'skip_dn_min_entry') else self.skip_dn_min_length,
             "hide_invalid_var": self.hide_invalid_var.get(),
             "real_time": self.real_time.get(),
             "current_view_mode": self.current_view_mode,
@@ -6743,12 +7241,20 @@ class PreviewPage(ttk.Frame):
             "show_occlusion_var": self.show_occlusion_var,
             "show_riser_warning": self.show_riser_warning,
             "show_zero_flow_label_var": self.show_zero_flow_label_var,
+            "skip_dn_short_pipe": self.skip_dn_short_pipe,
             "hide_invalid_var": self.hide_invalid_var,
             "real_time": self.real_time,
         }
         for key, var in bool_vars.items():
             if key in data:
                 var.set(data[key])
+
+        # 管长跳过DN标注阈值
+        if "skip_dn_min_length" in data:
+            self.skip_dn_min_length = data["skip_dn_min_length"]
+            if hasattr(self, 'skip_dn_min_entry'):
+                self.skip_dn_min_entry.delete(0, "end")
+                self.skip_dn_min_entry.insert(0, f"{self.skip_dn_min_length:.1f}")
 
         # 视角
         if "current_view_mode" in data:
