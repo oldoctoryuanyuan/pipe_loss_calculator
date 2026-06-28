@@ -2626,7 +2626,7 @@ class PreviewPage(ttk.Frame):
                 self.build_occlusion_cache()
         else:
             self.occlusion_breaks.clear()
-            self.occlusion_cache_valid = True
+            self.occlusion_cache_valid = False
 
         # 构建从 R_ 管道ID到立管对象的映射（用于重复立管高亮）
         self.riser_by_pipe_id = {}
@@ -2728,7 +2728,17 @@ class PreviewPage(ttk.Frame):
                 else:
                     pipe_to_floor[pipe.pipe_id] = sorted_f[0]
 
-        # 4. 楼层标高升序
+        # 4. 管道拓扑补齐：若节点未匹配到楼层，从其连接的管道继承楼层
+        for pipe in self.cad_data_manager.pipes:
+            pipe_floor = pipe_to_floor.get(pipe.pipe_id)
+            if not pipe_floor:
+                continue
+            for nid in (pipe.start_node_id, pipe.end_node_id):
+                if nid not in node_to_floors:
+                    node_to_floors[nid] = set()
+                node_to_floors[nid].add(pipe_floor)
+
+        # 5. 楼层标高升序
         sorted_pairs = sorted(
             [(f.name, f.elevation) for f in self.cad_data_manager.floors],
             key=lambda x: x[1]
@@ -2838,7 +2848,7 @@ class PreviewPage(ttk.Frame):
                     self._build_pipe_occlusion_cache(pipe_endpoints, pipe_depth_data)
             else:
                 self.occlusion_breaks.clear()
-                self.occlusion_cache_valid = True
+                self.occlusion_cache_valid = False
 
             self.projected_coords = primary_sep_coords.copy()
 
@@ -2933,12 +2943,11 @@ class PreviewPage(ttk.Frame):
             for hydrant in self.cad_data_manager.hydrants:
                 if not hasattr(hydrant, 'hydrant_id'):
                     continue
-                floor_name = hydrant.floor_name
-                offset = cumulative_offsets_mm.get(floor_name, 0.0) if floor_name else 0.0
                 an = node_by_id.get(hydrant.node_id)
                 if not an:
                     continue
-                hx, hy = cached_proj(an, offset)
+                hpos = self.projected_coords.get(hydrant.node_id, cached_proj(an, 0))
+                hx, hy = hpos
                 old_val = self.projected_coords.get(hydrant.node_id)
                 self.projected_coords[hydrant.node_id] = (hx, hy)
                 try:
@@ -3750,19 +3759,35 @@ class PreviewPage(ttk.Frame):
             return
 
         try:
+            new_doc.SetVariable("LTSCALE", 1000)
+        except Exception:
+            new_doc.SendCommand("_.LTSCALE 1000 ")
+
+        try:
             # 创建图层
             self._cad_ensure_layer(new_doc, pipe_layer_name, pipe_layer_color)
             self._cad_ensure_layer(new_doc, "PipeLoss_设备", 7)
             self._cad_ensure_layer(new_doc, "PipeLoss_标注", 7)
 
             # 创建字体样式
+            ts = None
             try:
                 ts = new_doc.TextStyles.Add("shui")
-                ts.fontFile = "gbenor.shx"
-                ts.bigFontFile = "gbcbig.shx"
-                ts.width = 0.7
             except Exception:
-                pass
+                try:
+                    ts = new_doc.TextStyles.Item("shui")
+                except Exception:
+                    pass
+            if ts:
+                try:
+                    ts.width = 0.7
+                except Exception:
+                    pass
+                try:
+                    ts.fontFile = "gbenor.shx"
+                    ts.bigFontFile = "gbcbig.shx"
+                except Exception:
+                    pass
 
             # 创建块定义
             self._cad_create_blocks(new_doc)
@@ -3786,6 +3811,23 @@ class PreviewPage(ttk.Frame):
                     return None
                 return APoint(wp[0], -wp[1], 0)
 
+            # 分离模式：预计算每管道独立偏移端点
+            sep_cad_unflipped = {}
+            pf_map = {}
+            offs = {}
+            if self._separation_applied:
+                sep_res = self._build_separation_transforms()
+                pf_map, _, offs, _ = sep_res
+                for p in self.cad_data_manager.pipes:
+                    fl = pf_map.get(p.pipe_id)
+                    off = offs.get(fl, 0.0) if fl else 0.0
+                    sn = self.cad_data_manager.node_by_id.get(p.start_node_id)
+                    en = self.cad_data_manager.node_by_id.get(p.end_node_id)
+                    if sn and en:
+                        sx, sy = self.project_point(sn.x, sn.y, sn.z + off)
+                        ex, ey = self.project_point(en.x, en.y, en.z + off)
+                        sep_cad_unflipped[p.pipe_id] = ((sx, sy), (ex, ey))
+
             # --- 管道 ---
             occlusion_breaks = {}
             if self.show_occlusion_var.get():
@@ -3796,10 +3838,17 @@ class PreviewPage(ttk.Frame):
             for pipe in self.cad_data_manager.pipes:
                 if self.hide_invalid_var.get() and not pipe.is_active:
                     continue
-                p1 = cad_pos(pipe.start_node_id)
-                p2 = cad_pos(pipe.end_node_id)
-                if not p1 or not p2:
-                    continue
+                if self._separation_applied:
+                    pp = sep_cad_unflipped.get(pipe.pipe_id)
+                    if not pp:
+                        continue
+                    p1 = APoint(pp[0][0], -pp[0][1], 0)
+                    p2 = APoint(pp[1][0], -pp[1][1], 0)
+                else:
+                    p1 = cad_pos(pipe.start_node_id)
+                    p2 = cad_pos(pipe.end_node_id)
+                    if not p1 or not p2:
+                        continue
 
                 # 消火栓支管偏移
                 if hydrant_offsets and pipe.pipe_id.startswith('B_'):
@@ -3824,6 +3873,10 @@ class PreviewPage(ttk.Frame):
                         continue
 
                 self._cad_add_pipe(ms, p1, p2, pipe_layer_name)
+
+            # 分离灰虚线（仅分离模式）
+            if self._separation_applied:
+                self._cad_write_separation_dashed_lines(ms, new_doc)
 
             # --- 消火栓（程序化块，固定比例1.0，直径600mm） ---
             for hydrant in self.cad_data_manager.hydrants:
@@ -3875,7 +3928,14 @@ class PreviewPage(ttk.Frame):
             for valve in self.cad_data_manager.valves:
                 if not valve.pipe_id:
                     continue
-                vw = self.project_point(valve.x, valve.y, valve.z)
+                valve_off_sep = 0.0
+                if self._separation_applied:
+                    pipe_v = self.cad_data_manager.pipe_by_id.get(valve.pipe_id)
+                    if pipe_v:
+                        fl = pf_map.get(pipe_v.pipe_id)
+                        if fl:
+                            valve_off_sep = offs.get(fl, 0.0)
+                vw = self.project_point(valve.x, valve.y, valve.z + valve_off_sep)
                 vp = APoint(vw[0], -vw[1], 0)
                 pipe = self.cad_data_manager.pipe_by_id.get(valve.pipe_id)
                 if pipe:
@@ -3899,7 +3959,11 @@ class PreviewPage(ttk.Frame):
                     pass
 
             # --- 标注文字 ---
-            self._cad_write_annotations(ms, proj, hydrant_offsets)
+            try:
+                new_doc.ActiveTextStyle = new_doc.TextStyles.Item("shui")
+            except Exception:
+                pass
+            self._cad_write_annotations(ms, proj, hydrant_offsets, sep_cad_unflipped if self._separation_applied else None)
 
             # 保存
             new_doc.SaveAs(filepath)
@@ -3959,8 +4023,8 @@ class PreviewPage(ttk.Frame):
             # AppendOuterLoop 在 AutoCAD 2014 COM 下不可用，用8段AddSolid扇形逼近半圆
             N = 8
             for i in range(N):
-                a1 = math.radians(45 + i * 180 / N)
-                a2 = math.radians(45 + (i + 1) * 180 / N)
+                a1 = math.radians(225 + i * 180 / N)
+                a2 = math.radians(225 + (i + 1) * 180 / N)
                 x1 = R * math.cos(a1)
                 y1 = R * math.sin(a1)
                 x2 = R * math.cos(a2)
@@ -4008,7 +4072,69 @@ class PreviewPage(ttk.Frame):
             ))
         return segs
 
-    def _cad_write_annotations(self, ms, proj, hydrant_offsets):
+    def _cad_write_separation_dashed_lines(self, ms, new_doc):
+        """反写分离灰虚线到CAD"""
+        pipe_endpoints = getattr(self, '_sep_pipe_endpoints', None)
+        if not pipe_endpoints:
+            return
+        sep = self._build_separation_transforms()
+        pipe_to_floor, _, cumulative_offsets_mm, _ = sep
+        node_connected_floors = {}
+        for node in self.cad_data_manager.nodes:
+            floors = set()
+            for pid in getattr(node, 'connected_pipes', []) or []:
+                fn = pipe_to_floor.get(pid)
+                if fn:
+                    floors.add(fn)
+            if floors:
+                node_connected_floors[node.node_id] = floors
+        pipe_node_proj = {}
+        for pid, ((sx, sy), (ex, ey)) in pipe_endpoints.items():
+            pipe = self.cad_data_manager.pipe_by_id.get(pid)
+            if pipe:
+                pipe_node_proj[(pid, pipe.start_node_id)] = (sx, sy)
+                pipe_node_proj[(pid, pipe.end_node_id)] = (ex, ey)
+        layer_name = "PipeLoss_分离虚线"
+        try:
+            new_doc.Linetypes.Load("DASHED", "acad.lin")
+        except Exception:
+            pass
+        self._cad_ensure_layer(new_doc, layer_name, 8)
+        try:
+            new_doc.Layers.Item(layer_name).Linetype = "DASHED"
+        except Exception:
+            pass
+        sorted_floors = sorted(self.cad_data_manager.floors, key=lambda f: f.elevation)
+        for i in range(len(sorted_floors) - 1):
+            lo, hi = sorted_floors[i], sorted_floors[i + 1]
+            off_lo = cumulative_offsets_mm.get(lo.name, 0.0)
+            off_hi = cumulative_offsets_mm.get(hi.name, 0.0)
+            if abs(off_hi - off_lo) < 0.001:
+                continue
+            for node in self.cad_data_manager.nodes:
+                floors = node_connected_floors.get(node.node_id, set())
+                if lo.name not in floors or hi.name not in floors:
+                    continue
+                cps = getattr(node, 'connected_pipes', []) or []
+                l_pid = r_pid = None
+                for pid in cps:
+                    fn = pipe_to_floor.get(pid)
+                    if fn == lo.name and pid.startswith('L_'):
+                        l_pid = pid
+                    if fn == hi.name and pid.startswith('R_'):
+                        r_pid = pid
+                if not (l_pid and r_pid):
+                    continue
+                lp = pipe_node_proj.get((l_pid, node.node_id))
+                rp = pipe_node_proj.get((r_pid, node.node_id))
+                if not lp or not rp:
+                    continue
+                p1 = APoint(lp[0], -lp[1], 0)
+                p2 = APoint(rp[0], -rp[1], 0)
+                line = ms.AddLine(p1, p2)
+                line.Layer = layer_name
+
+    def _cad_write_annotations(self, ms, proj, hydrant_offsets, pipe_unflipped=None):
         """反写标注文字"""
         for pipe in self.cad_data_manager.pipes:
             if self.hide_invalid_var.get() and not pipe.is_active:
@@ -4022,12 +4148,19 @@ class PreviewPage(ttk.Frame):
                     threshold = self.skip_dn_min_length
                 if pipe.length < threshold:
                     skip_dn = True
-            p1 = proj.get(pipe.start_node_id)
-            p2 = proj.get(pipe.end_node_id)
-            if not p1 or not p2:
-                continue
-            sx, sy = p1
-            ex, ey = p2
+            if pipe_unflipped:
+                pp = pipe_unflipped.get(pipe.pipe_id)
+                if not pp:
+                    continue
+                sx, sy = pp[0]
+                ex, ey = pp[1]
+            else:
+                p1 = proj.get(pipe.start_node_id)
+                p2 = proj.get(pipe.end_node_id)
+                if not p1 or not p2:
+                    continue
+                sx, sy = p1
+                ex, ey = p2
             if hydrant_offsets and pipe.pipe_id.startswith('B_'):
                 mid_id = hydrant_offsets.get(pipe.end_node_id)
                 if mid_id:
