@@ -8,9 +8,12 @@ class MaterialManager:
     def __init__(self, materials_file: str):
         self.materials_file = materials_file
         self.default_materials_file = os.path.join(os.path.dirname(materials_file), "default_materials.json")
+        self.elbow_90_la_file = os.path.join(os.path.dirname(materials_file), "elbow_90_la.json")
         self.materials: Dict[str, Dict] = {}
         self.default_materials: Dict[str, Dict] = {}
+        self.elbow_90_la_mm: Dict[str, float] = {}
         self.load_default_materials()
+        self.load_elbow_90_la()
         self.load_materials()
         self.load_k_dn_map()
         
@@ -27,6 +30,19 @@ class MaterialManager:
         else:
             self.default_materials = {}
             print(f"默认管材配置文件不存在: {self.default_materials_file}")
+
+    def load_elbow_90_la(self):
+        """加载 90 度弯头 La 数据（独立只读文件 elbow_90_la.json，程序不覆写该文件）"""
+        if os.path.exists(self.elbow_90_la_file):
+            try:
+                with open(self.elbow_90_la_file, 'r', encoding='utf-8') as f:
+                    self.elbow_90_la_mm = json.load(f).get("elbow_90_la_mm", {})
+            except Exception as e:
+                print(f"加载 90 度弯头 La 数据失败: {e}")
+                self.elbow_90_la_mm = {}
+        else:
+            self.elbow_90_la_mm = {}
+            print(f"90 度弯头 La 数据文件不存在: {self.elbow_90_la_file}")
         
     def load_materials(self):
         """从配置文件加载用户管材数据"""
@@ -161,6 +177,19 @@ class MaterialManager:
             if info.get("nominal") == dn:
                 return info
         return {"nominal": dn, "inner": 0.0}
+
+    def get_elbow_90_la_mm(self, dn) -> Optional[float]:
+        """获取 90 度弯头尺寸 La（毫米），dn 接受 'DN100' 或 100 两种形式"""
+        if dn is None:
+            return None
+        s = str(dn).strip().upper()
+        if s in self.elbow_90_la_mm:
+            return float(self.elbow_90_la_mm[s])
+        if s.isdigit():
+            key = "DN" + s
+            if key in self.elbow_90_la_mm:
+                return float(self.elbow_90_la_mm[key])
+        return None
 
     def load_k_dn_map(self):
         """加载K-DN映射表，用户文件不存在时从默认文件复制"""

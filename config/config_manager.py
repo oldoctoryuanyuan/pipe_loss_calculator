@@ -88,6 +88,7 @@ class ConfigManager:
             "tolerance": 10.0,
             "sprinkler_block_name": "",        # 喷头图块名（喷淋模式，无属性值）
             "sprinkler_K": 80,                # 喷头流量系数
+            "tz_ratio_sprinkler": 0.015,      # 支状喷淋倒推法局部水损系数（仅喷淋）
             "hydrant_Ad": 0.00172,            # 水带比阻
             "hydrant_Ld": 25,                 # 水带长度 (m)
             "hydrant_B": 1.577,               # 水枪特性系数
@@ -170,11 +171,22 @@ class ConfigManager:
             self.current_scheme = scheme_name
             self.save_config()
     
-    def update_current_config(self, key: str, value: Any):
-        """更新当前方案的配置"""
+    def update_current_config(self, key: str, value: Any = None):
+        """更新当前方案的配置
+
+        兼容两种调用方式：
+        1. update_current_config("key", value)：更新单个配置项
+        2. update_current_config(config_dict)：整体替换当前方案配置
+           （value 缺省时 key 视为完整配置字典）
+        """
+        if value is None and isinstance(key, dict):
+            self.schemes[self.current_scheme] = copy.deepcopy(key)
+            self.save_config()
+            return
+
         if self.current_scheme not in self.schemes:
             self.schemes[self.current_scheme] = self.create_default_scheme()
-        
+
         self.schemes[self.current_scheme][key] = value
         self.save_config()
     
