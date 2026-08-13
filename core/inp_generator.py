@@ -5,7 +5,7 @@ INP文件生成器
 import os
 import json
 from collections import deque
-from typing import Dict, List, Tuple, Set
+from typing import Dict, List, Tuple, Set, Optional
 from dataclasses import dataclass
 import logging
 from datetime import datetime
@@ -58,11 +58,15 @@ class INPGenerator:
     # 注释原因：此方法在代码中从未被调用，水头损失公式在[OPTIONS]中直接硬编码为H-W
     
     def generate_inp_file(self, cad_data_manager, project_dir, demand_groups,
-                          no_virtual=False, calc_type='fire_fighting') -> Tuple[bool, str, Dict]:
+                          no_virtual=False, calc_type='fire_fighting',
+                          pipe_lengths: Optional[Dict[str, float]] = None,
+                          inner_diameter_offset: float = 0.0) -> Tuple[bool, str, Dict]:
         """
         生成EPANET INP文件
         :param no_virtual: 是否不使用虚拟用水节点（模式B/C时True）
         :param calc_type: 计算类型，用于可能的水头损失公式（暂未使用）
+        :param pipe_lengths: 管道计算长度覆盖表（当量长度法提供，None时按局部水损系数法计算）
+        :param inner_diameter_offset: 内径修正量（mm，如 -1.0 表示内径减1mm计算）
         """
         try:
             inp_path = os.path.join(project_dir, "network.inp")
@@ -80,7 +84,10 @@ class INPGenerator:
                 demand_group_models,
                 flow_factor,
                 pressure_factor,
-                no_virtual=no_virtual
+                no_virtual=no_virtual,
+                pipe_lengths=pipe_lengths,
+                calc_type=calc_type,
+                inner_diameter_offset=inner_diameter_offset
             )
 
             with open(inp_path, 'w', encoding='utf-8') as f:
@@ -101,9 +108,12 @@ class INPGenerator:
             if not group_data.get("is_selected", False):
                 continue
                 
-            # 创建虚拟需求节点ID
+            # 创建虚拟需求节点ID（跳过状态为"关"的用水点，如位于检修管道上的用水点）
             demand_node_id = f"D_{group_id}"
-            actual_nodes = [node.node_id for node in group_data.get("demand_nodes", [])]
+            actual_nodes = [
+                node.node_id for node in group_data.get("demand_nodes", [])
+                if getattr(node, 'status', "开") != "关"
+            ]
             
             total_flow_lps = group_data.get("total_flow", 0.0)
             
@@ -156,7 +166,10 @@ class INPGenerator:
         return visited
 
     def _generate_inp_content(self, cad_data_manager, demand_group_models,
-                            flow_factor, pressure_factor, no_virtual=False) -> str:
+                            flow_factor, pressure_factor, no_virtual=False,
+                            pipe_lengths: Optional[Dict[str, float]] = None,
+                            calc_type: str = 'fire_fighting',
+                            inner_diameter_offset: float = 0.0) -> str:
         """生成完整的INP文件内容 - 修正节点重复定义问题"""
         lines = []
         
@@ -256,15 +269,24 @@ class INPGenerator:
         lines.append("[PIPES]")
         lines.append(";ID               Node1            Node2            Length      Diameter    Roughness  Status")
         
-        # 获取局部水损比例
+        # 获取局部水损比例（A1：消火栓-局部水损比例法；B1：喷淋-局部水损比例法；旧key回退兼容）
+        # 当量长度法（pipe_lengths非空）时不使用此系数，长度由 pipe_lengths 直接覆盖
         config = self.config_manager.get_live_config()
-        local_loss_ratio = config.get("local_loss_ratio", 0.3)
+        if calc_type == "sprinkler":
+            local_loss_ratio = config.get("local_loss_ratio_sprinkler", 0.5)
+        else:
+            local_loss_ratio = config.get("local_loss_ratio_hydrant",
+                                          config.get("local_loss_method_ratio", 0.3))
         length_factor = 1.0 + local_loss_ratio   # 放大系数
 
         # 写入所有实际管道
         for pipe in cad_data_manager.pipes:
             if not pipe.is_active:
                 continue   # 跳过无效管道
+            # 跳过自环管道（起点==终点）：EPANET 不接受自环，物理上也无意义
+            if pipe.start_node_id == pipe.end_node_id:
+                logger.warning(f"管道 {pipe.pipe_id} 为自环管道（起点=终点），跳过写入")
+                continue
             # 检查端点节点是否存在且有效
             start_node = cad_data_manager.node_by_id.get(pipe.start_node_id)
             end_node = cad_data_manager.node_by_id.get(pipe.end_node_id)
@@ -282,9 +304,12 @@ class INPGenerator:
             else:
                 status = "Open" if pipe.status == "开" else "Closed"
             
-            diameter_mm = pipe.inner_diameter
+            diameter_mm = pipe.inner_diameter + inner_diameter_offset
             roughness = self.material_manager.get_roughness(pipe.material)
-            adjusted_length = pipe.length * length_factor # 修改长度
+            if pipe_lengths is not None and pipe.pipe_id in pipe_lengths:
+                adjusted_length = pipe_lengths[pipe.pipe_id]   # 当量长度法：使用引擎提供的计算长度
+            else:
+                adjusted_length = pipe.length * length_factor # 修改长度
             lines.append(f"{pipe.pipe_id:15} {pipe.start_node_id:15} {pipe.end_node_id:15} "
                         f"{adjusted_length:<8.2f}    {diameter_mm:<8.3f}  {roughness:<8.1f} 0.0      {status}")
         

@@ -5,7 +5,7 @@ EPANET计算器（改用 WNTR 实现）
 import os
 import threading
 import time
-from typing import Tuple, Optional
+from typing import Dict, Tuple, Optional
 import logging
 import wntr
 
@@ -103,6 +103,59 @@ class EpanetCalculator:
             self.current_status = f"计算失败: {str(e)}"
             logger.error(f"WNTR 计算异常: {e}", exc_info=True)
             return False, f"计算失败: {str(e)}", ""
+
+    # ---------- 内存模式（P3 优化：模型只加载一次，迭代间改 demand/head 直接重算） ----------
+    def load_model(self, inp_file: str) -> Tuple[bool, str]:
+        """将 INP 加载为内存模型（仅首次需要），保存到 self.last_wn，供后续内存模式复用"""
+        try:
+            wn = wntr.network.WaterNetworkModel(inp_file)
+            wn.options.hydraulic.demand_model = 'DDA'
+            self.last_wn = wn
+            logger.info(f"内存模型加载成功: {inp_file}")
+            return True, ""
+        except Exception as e:
+            logger.error(f"加载模型失败: {e}", exc_info=True)
+            return False, str(e)
+
+    def set_demands(self, demand_map: Dict[str, float]) -> None:
+        """批量设置节点需求（单位 L/s，内部转换为 WNTR 的 m³/s）"""
+        if self.last_wn is None:
+            return
+        for node_id, q_lps in demand_map.items():
+            node = self.last_wn.get_node(node_id)
+            if node is None:
+                continue
+            try:
+                ts_list = node.demand_timeseries_list
+                if len(ts_list) > 0:
+                    ts_list[0].base_value = q_lps / 1000.0
+            except Exception as e:
+                logger.warning(f"设置节点 {node_id} 需求失败: {e}")
+
+    def set_reservoir_head(self, node_id: str, head_m: float) -> None:
+        """设置水库水头（米），模式C二分时更新供水压力用"""
+        if self.last_wn is None:
+            return
+        node = self.last_wn.get_node(node_id)
+        if node is None:
+            return
+        try:
+            node.base_head = head_m
+        except Exception as e:
+            logger.warning(f"设置水库 {node_id} 水头失败: {e}")
+
+    def run_loaded_model(self) -> Tuple[bool, str]:
+        """用内存模型运行水力模拟（与 run_analysis 使用同一 EpanetSimulator 引擎）"""
+        if self.last_wn is None:
+            return False, "模型未加载"
+        try:
+            sim = wntr.sim.EpanetSimulator(self.last_wn)
+            results = sim.run_sim()
+            self.last_results = results
+            return True, "计算成功完成"
+        except Exception as e:
+            logger.error(f"内存模式计算异常: {e}", exc_info=True)
+            return False, f"计算失败: {str(e)}"
 
     def _generate_simple_rpt(self, results, wn, rpt_path):
         """生成一个简化的 rpt 文件，内容与 EPANET 报告类似（可选）"""

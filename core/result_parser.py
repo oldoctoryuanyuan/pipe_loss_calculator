@@ -51,7 +51,7 @@ class ResultParser:
             # 注意：WNTR 结果中可能没有直接给出 headloss_per_km，我们需要通过模型计算或从结果获取
             # 如果结果中有 'headloss'，则使用，否则手动计算
             if 'headloss' in results.link:
-                link_headloss = results.link['headloss'].iloc[-1]   # 总水损，米
+                link_headloss = results.link['headloss'].iloc[-1]   # 每米水损 (m/m)
             else:
                 link_headloss = None
 
