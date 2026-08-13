@@ -3,6 +3,7 @@ CAD数据管理器模块
 负责读取和处理CAD文件中的管网数据
 """
 import os
+import copy
 import tempfile
 import uuid
 import json
@@ -133,6 +134,43 @@ class DemandGroupData:
 
 
 @dataclass
+class ConnectionPointData:
+    """连接点数据类（区域管网模式用）"""
+    point_id: str = ""
+    node_id: str = ""
+    building_id: str = ""
+    floor_name: str = ""
+    paired_with: str = ""      # 配对的连接点ID，空=未配对
+    is_calibrated: bool = False  # 是否已校准（阶段九使用）
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    calib_dx: float = 0.0      # 校准个体拖动偏移X（毫米）
+    calib_dy: float = 0.0      # 校准个体拖动偏移Y（毫米）
+
+
+@dataclass
+class CalibrationRectData:
+    """校准配对矩形框数据类（阶段九使用）"""
+    rect_id: str = ""
+    base_building_id: str = ""
+    target_building_id: str = ""
+    target_floor_name: str = ""
+    pairings: List[Tuple[str, str]] = field(default_factory=list)
+    # pairings: (base_cp_id, target_cp_id) 基准方CP→目标方CP
+    is_calibrated: bool = False
+    is_spliced: bool = False
+    transform_dx: float = 0.0
+    transform_dy: float = 0.0
+    transform_angle: float = 0.0  # 度
+    # CAD对齐框（目标方楼层矩形框，毫米）
+    rect_min_x: float = 0.0
+    rect_min_y: float = 0.0
+    rect_max_x: float = 0.0
+    rect_max_y: float = 0.0
+
+
+@dataclass
 class ValveData:
     """阀门数据类"""
     valve_id: str = ""
@@ -195,6 +233,59 @@ class FloorData:
     nodes: List['NodeData'] = field(default_factory=list)   # 本层节点
     pipe_z_offset: float = 0.0    # 本层管网标高（米），计算后赋值
     hydrants: List['HydrantData'] = field(default_factory=list)  # 本层消火栓数据列表
+    building_id: str = ""        # 所属楼栋ID（区域模式），非区域时空字符串
+    pipe_z_offset_set: bool = False  # 是否由用户手动/导入设置（首次自动计算时跳过覆盖）
+    rect_corners: Optional[List[List[float]]] = None  # 楼层矩形框4角点[[x,y]×4]（毫米），支持旋转/凸四边形；None=仅用rect_min/rect_max轴对齐判定
+
+
+# ========== 楼层矩形框判定辅助函数 ==========
+def _points_form_convex_quad(points, tol_abs: float = 1e-3):
+    """判断4个点是否构成凸四边形（允许旋转和浮点坐标噪声）。
+
+    沿顶点顺序计算相邻两边向量的叉积，凸四边形要求各叉积符号一致（含容差）。
+    points: 4个 (x, y) 点
+    """
+    if len(points) != 4:
+        return False
+    signs = []
+    for i in range(4):
+        p0 = points[i]
+        p1 = points[(i + 1) % 4]
+        p2 = points[(i + 2) % 4]
+        cross = ((p1[0] - p0[0]) * (p2[1] - p1[1])
+                 - (p1[1] - p0[1]) * (p2[0] - p1[0]))
+        if abs(cross) < tol_abs:
+            continue  # 近共线顶点，忽略
+        signs.append(cross > 0)
+    return len(set(signs)) <= 1 if signs else False
+
+
+def _point_in_quad(x: float, y: float, corners, tol_abs: float = 1e-3) -> bool:
+    """判断点 (x,y) 是否在凸四边形内（叉积符号一致，含边界容差）。
+
+    先做轴对齐包围盒快速排除，再逐边叉积判定；支持旋转/噪声矩形。
+    corners: 4个按顺序的 (x, y) 角点
+    """
+    if len(corners) != 4:
+        return False
+    xs = [c[0] for c in corners]
+    ys = [c[1] for c in corners]
+    if (x < min(xs) - tol_abs or x > max(xs) + tol_abs
+            or y < min(ys) - tol_abs or y > max(ys) + tol_abs):
+        return False
+    sign = 0
+    for i in range(4):
+        ax, ay = corners[i]
+        bx, by = corners[(i + 1) % 4]
+        cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+        if abs(cross) < tol_abs:
+            continue  # 点在边所在直线上，视为边界包含
+        s = 1 if cross > 0 else -1
+        if sign == 0:
+            sign = s
+        elif sign != s:
+            return False
+    return True
 
 
 # ========== 多楼层合一辅助函数 ==========
@@ -340,9 +431,26 @@ class CADDataManager:
         # 状态
         self.is_loaded = False
         self.current_project_dir = None   # 当前项目目录，用于保存楼层配置
+        # 自环管道ID列表（起点=终点）：读取CAD时由管件分析检测并缓存，计算时直接读取不重复分析
+        self.self_loop_pipes: List[str] = []
+
+        # 区域管网模式数据
+        self.building_data: Dict[str, Dict] = {}
+        self.building_order: list[str] = []
+        self.building_file_paths: dict[str, str] = {}  # building_id -> file_path
+        self._building_id: str = ""  # 当前读取楼栋ID，区域模式专用
+        self._auto_sprinkler_seen: bool = False  # 区域模式：任一单体/室外管网检测到喷头后保持喷淋
+        
+        # 连接点数据（区域管网模式用）
+        self.connection_points: List[ConnectionPointData] = []
+        self.connection_counters: Dict[str, int] = {}
+        self.calibration_rects: List[CalibrationRectData] = []
         self.default_color256_diameter = None  # 存储用户指定的随层管道管径
         self.progress_callback = None  # 用于接收进度消息的回调函数
-        
+
+        # 阀门→管道合并映射，用于修复阀门匹配
+        self._valve_pipe_pairs: List[tuple] = []  # [(x, y, z, pipe_id), ...]
+
         # 单位转换因子 (CAD单位到米)
         self.unit_factors = {
             "毫米": 0.001,
@@ -399,6 +507,462 @@ class CADDataManager:
             logger.error(f"检查CAD文档失败: {e}")
             return False
 
+    def _prefix_id(self, base_id: str) -> str:
+        """区域模式：给编号加楼栋ID前缀"""
+        return f"{self._building_id}_{base_id}" if self._building_id else base_id
+
+    def _unprefix_id(self, prefixed_id: str) -> str:
+        """区域模式：去除当前楼栋ID前缀（只用于派生ID的重新拼装）"""
+        if self._building_id and prefixed_id.startswith(f"{self._building_id}_"):
+            return prefixed_id[len(self._building_id) + 1:]
+        return prefixed_id
+
+    def get_building_ids(self) -> list[str]:
+        """返回楼栋ID按读入顺序的列表（区域模式），非区域模式返回空列表"""
+        return self.building_order
+
+    def get_building_by_entity(self, entity_id: str) -> str | None:
+        """区域模式：返回指定实体ID所属的楼栋ID，非区域模式返回None"""
+        if not self.building_order:
+            return None
+        for bid in self.building_order:
+            if entity_id.startswith(f"{bid}_"):
+                return bid
+        return None
+
+    def get_building_id_by_file(self, file_path: str) -> str | None:
+        """返回指定CAD文件已关联的建筑ID，未关联则返回None"""
+        for bid, fp in self.building_file_paths.items():
+            if fp == file_path:
+                return bid
+        return None
+
+    def delete_building(self, building_id: str) -> dict:
+        """级联删除指定楼栋的所有数据，返回快照（用于undo恢复）。
+
+        清理顺序：配对引用 → 收集快照 → 楼层引用 → 全局列表 → 索引字典 → building_order
+        """
+        bprefix = building_id + "_"
+
+        # ── 1. 清理配对引用 ──
+        # 被删楼栋的所有连接点ID
+        deleted_cp_ids = {cp.point_id for cp in self.connection_points if cp.building_id == building_id}
+        # 与被删楼栋连接点配对过的对方连接点ID（清配对前收集，用于清 calib 偏移）
+        partner_cp_ids = set()
+        for cp in self.connection_points:
+            if cp.building_id == building_id and cp.paired_with:
+                partner_cp_ids.add(cp.paired_with)
+            elif cp.paired_with in deleted_cp_ids:
+                partner_cp_ids.add(cp.point_id)
+        # 被删连接点的对方配对清空
+        for cp in self.connection_points:
+            if cp.building_id == building_id and cp.paired_with:
+                partner = self.get_connection_point_by_id(cp.paired_with)
+                if partner:
+                    partner.paired_with = ""
+        # 剩余连接点中指向被删楼栋的配对清空
+        for cp in self.connection_points:
+            if cp.building_id != building_id and cp.paired_with in deleted_cp_ids:
+                cp.paired_with = ""
+        # 清理涉及被删楼栋的校准条目（作为基准方或目标方皆删），
+        # 否则残留 rect 会导致 ZT 画布残留虚线、_zt_has_pending_work 误判未完成工作
+        self.calibration_rects = [
+            r for r in self.calibration_rects
+            if r.base_building_id != building_id and r.target_building_id != building_id
+        ]
+        # 清空对方连接点残留的 calib 拖动偏移（其校准上下文已随 rect 删除），
+        # 避免重新校准配对时旧偏移叠加到新条目
+        for cp in self.connection_points:
+            if cp.building_id != building_id and cp.point_id in partner_cp_ids:
+                cp.calib_dx = 0.0
+                cp.calib_dy = 0.0
+
+        # ── 2. 收集快照 ──
+        deleted_pipes = [p for p in self.pipes if p.pipe_id.startswith(bprefix)]
+        deleted_nodes = [n for n in self.nodes if n.node_id.startswith(bprefix)]
+        deleted_valves = [v for v in self.valves if v.valve_id.startswith(bprefix)]
+        deleted_hydrants = [h for h in self.hydrants if h.hydrant_id.startswith(bprefix)]
+        deleted_risers = [r for r in self.risers if r.riser_id.startswith(bprefix)]
+        deleted_cps = [cp for cp in self.connection_points if cp.building_id == building_id]
+        deleted_floors = [f for f in self.floors if f.building_id == building_id]
+        bdata = copy.deepcopy(self.building_data.get(building_id)) if building_id in self.building_data else None
+        bpath = self.building_file_paths.get(building_id)
+        order_idx = self.building_order.index(building_id) if building_id in self.building_order else -1
+
+        snapshot = {
+            'building_id': building_id,
+            'pipes': deleted_pipes, 'nodes': deleted_nodes,
+            'valves': deleted_valves, 'hydrants': deleted_hydrants,
+            'risers': deleted_risers, 'connection_points': deleted_cps,
+            'floors': deleted_floors,
+            'building_data_entry': bdata,
+            'building_file_paths_entry': bpath,
+            'building_order_index': order_idx,
+        }
+
+        # ── 3. 收集被删ID集合（用于断言）──
+        del_pipe_ids = {p.pipe_id for p in deleted_pipes}
+        del_node_ids = {n.node_id for n in deleted_nodes}
+        del_valve_ids = {v.valve_id for v in deleted_valves}
+        del_hydrant_ids = {h.hydrant_id for h in deleted_hydrants}
+        del_riser_ids = {r.riser_id for r in deleted_risers}
+
+        # ── 4. 从楼层引用中移除实体 ──
+        for floor in deleted_floors:
+            fkey = self._make_floor_key(floor.name, floor.building_id)
+            self.floor_by_name.pop(fkey, None)
+            floor.pipes.clear()
+            floor.nodes.clear()
+            floor.hydrants.clear()
+            if hasattr(floor, 'risers'):
+                floor.risers.clear()
+            if floor in self.floors:
+                self.floors.remove(floor)
+
+        for floor in self.floors:
+            floor.pipes = [p for p in floor.pipes if p.pipe_id not in del_pipe_ids]
+            floor.nodes = [n for n in floor.nodes if n.node_id not in del_node_ids]
+            floor.hydrants = [h for h in floor.hydrants if h.hydrant_id not in del_hydrant_ids]
+            if hasattr(floor, 'risers'):
+                floor.risers = [r for r in floor.risers if r.riser_id not in del_riser_ids]
+
+        # ── 5. 从全局列表中移除实体 ──
+        self.pipes = [p for p in self.pipes if p.pipe_id not in del_pipe_ids]
+        self.nodes = [n for n in self.nodes if n.node_id not in del_node_ids]
+        self.valves = [v for v in self.valves if v.valve_id not in del_valve_ids]
+        self.hydrants = [h for h in self.hydrants if h.hydrant_id not in del_hydrant_ids]
+        self.risers = [r for r in self.risers if r.riser_id not in del_riser_ids]
+        self.connection_points = [cp for cp in self.connection_points if cp.building_id != building_id]
+
+        # ── 6. 清理索引字典 ──
+        for pid in del_pipe_ids:
+            self.pipe_by_id.pop(pid, None)
+        for nid in del_node_ids:
+            self.node_by_id.pop(nid, None)
+        for vid in del_valve_ids:
+            self.valve_by_id.pop(vid, None)
+        for hid in del_hydrant_ids:
+            self.hydrant_by_id.pop(hid, None)
+        for rid in del_riser_ids:
+            self.riser_by_id.pop(rid, None)
+
+        # ── 7. 清理派生数据 ──
+        # duplicate_risers_by_floor: 移除被删楼栋楼层条目，过滤剩余楼层中的被删立管
+        for fkey in list(self.duplicate_risers_by_floor.keys()):
+            if any(fkey.startswith(f"{building_id}|") for f in deleted_floors
+                   if fkey == self._make_floor_key(f.name, f.building_id)):
+                del self.duplicate_risers_by_floor[fkey]
+            else:
+                self.duplicate_risers_by_floor[fkey] = [
+                    r for r in self.duplicate_risers_by_floor[fkey]
+                    if r.riser_id not in del_riser_ids
+                ]
+                if not self.duplicate_risers_by_floor[fkey]:
+                    del self.duplicate_risers_by_floor[fkey]
+        # duplicate_pipe_ids_by_floor: 同上
+        for fkey in list(self.duplicate_pipe_ids_by_floor.keys()):
+            if any(fkey.startswith(f"{building_id}|") for f in deleted_floors
+                   if fkey == self._make_floor_key(f.name, f.building_id)):
+                del self.duplicate_pipe_ids_by_floor[fkey]
+            else:
+                self.duplicate_pipe_ids_by_floor[fkey] -= del_pipe_ids
+                if not self.duplicate_pipe_ids_by_floor[fkey]:
+                    del self.duplicate_pipe_ids_by_floor[fkey]
+        # grouped_floors_map: 移除该楼栋的分组条目
+        for fkey in list(self.grouped_floors_map.keys()):
+            if fkey.startswith(f"{building_id}|"):
+                del self.grouped_floors_map[fkey]
+
+        # ── 8. 清理 building 元数据 ──
+        self.building_data.pop(building_id, None)
+        # 清理其他楼栋指向该楼栋的基准引用及拼接状态
+        for bid_data in self.building_data.values():
+            if bid_data.get("base_building_id") == building_id:
+                bid_data["base_building_id"] = ""
+                bid_data["is_spliced"] = False
+        if building_id in self.building_order:
+            self.building_order.remove(building_id)
+        self.building_file_paths.pop(building_id, None)
+        self.connection_counters.pop(building_id, None)
+
+        # ── 9. 断言验证 ──
+        for pid in del_pipe_ids:
+            assert pid not in self.pipe_by_id
+        for nid in del_node_ids:
+            assert nid not in self.node_by_id
+        for vid in del_valve_ids:
+            assert vid not in self.valve_by_id
+        for hid in del_hydrant_ids:
+            assert hid not in self.hydrant_by_id
+        for rid in del_riser_ids:
+            assert rid not in self.riser_by_id
+        assert building_id not in self.building_data
+        assert building_id not in self.building_order
+
+        logger.info(f"已删除楼栋 {building_id}: {len(del_pipe_ids)} 管道, {len(del_node_ids)} 节点, "
+                    f"{len(del_valve_ids)} 阀门, {len(del_hydrant_ids)} 消火栓, "
+                    f"{len(del_riser_ids)} 立管, {len(deleted_cps)} 连接点, {len(deleted_floors)} 楼层")
+        if not self.building_order:
+            self.is_loaded = False
+        return snapshot
+
+    def get_next_connection_pipe_number(self, base_bid: str) -> int:
+        """获取基准方下一个连接管编号。"""
+        prefix = f"{base_bid}_C_"
+        max_num = 0
+        for p in self.pipes:
+            if p.pipe_id.startswith(prefix):
+                try:
+                    num = int(p.pipe_id.split("_C_")[1])
+                    max_num = max(max_num, num)
+                except (IndexError, ValueError):
+                    pass
+        return max_num + 1
+
+    @staticmethod
+    def parse_dn_to_float(dn_str: str) -> float:
+        """解析 'DN100' → 100.0，失败返回 0.0。"""
+        if not dn_str:
+            return 0.0
+        s = dn_str.strip().upper().replace("DN", "").replace(" ", "")
+        try:
+            return float(s)
+        except ValueError:
+            return 0.0
+
+    def add_connection_point(self, node_id: str, building_id: str, floor_name: str = "") -> str:
+        """为指定节点添加连接点，返回 point_id。非区域模式返回空字符串。"""
+        if not building_id:
+            return ""
+        node = self.node_by_id.get(node_id)
+        if not node:
+            return ""
+        counter = self.connection_counters.get(building_id, 0) + 1
+        self.connection_counters[building_id] = counter
+        point_id = f"{building_id}_LJD_{counter:03d}"
+        cp = ConnectionPointData(
+            point_id=point_id,
+            node_id=node_id,
+            building_id=building_id,
+            floor_name=floor_name,
+            x=node.x, y=node.y, z=node.z,
+        )
+        self.connection_points.append(cp)
+        logger.info(f"添加连接点 {point_id} (节点 {node_id}, 楼层 {floor_name})")
+        return point_id
+
+    def remove_connection_point(self, point_id: str) -> bool:
+        """删除指定连接点，返回是否成功。已配对时自动清空对方 paired_with。"""
+        cp = self.get_connection_point_by_id(point_id)
+        if cp is None:
+            return False
+        if cp.paired_with:
+            partner = self.get_connection_point_by_id(cp.paired_with)
+            if partner:
+                partner.paired_with = ""
+        self.connection_points.remove(cp)
+        # 清理涉及此连接点的校准矩形框
+        self.calibration_rects = [
+            r for r in self.calibration_rects
+            if not any(base_id == point_id or tgt_id == point_id
+                       for base_id, tgt_id in r.pairings)
+        ]
+        logger.info(f"删除连接点 {point_id}")
+        return True
+
+    def get_connection_point_by_id(self, point_id: str) -> Optional['ConnectionPointData']:
+        """根据 point_id 查找连接点。"""
+        for cp in self.connection_points:
+            if cp.point_id == point_id:
+                return cp
+        return None
+
+    # ── 校准矩形框 CRUD（阶段九） ──
+
+    def add_calibration_rect(self, rect: CalibrationRectData):
+        self.calibration_rects.append(rect)
+
+    def remove_calibration_rect(self, rect_id: str) -> bool:
+        for r in self.calibration_rects:
+            if r.rect_id == rect_id:
+                self.calibration_rects.remove(r)
+                return True
+        return False
+
+    def get_calibration_rects_for_floor(self, base_bid: str, floor_name: str) -> List[CalibrationRectData]:
+        result = []
+        for r in self.calibration_rects:
+            if r.base_building_id != base_bid:
+                continue
+            for base_cp_id, _ in r.pairings:
+                cp = self.get_connection_point_by_id(base_cp_id)
+                if cp and cp.floor_name == floor_name:
+                    result.append(r)
+                    break
+        return result
+
+    def get_calibration_rect_for_cp(self, cp_point_id: str) -> Optional['CalibrationRectData']:
+        """返回包含指定连接点的校准条目（base CP 或 target CP 皆可）。"""
+        for r in self.calibration_rects:
+            for base_id, tgt_id in r.pairings:
+                if base_id == cp_point_id or tgt_id == cp_point_id:
+                    return r
+        return None
+
+    def id_type(self, entity_id: str) -> str:
+        """提取实体ID的类型标签（R/L/B/H/P/N/V/SP），兼容建筑ID前缀和带后缀的拆分ID"""
+        parts = entity_id.split('_')
+        if len(parts) < 2:
+            return ""
+        known_types = {"R", "L", "B", "H", "P", "N", "V", "SP"}
+        for part in parts:
+            if part in known_types:
+                return part
+        i = len(parts) - 1
+        while i >= 0 and parts[i].isdigit():
+            i -= 1
+        return parts[i] if i >= 0 else ""
+
+    def _make_floor_key(self, name: str, building_id: str | None = None) -> str:
+        """构建楼层名称的复合键，区域模式下包含楼栋ID防碰撞"""
+        if building_id:
+            return f"{building_id}|{name}"
+        return name
+
+    def lookup_floor(self, name: str, building_id: str | None = None):
+        """楼层查找，区域模式下用复合键匹配楼栋，回退到 plain key"""
+        result = self.floor_by_name.get(self._make_floor_key(name, building_id))
+        if result is None:
+            result = self.floor_by_name.get(name)
+        return result
+
+    def _save_state(self) -> dict:
+        """保存当前所有数据（区域模式追加前调用）"""
+        return {
+            'pipes': list(self.pipes),
+            'pipe_by_id': dict(self.pipe_by_id),
+            'nodes': list(self.nodes),
+            'node_by_id': dict(self.node_by_id),
+            'valves': list(self.valves),
+            'valve_by_id': dict(self.valve_by_id),
+            'hydrants': list(self.hydrants),
+            'hydrant_by_id': dict(self.hydrant_by_id),
+            'risers': list(self.risers),
+            'riser_by_id': dict(self.riser_by_id),
+            'floors': list(self.floors),
+            'floor_by_name': dict(self.floor_by_name),
+            'grouped_floors_map': dict(self.grouped_floors_map),
+            'duplicate_risers_by_floor': dict(self.duplicate_risers_by_floor),
+            'duplicate_pipe_ids_by_floor': dict(self.duplicate_pipe_ids_by_floor),
+            'supply_nodes': list(self.supply_nodes),
+            'demand_groups': dict(self.demand_groups),
+            'sprinkler_s_node_ids': list(self.sprinkler_s_node_ids),
+            'sprinkler_k_map': dict(self.sprinkler_k_map),
+            'sprinkler_k_overrides': set(self.sprinkler_k_overrides),
+            'manual_dn_pipes': set(self.manual_dn_pipes),
+            'is_loaded': self.is_loaded,
+            'cad_file_path': self.cad_file_path,
+            'connection_points': list(self.connection_points),
+            'connection_counters': dict(self.connection_counters),
+        }
+
+    def _restore_state(self, state: dict):
+        """恢复旧数据（区域模式读取失败时回滚）"""
+        self.pipes = state['pipes']
+        self.pipe_by_id = state['pipe_by_id']
+        self.nodes = state['nodes']
+        self.node_by_id = state['node_by_id']
+        self.valves = state['valves']
+        self.valve_by_id = state['valve_by_id']
+        self.hydrants = state['hydrants']
+        self.hydrant_by_id = state['hydrant_by_id']
+        self.risers = state['risers']
+        self.riser_by_id = state['riser_by_id']
+        self.floors = state['floors']
+        self.floor_by_name = state['floor_by_name']
+        self.grouped_floors_map = state['grouped_floors_map']
+        self.duplicate_risers_by_floor = state['duplicate_risers_by_floor']
+        self.duplicate_pipe_ids_by_floor = state['duplicate_pipe_ids_by_floor']
+        self.supply_nodes = state['supply_nodes']
+        self.demand_groups = state['demand_groups']
+        self.sprinkler_s_node_ids = state['sprinkler_s_node_ids']
+        self.sprinkler_k_map = state['sprinkler_k_map']
+        self.sprinkler_k_overrides = state['sprinkler_k_overrides']
+        self.manual_dn_pipes = state['manual_dn_pipes']
+        self.is_loaded = state['is_loaded']
+        self.cad_file_path = state['cad_file_path']
+        self.connection_points = state.get('connection_points', [])
+        self.connection_counters = state.get('connection_counters', {})
+
+    def _merge_state(self, old: dict):
+        """区域模式成功后，将旧数据合并回全局列表（旧在前，新在后）"""
+        self.pipes = old['pipes'] + self.pipes
+        self.pipe_by_id = {**old['pipe_by_id'], **self.pipe_by_id}
+        self.nodes = old['nodes'] + self.nodes
+        self.node_by_id = {**old['node_by_id'], **self.node_by_id}
+        self.valves = old['valves'] + self.valves
+        self.valve_by_id = {**old['valve_by_id'], **self.valve_by_id}
+        self.hydrants = old['hydrants'] + self.hydrants
+        self.hydrant_by_id = {**old['hydrant_by_id'], **self.hydrant_by_id}
+        self.risers = old['risers'] + self.risers
+        self.riser_by_id = {**old['riser_by_id'], **self.riser_by_id}
+        self.floors = old['floors'] + self.floors
+        # 从合并后的楼层列表重建 floor_by_name（复合键 building_id|name 防碰撞）
+        self.floor_by_name = {}
+        for f in self.floors:
+            self.floor_by_name[self._make_floor_key(f.name, f.building_id)] = f
+        # 合并 grouped_floors_map（复合键防碰撞）
+        new_map = {}
+        for k, v in old['grouped_floors_map'].items():
+            if '|' in k:
+                new_map[k] = v
+            else:
+                bid = next((f.building_id for f in old['floors'] if f.name in v), "")
+                new_map[self._make_floor_key(k, bid)] = v
+        for k, v in self.grouped_floors_map.items():
+            if '|' in k:
+                new_map[k] = v
+            else:
+                new_map[self._make_floor_key(k, self._building_id or "")] = v
+        self.grouped_floors_map = new_map
+        new_dup_risers = {}
+        for k, v in old['duplicate_risers_by_floor'].items():
+            if '|' in k:
+                new_dup_risers[k] = v
+            else:
+                bid = next((f.building_id for f in old['floors'] if f.name == k), "")
+                new_dup_risers[self._make_floor_key(k, bid)] = v
+        for k, v in self.duplicate_risers_by_floor.items():
+            if '|' in k:
+                new_dup_risers[k] = v
+            else:
+                new_dup_risers[self._make_floor_key(k, self._building_id or "")] = v
+        self.duplicate_risers_by_floor = new_dup_risers
+        new_dup_pipes = {}
+        for k, v in old['duplicate_pipe_ids_by_floor'].items():
+            if '|' in k:
+                new_dup_pipes[k] = v
+            else:
+                bid = next((f.building_id for f in old['floors'] if f.name == k), "")
+                new_dup_pipes[self._make_floor_key(k, bid)] = v
+        for k, v in self.duplicate_pipe_ids_by_floor.items():
+            if '|' in k:
+                new_dup_pipes[k] = v
+            else:
+                new_dup_pipes[self._make_floor_key(k, self._building_id or "")] = v
+        self.duplicate_pipe_ids_by_floor = new_dup_pipes
+        self.supply_nodes = old['supply_nodes'] + self.supply_nodes
+        self.demand_groups = {**old['demand_groups'], **self.demand_groups}
+        self.sprinkler_s_node_ids = old['sprinkler_s_node_ids'] + self.sprinkler_s_node_ids
+        self.sprinkler_k_map = {**old['sprinkler_k_map'], **self.sprinkler_k_map}
+        self.sprinkler_k_overrides = old['sprinkler_k_overrides'] | self.sprinkler_k_overrides
+        self.manual_dn_pipes = old['manual_dn_pipes'] | self.manual_dn_pipes
+        
+        self.connection_points = old.get('connection_points', []) + self.connection_points
+        old_counters = old.get('connection_counters', {})
+        for bid, cnt in old_counters.items():
+            self.connection_counters[bid] = max(self.connection_counters.get(bid, 0), cnt)
+
     def load_cad_file(self, file_path: str, force_reload=False, progress_callback=None) -> bool:
         """
         加载CAD文件
@@ -426,36 +990,102 @@ class CADDataManager:
                 f"请在AutoCAD中将当前文档切换到:\n{os.path.basename(file_path)}\n\n"
                 f"然后重新点击「读取文件」按钮。")
             return False
-               
+
+        building_id = self._building_id  # 调用方已设置
+        
         try:
             self.cad_file_path = file_path
             logger.info(f"开始加载CAD文件: {file_path}")
 
-            # 清空旧数据
+            # 区域模式：保存当前数据，用于失败回滚或成功后合并
+            old_state = None
+            if building_id:
+                old_state = self._save_state()
+
+            # 清空旧数据（区域模式下已有 old_state 备份）
             self.clear_data()
             # 重置随层管径询问缓存，确保每次读取都询问
             self.default_color256_diameter = None
             
             # 获取配置
             config = self.config_manager.get_live_config()
-            self.preprocess_enabled = config.get("preprocess_cad", False)
+            # 永远先进行预处理（设置页已无预处理勾选框，读取CAD一律先拆分/合并/分割）
+            self.preprocess_enabled = True
 
             # 调用 extract_all_data 并传入配置
             if self.progress_callback:
                 self.progress_callback("正在提取管网数据...")
             if not self.extract_all_data(config):
                 logger.error("提取管网数据失败")
+                if old_state:
+                    self._restore_state(old_state)
                 return False
+
+            # 把检测到的 system_type（如 "sprinkler"）同步回 live_config
+            if not self.config_manager.live_config:
+                self.config_manager.live_config = config
+
+            # 区域模式：合并旧数据（旧在前，新在后）
+            if old_state:
+                self._merge_state(old_state)
 
             logger.info(f"CAD文件加载成功: {file_path}")
             # 确保项目目录存在，用于保存楼层配置
             self._ensure_project_dir()
             self.is_loaded = True
+            
+            # 区域模式：存储 building_data
+            if building_id:
+                self.building_data[building_id] = {
+                    'building_id': building_id,
+                    'is_outdoor': building_id == 'ZT',
+                    # ZT 室外管网读入即带基准属性（基准判定统一检查 is_base，不再特判 ZT）
+                    'is_base': building_id == 'ZT',
+                }
+                if building_id not in self.building_order:
+                    self.building_order.append(building_id)
+                self.building_file_paths[building_id] = file_path
+
+            # 室外管网缺省楼层：ZT 完全无楼层时自动创建
+            if building_id == "ZT":
+                zt_floors = [f for f in self.floors if f.building_id == "ZT"]
+                if not zt_floors:
+                    drawing_unit = config.get("drawing_unit", "毫米")
+                    if drawing_unit == "毫米":
+                        to_mm = 1000.0
+                    elif drawing_unit == "厘米":
+                        to_mm = 10.0
+                    else:
+                        to_mm = 1.0
+                    zt_floor = FloorData(
+                        name="室外管网", elevation=0.0, pipe_z_offset=-1.0,
+                        pipe_z_offset_set=True,
+                        align_point=(0, 0, 0), rect_min=(0, 0), rect_max=(0, 0),
+                        layer="", building_id="ZT",
+                    )
+                    self.floors.append(zt_floor)
+                    self.floor_by_name[self._make_floor_key("室外管网", "ZT")] = zt_floor
+                    for node in self.nodes:
+                        if node.node_id.startswith("ZT_"):
+                            node.z = -1.0 * to_mm
+                            zt_floor.nodes.append(node)
+                    for pipe in self.pipes:
+                        if pipe.pipe_id.startswith("ZT_"):
+                            zt_floor.pipes.append(pipe)
+                    for valve in self.valves:
+                        if valve.valve_id.startswith("ZT_"):
+                            valve.z = -1.0 * to_mm
+                            valve.floor_name = "室外管网"
+
             return True
 
         except Exception as e:
+            if old_state is not None:
+                self._restore_state(old_state)
             logger.error(f"加载CAD文件失败: {e}", exc_info=True)
             return False
+        finally:
+            self._building_id = ""
 
     def _ensure_project_dir(self):
         """根据当前CAD文件路径创建或获取项目目录"""
@@ -498,9 +1128,9 @@ class CADDataManager:
         model_space = self.acad.doc.ModelSpace
 
         pipe_layers = config.get("pipe_layers", [])
-        valve_block_name = config.get("valve_block_name", "")
-        hydrant_block_name = config.get("hydrant_block_name", "")
-        sprinkler_block_name = config.get("sprinkler_block_name", "")
+        valve_block_names = [n.strip() for n in config.get("valve_block_name", "").split(",") if n.strip()]
+        hydrant_block_names = [n.strip() for n in config.get("hydrant_block_name", "").split(",") if n.strip()]
+        sprinkler_block_names = [n.strip() for n in config.get("sprinkler_block_name", "").split(",") if n.strip()]
         riser_layers = config.get("riser_layers", [])
         riser_note_layers = config.get("riser_note_layers", [])
         align_block_name = config.get("align_block_name", "")
@@ -536,11 +1166,10 @@ class CADDataManager:
                     handle = entity.Handle
                     if obj_name in ("AcDbPolyline", "AcDb2dPolyline"):
                         coords = entity.Coordinates
-                        elevation = getattr(entity, 'Elevation', 0.0)
                         if len(coords) % 2 == 0:
-                            points = [(coords[i], coords[i+1], elevation) for i in range(0, len(coords), 2)]
+                            points = [(coords[i], coords[i+1], 0.0) for i in range(0, len(coords), 2)]
                         else:
-                            points = [(coords[i], coords[i+1], coords[i+2]) for i in range(0, len(coords), 3)]
+                            points = [(coords[i], coords[i+1], 0.0) for i in range(0, len(coords), 3)]
                         for i in range(len(points) - 1):
                             result['pipe_segments'].append({
                                 'start': points[i],
@@ -550,8 +1179,8 @@ class CADDataManager:
                                 'handle': handle
                             })
                     else:
-                        start = (entity.StartPoint[0], entity.StartPoint[1], entity.StartPoint[2])
-                        end = (entity.EndPoint[0], entity.EndPoint[1], entity.EndPoint[2])
+                        start = (entity.StartPoint[0], entity.StartPoint[1], 0.0)
+                        end = (entity.EndPoint[0], entity.EndPoint[1], 0.0)
                         result['pipe_segments'].append({
                             'start': start,
                             'end': end,
@@ -566,18 +1195,18 @@ class CADDataManager:
                     name = entity.Name
                     ins = entity.InsertionPoint
                     handle = entity.Handle
-                    xyz = (ins[0], ins[1], ins[2])
+                    xyz = (ins[0], ins[1], 0.0)
 
-                    if name == valve_block_name:
+                    if name in valve_block_names:
                         result['valve_points'].append(xyz)
-                        result['valve_raw'].append((ins[0], ins[1], ins[2], handle))
-                    elif name == hydrant_block_name:
-                        result['hydrant_raw'].append((ins[0], ins[1], ins[2], handle))
-                    elif name == sprinkler_block_name:
-                        result['sprinkler_raw'].append((ins[0], ins[1], ins[2], handle))
+                        result['valve_raw'].append((ins[0], ins[1], 0.0, handle))
+                    elif name in hydrant_block_names:
+                        result['hydrant_raw'].append((ins[0], ins[1], 0.0, handle))
+                    elif name in sprinkler_block_names:
+                        result['sprinkler_raw'].append((ins[0], ins[1], 0.0, handle))
                     elif name == align_block_name:
                         result['floor_align_blocks'].append({
-                            'point': (ins[0], ins[1], ins[2]),
+                            'point': (ins[0], ins[1], 0.0),
                             'layer': layer,
                             'handle': handle
                         })
@@ -587,7 +1216,7 @@ class CADDataManager:
                 if obj_name in ("AcDbCircle", "AcDbArc") and is_riser_layer:
                     center = entity.Center
                     result['riser_circles'].append({
-                        'center': (center[0], center[1], center[2]),
+                        'center': (center[0], center[1], 0.0),
                         'radius': entity.Radius,
                         'layer': layer,
                         'handle': entity.Handle
@@ -596,8 +1225,8 @@ class CADDataManager:
 
                 # 4. Riser note lines
                 if obj_name == "AcDbLine" and is_riser_note_layer:
-                    start = (entity.StartPoint[0], entity.StartPoint[1], entity.StartPoint[2])
-                    end = (entity.EndPoint[0], entity.EndPoint[1], entity.EndPoint[2])
+                    start = (entity.StartPoint[0], entity.StartPoint[1], 0.0)
+                    end = (entity.EndPoint[0], entity.EndPoint[1], 0.0)
                     result['riser_lines'].append((start, end, entity.Handle))
                     continue
 
@@ -606,11 +1235,11 @@ class CADDataManager:
                     ins = entity.InsertionPoint
                     result['riser_texts'].append({
                         'text': entity.TextString,
-                        'pos': (ins[0], ins[1], ins[2])
+                        'pos': (ins[0], ins[1], 0.0)
                     })
                     continue
 
-                # 6. Floor rect polylines (4-vertex axis-aligned)
+                # 6. Floor rect polylines (4-vertex convex quad，支持旋转矩形与浮点坐标噪声)
                 if obj_name in ("AcDbPolyline", "AcDb2dPolyline"):
                     coords = entity.Coordinates
                     if len(coords) == 8:
@@ -619,15 +1248,12 @@ class CADDataManager:
                         points = [(coords[i], coords[i+1]) for i in range(0, 12, 3)]
                     else:
                         continue
-                    if len(points) == 4:
-                        xs = sorted(set(p[0] for p in points))
-                        ys = sorted(set(p[1] for p in points))
-                        if len(xs) == 2 and len(ys) == 2:
-                            result['floor_rect_polylines'].append({
-                                'coords': coords,
-                                'layer': layer,
-                                'handle': entity.Handle
-                            })
+                    if len(points) == 4 and _points_form_convex_quad(points):
+                        result['floor_rect_polylines'].append({
+                            'coords': coords,
+                            'layer': layer,
+                            'handle': entity.Handle
+                        })
 
             except Exception:
                 continue
@@ -655,9 +1281,9 @@ class CADDataManager:
         doc = self.acad.doc
 
         pipe_layers = config.get("pipe_layers", [])
-        valve_block_name = config.get("valve_block_name", "")
-        hydrant_block_name = config.get("hydrant_block_name", "")
-        sprinkler_block_name = config.get("sprinkler_block_name", "")
+        valve_block_names = [n.strip() for n in config.get("valve_block_name", "").split(",") if n.strip()]
+        hydrant_block_names = [n.strip() for n in config.get("hydrant_block_name", "").split(",") if n.strip()]
+        sprinkler_block_names = [n.strip() for n in config.get("sprinkler_block_name", "").split(",") if n.strip()]
         riser_layers = config.get("riser_layers", [])
         riser_note_layers = config.get("riser_note_layers", [])
         align_block_name = config.get("align_block_name", "")
@@ -717,8 +1343,8 @@ class CADDataManager:
                             start = entity.dxf.start
                             end = entity.dxf.end
                             result['pipe_segments'].append({
-                                'start': (start[0], start[1], start[2]),
-                                'end': (end[0], end[1], end[2]),
+                                'start': (start[0], start[1], 0.0),
+                                'end': (end[0], end[1], 0.0),
                                 'color': color,
                                 'layer': layer,
                                 'handle': handle,
@@ -726,10 +1352,9 @@ class CADDataManager:
                         else:
                             if dxftype == "LWPOLYLINE":
                                 pts = entity.get_points()
-                                elev = entity.dxf.elevation if entity.dxf.hasattr('elevation') else 0.0
-                                points = [(p[0], p[1], elev) for p in pts]
+                                points = [(p[0], p[1], 0.0) for p in pts]
                             else:
-                                points = [(v.dxf.location[0], v.dxf.location[1], v.dxf.location[2])
+                                points = [(v.dxf.location[0], v.dxf.location[1], 0.0)
                                           for v in entity.vertices]
                             for i in range(len(points) - 1):
                                 result['pipe_segments'].append({
@@ -744,17 +1369,17 @@ class CADDataManager:
                     if dxftype == "INSERT":
                         name = entity.dxf.name
                         ins = entity.dxf.insert
-                        xyz = (ins[0], ins[1], ins[2])
-                        if name == valve_block_name:
+                        xyz = (ins[0], ins[1], 0.0)
+                        if name in valve_block_names:
                             result['valve_points'].append(xyz)
-                            result['valve_raw'].append((ins[0], ins[1], ins[2], handle))
-                        elif name == hydrant_block_name:
-                            result['hydrant_raw'].append((ins[0], ins[1], ins[2], handle))
-                        elif name == sprinkler_block_name:
-                            result['sprinkler_raw'].append((ins[0], ins[1], ins[2], handle))
+                            result['valve_raw'].append((ins[0], ins[1], 0.0, handle))
+                        elif name in hydrant_block_names:
+                            result['hydrant_raw'].append((ins[0], ins[1], 0.0, handle))
+                        elif name in sprinkler_block_names:
+                            result['sprinkler_raw'].append((ins[0], ins[1], 0.0, handle))
                         elif name == align_block_name:
                             result['floor_align_blocks'].append({
-                                'point': (ins[0], ins[1], ins[2]),
+                                'point': (ins[0], ins[1], 0.0),
                                 'layer': layer,
                                 'handle': handle,
                             })
@@ -763,7 +1388,7 @@ class CADDataManager:
                     if dxftype in ("CIRCLE", "ARC") and is_riser_layer:
                         center = entity.dxf.center
                         result['riser_circles'].append({
-                            'center': (center[0], center[1], center[2]),
+                            'center': (center[0], center[1], 0.0),
                             'radius': entity.dxf.radius,
                             'layer': layer,
                             'handle': handle,
@@ -774,8 +1399,8 @@ class CADDataManager:
                         start = entity.dxf.start
                         end = entity.dxf.end
                         result['riser_lines'].append(
-                            ((start[0], start[1], start[2]),
-                             (end[0], end[1], end[2]),
+                            ((start[0], start[1], 0.0),
+                             (end[0], end[1], 0.0),
                              handle)
                         )
                         continue
@@ -784,7 +1409,7 @@ class CADDataManager:
                         ins = entity.dxf.insert
                         result['riser_texts'].append({
                             'text': entity.dxf.text,
-                            'pos': (ins[0], ins[1], ins[2]),
+                            'pos': (ins[0], ins[1], 0.0),
                         })
                         continue
 
@@ -807,9 +1432,7 @@ class CADDataManager:
                             for v in verts:
                                 flat_coords.extend([v.dxf.location[0], v.dxf.location[1]])
                             coords = tuple(flat_coords)
-                        xs = sorted(set(p[0] for p in points_2d))
-                        ys = sorted(set(p[1] for p in points_2d))
-                        if len(xs) == 2 and len(ys) == 2:
+                        if _points_form_convex_quad(points_2d):
                             result['floor_rect_polylines'].append({
                                 'coords': coords,
                                 'layer': layer,
@@ -862,6 +1485,20 @@ class CADDataManager:
             else:
                 logger.warning("CAD未连接，无法使用单次遍历优化")
                 collected = None
+
+            # 自动检测系统类型（读取时按图纸内容决定）：
+            # 图纸中有喷头块 → 喷淋管网；没有喷头块 → 消火栓管网。
+            # 已不区分室内/室外消火栓：无论有无消火栓图块，只要没有喷头就判为消火栓管网，
+            # 配置文件中的 system_type 不再起作用（检测结果总是覆盖配置）。
+            # 区域模式同样适用：读取每个单体/室外管网时按其图纸判定；
+            # 任一单体含喷头 → 整体保持喷淋（_auto_sprinkler_seen），不因后续无喷头单体而降级。
+            if collected:
+                if collected.get('sprinkler_raw'):
+                    logger.info(f"检测到 {len(collected['sprinkler_raw'])} 个喷头块，自动设为喷淋模式")
+                    config['system_type'] = 'sprinkler'
+                    self._auto_sprinkler_seen = True
+                elif not self.building_order or not self._auto_sprinkler_seen:
+                    config['system_type'] = 'indoor_hydrant'
 
             if self.progress_callback:
                 self.progress_callback("正在提取管道...")
@@ -961,7 +1598,7 @@ class CADDataManager:
                 self.progress_callback("正在更新管道类型...")
             logger.info("正在更新管道类型...")
             self.update_pipe_types(config)
-            
+
             if config.get("system_type", "indoor_hydrant") == "sprinkler":
                 if self.progress_callback:
                     self.progress_callback("正在处理喷淋短管...")
@@ -1000,7 +1637,7 @@ class CADDataManager:
                 return True
 
             material = config.get("pipe_material", "镀锌钢管")
-            short_len_m = 0.1
+            short_len_m = config.get("sprinkler_up_pipe_len", 0.6)  # 读取CAD默认上喷，短管长度从设置页读取
             K = config.get("sprinkler_K", 80)
             short_dn = self.material_manager.get_sprinkler_dn(K)
             diameter_info = self.material_manager.get_diameter_info(material, short_dn)
@@ -1013,7 +1650,7 @@ class CADDataManager:
             drawing_unit = config.get("drawing_unit", "毫米")
             unit_factor = self.unit_factors.get(drawing_unit, 0.001)
             height_increment = short_len_m / unit_factor if unit_factor > 0 else short_len_m * 1000
-            tolerance = config.get("tolerance", 10.0) * 0.001
+            tolerance = self._mm_to_drawing_units(config.get("tolerance", 10.0))
 
             new_pipes = []
             new_nodes = []
@@ -1044,7 +1681,7 @@ class CADDataManager:
                 self.node_by_id[new_node.node_id] = new_node
                 new_nodes.append(new_node)
 
-                pipe_id = f"SP_{node_id}"
+                pipe_id = self._prefix_id(f"SP_{self._unprefix_id(node_id)}")
                 new_pipe = PipeData(
                     pipe_id=pipe_id,
                     start_node_id=node_id,
@@ -1107,7 +1744,8 @@ class CADDataManager:
         """
         合并共线且部分或完全重叠的管道（排除仅端点相接的情况）
         """
-        tolerance = self.config_manager.get_live_config().get("tolerance", 10.0) * 0.001  # 米
+        tolerance_mm = self.config_manager.get_live_config().get("tolerance", 10.0)
+        tolerance = self._mm_to_drawing_units(tolerance_mm)
         unique_pipes = []
         duplicate_count = 0
 
@@ -1227,7 +1865,8 @@ class CADDataManager:
             if collected is not None or getattr(self, 'preprocess_enabled', False):
                 if self.progress_callback:
                     self.progress_callback("预处理：拆分多段线...")
-                tolerance = self.config_manager.get_live_config().get("tolerance", 10.0)
+                tolerance_mm = self.config_manager.get_live_config().get("tolerance", 10.0)
+                tolerance = self._mm_to_drawing_units(tolerance_mm)
 
                 if collected is not None:
                     segments = collected['pipe_segments']
@@ -1242,8 +1881,8 @@ class CADDataManager:
                     if not simple_lines:
                         logger.warning("预处理未生成任何线段")
                         return False
-                    valve_block_name = config.get("valve_block_name", "valve")
-                    simple_lines = merge_pipes_at_valves(simple_lines, self.acad, valve_block_name, tolerance)
+                    valve_block_names = [n.strip() for n in config.get("valve_block_name", "valve").split(",") if n.strip()]
+                    simple_lines = merge_pipes_at_valves(simple_lines, self.acad, valve_block_names, tolerance)
 
                 if self.progress_callback:
                     self.progress_callback("预处理：创建管道对象...")
@@ -1259,9 +1898,12 @@ class CADDataManager:
                         for pipe_data in pipes_data:
                             pipe_count += 1
                             id_digits = 4 if pipe_count < 10000 else 5
-                            pipe_data.pipe_id = f"P_{pipe_count:0{id_digits}d}"
+                            pipe_data.pipe_id = self._prefix_id(f"P_{pipe_count:0{id_digits}d}")
                             self.pipes.append(pipe_data)
                             self.pipe_by_id[pipe_data.pipe_id] = pipe_data
+                            if line.valve_pos is not None:
+                                vp = line.valve_pos
+                                self._valve_pipe_pairs.append((vp[0], vp[1], vp[2], pipe_data.pipe_id))
                 logger.info(f"{'预收集' if collected else '预处理'}模式：从 {len(simple_lines)} 个直线段创建了 {len(self.pipes)} 条管道")
                 return len(self.pipes) > 0
 
@@ -1296,7 +1938,7 @@ class CADDataManager:
                             if pipe_count >= 10000:
                                 id_digits = 5
 
-                            pipe_data.pipe_id = f"P_{pipe_count:0{id_digits}d}"
+                            pipe_data.pipe_id = self._prefix_id(f"P_{pipe_count:0{id_digits}d}")
                             self.pipes.append(pipe_data)
                             self.pipe_by_id[pipe_data.pipe_id] = pipe_data
 
@@ -1353,16 +1995,10 @@ class CADDataManager:
                 vertex_count = len(coords)
 
                 # 确定每个顶点的坐标维度（2D或3D）
-                if vertex_count % 3 == 0:
-                    # 3D坐标，每3个值一个点
-                    points = []
-                    for i in range(0, vertex_count, 3):
-                        points.append((coords[i], coords[i+1], coords[i+2]))
-                else:
-                    # 2D坐标，每2个值一个点，Z坐标为0
-                    points = []
-                    for i in range(0, vertex_count, 2):
-                        points.append((coords[i], coords[i+1], 0.0))
+                # 统一忽略Z坐标，后续由assign_node_z_coordinates赋值
+                points = []
+                for i in range(0, vertex_count, 2 if vertex_count % 2 == 0 else 3):
+                    points.append((coords[i], coords[i+1], 0.0))
 
                 # 将多段线拆分为多个直线段
                 if len(points) >= 2:
@@ -1394,10 +2030,8 @@ class CADDataManager:
 
             elif entity.ObjectName == "AcDbLine":
                 # 直线，直接创建
-                start_point = (
-                    entity.StartPoint[0], entity.StartPoint[1], entity.StartPoint[2])
-                end_point = (
-                    entity.EndPoint[0], entity.EndPoint[1], entity.EndPoint[2])
+                start_point = (entity.StartPoint[0], entity.StartPoint[1], 0.0)
+                end_point = (entity.EndPoint[0], entity.EndPoint[1], 0.0)
                 dx = end_point[0] - start_point[0]
                 dy = end_point[1] - start_point[1]
                 raw_length = math.hypot(dx, dy)
@@ -1444,6 +2078,12 @@ class CADDataManager:
             logger.error(f"初始化节点数据失败: {e}")
             return False
 
+    def _mm_to_drawing_units(self, mm_value: float) -> float:
+        config = self.config_manager.get_live_config()
+        drawing_unit = config.get("drawing_unit", "毫米")
+        unit_factor = self.unit_factors.get(drawing_unit, 0.001)
+        return mm_value * 0.001 / unit_factor if unit_factor > 0 else mm_value * 0.001
+
     def match_nodes_with_pipes(self, tolerance_mm: float = 10.0) -> bool:
         """
         建立节点与管道的连接关系，合并容差范围内的相同坐标节点
@@ -1451,7 +2091,7 @@ class CADDataManager:
             tolerance_mm: 容差（毫米），用于合并节点
         """
         try:
-            tolerance = tolerance_mm * 0.001  # 转换为米
+            tolerance = self._mm_to_drawing_units(tolerance_mm)
             nodes = []          # 存储已创建的节点对象
             node_counter = 1
 
@@ -1476,7 +2116,7 @@ class CADDataManager:
                 existing = find_existing_node(start_point)
                 if existing is None:
                     node = NodeData(
-                        node_id=f"N_{node_counter:04d}",
+                        node_id=self._prefix_id(f"N_{node_counter:04d}"),
                         x=start_point[0],
                         y=start_point[1],
                         z=start_point[2],
@@ -1495,7 +2135,7 @@ class CADDataManager:
                 existing = find_existing_node(end_point)
                 if existing is None:
                     node = NodeData(
-                        node_id=f"N_{node_counter:04d}",
+                        node_id=self._prefix_id(f"N_{node_counter:04d}"),
                         x=end_point[0],
                         y=end_point[1],
                         z=end_point[2],
@@ -1676,6 +2316,63 @@ class CADDataManager:
         # 同时更新管材管理器中的粗糙系数（如果需要）
         self.roughness = self.material_manager.get_roughness(new_material)
 
+    # ---------- 标高管材分段（按标高分段赋予不同管材） ----------
+    def _set_pipe_material_with_props(self, pipe, new_material: str) -> None:
+        """设置单根管道管材，并按新管材颜色表同步内径与粗糙度。
+
+        注意：现有 update_all_pipes_material 遗漏了 pipe.roughness 的更新，
+        此处补全（三种钢管 roughness 目前均为 120，但用户可能在管材管理中修改过）。
+        """
+        pipe.material = new_material
+        info = self.material_manager.get_color_diameter_table(new_material).get(str(pipe.color_code))
+        if info and info.get("inner"):
+            pipe.inner_diameter = info.get("inner", 0.0)
+        else:
+            logger.debug(f"管道 {pipe.pipe_id} 颜色 {pipe.color_code} 在新管材中无对应，内径保留原值")
+        pipe.roughness = self.material_manager.get_roughness(new_material)
+
+    def apply_elevation_materials(self, segments: list, outdoor_material: str = "") -> int:
+        """按标高管材分段重新赋予管道管材（标高管材分段功能）。
+
+        Args:
+            segments: [{material, lower, upper}]（管材空=跳过；标高 None=±∞）
+            outdoor_material: 室外管网管材（空=室外管道保持原管材）
+
+        Returns:
+            实际更换管材的管道数量
+        """
+        from core.elevation_material_assigner import assign_elevation_materials
+        mapping = assign_elevation_materials(self, segments, outdoor_material)
+        count = 0
+        for pid, mat in mapping.items():
+            pipe = self.pipe_by_id.get(pid)
+            if pipe and pipe.material != mat:
+                self._set_pipe_material_with_props(pipe, mat)
+                count += 1
+        if count:
+            self.roughness = self.material_manager.get_roughness(
+                self.config_manager.get_live_config().get("pipe_material", "镀锌钢管"))
+        logger.info(f"标高管材应用完成: {count} 条管道已更换管材")
+        return count
+
+    def restore_uniform_material(self) -> int:
+        """恢复所有管道为当前统一管材（config.pipe_material），并同步内径与粗糙度。
+
+        用于标高管材分段功能取消勾选时，将管道恢复为读 CAD 时的统一管材。
+        """
+        config = self.config_manager.get_live_config()
+        uniform = config.get("pipe_material", "镀锌钢管")
+        count = 0
+        for pipe in self.pipes:
+            if not pipe.is_active:
+                continue
+            if pipe.material != uniform:
+                self._set_pipe_material_with_props(pipe, uniform)
+                count += 1
+        self.roughness = self.material_manager.get_roughness(uniform)
+        logger.info(f"标高管材恢复完成: {count} 条管道已恢复为 {uniform}")
+        return count
+
     def extract_valves(self, config: dict, collected: dict = None) -> bool:
         """
         提取阀门数据（不再读取属性，所有阀门初始状态为OPEN）
@@ -1689,7 +2386,7 @@ class CADDataManager:
                 for (x, y, z, handle) in collected['valve_raw']:
                     valve_count += 1
                     valve = ValveData(
-                        valve_id=f"V_{valve_count:04d}",
+                        valve_id=self._prefix_id(f"V_{valve_count:04d}"),
                         status="OPEN",
                         x=x, y=y, z=z,
                         attribute_value="",
@@ -1700,8 +2397,8 @@ class CADDataManager:
                 logger.info(f"阀门提取完成(预收集): 共 {len(self.valves)} 个阀门")
                 return True
 
-            valve_block_name = config.get("valve_block_name", "valve")
-            tolerance = config.get("tolerance", 10.0) * 0.001  # 转换为米
+            valve_block_names = [n.strip() for n in config.get("valve_block_name", "valve").split(",") if n.strip()]
+            tolerance = self._mm_to_drawing_units(config.get("tolerance", 10.0))
 
             if not CAD_AVAILABLE or not self.acad:
                 logger.warning("CAD未连接，无法提取阀门")
@@ -1710,7 +2407,7 @@ class CADDataManager:
             model_space = self.acad.doc.ModelSpace
             valve_count = 0
 
-            logger.info(f"开始提取阀门图块: {valve_block_name}")
+            logger.info(f"开始提取阀门图块: {', '.join(valve_block_names)}")
 
             for entity in model_space:
                 try:
@@ -1720,7 +2417,7 @@ class CADDataManager:
                 try:
                     if entity.ObjectName != "AcDbBlockReference":
                         continue
-                    if entity.Name != valve_block_name:
+                    if entity.Name not in valve_block_names:
                         continue
 
                     valve_point = (
@@ -1731,7 +2428,7 @@ class CADDataManager:
 
                     valve_count += 1
                     valve = ValveData(
-                        valve_id=f"V_{valve_count:04d}",
+                        valve_id=self._prefix_id(f"V_{valve_count:04d}"),
                         status="OPEN",
                         x=valve_point[0],
                         y=valve_point[1],
@@ -1771,7 +2468,7 @@ class CADDataManager:
                 for (x, y, z, handle) in collected['hydrant_raw']:
                     hydrant_count += 1
                     hydrant = HydrantData(
-                        hydrant_id=f"H_{hydrant_count:04d}",
+                        hydrant_id=self._prefix_id(f"H_{hydrant_count:04d}"),
                         x=x, y=y, z=z,
                         block_name=hydrant_block_name,
                         entity_handle=handle
@@ -1781,8 +2478,9 @@ class CADDataManager:
                 logger.info(f"消火栓提取完成(预收集): 共 {len(self.hydrants)} 个")
                 return True
 
-            hydrant_block_name = config.get("hydrant_block_name", "hydrant")
-            tolerance = config.get("tolerance", 10.0) * 0.001
+            hydrant_block_names = [n.strip() for n in config.get("hydrant_block_name", "hydrant").split(",") if n.strip()]
+            hydrant_block_name = hydrant_block_names[0] if hydrant_block_names else "hydrant"
+            tolerance = self._mm_to_drawing_units(config.get("tolerance", 10.0))
 
             if not CAD_AVAILABLE or not self.acad:
                 logger.warning("CAD未连接，无法提取消火栓")
@@ -1791,7 +2489,7 @@ class CADDataManager:
             model_space = self.acad.doc.ModelSpace
             hydrant_count = 0
 
-            logger.info(f"开始提取消火栓图块: {hydrant_block_name}")
+            logger.info(f"开始提取消火栓图块: {', '.join(hydrant_block_names)}")
 
             for entity in model_space:
                 try:
@@ -1801,7 +2499,7 @@ class CADDataManager:
                 try:
                     if entity.ObjectName != "AcDbBlockReference":
                         continue
-                    if entity.Name != hydrant_block_name:
+                    if entity.Name not in hydrant_block_names:
                         continue
 
                     point = (entity.InsertionPoint[0],
@@ -1810,7 +2508,7 @@ class CADDataManager:
 
                     hydrant_count += 1
                     hydrant = HydrantData(
-                        hydrant_id=f"H_{hydrant_count:04d}",
+                        hydrant_id=self._prefix_id(f"H_{hydrant_count:04d}"),
                         x=point[0],
                         y=point[1],
                         z=point[2],
@@ -1842,7 +2540,7 @@ class CADDataManager:
             align_block_name = config.get("align_block_name", "Floorbase")
             align_attr_name = config.get("align_attribute_name", "Elevation")
             tolerance_mm = config.get("tolerance", 10.0)
-            tolerance = tolerance_mm * 0.001   # 米
+            tolerance = self._mm_to_drawing_units(tolerance_mm)
 
             # 从预收集数据加载
             if collected is not None:
@@ -1866,7 +2564,7 @@ class CADDataManager:
                         if entity.Name != align_block_name:
                             continue
                         ins = entity.InsertionPoint
-                        point = (ins[0], ins[1], ins[2])
+                        point = (ins[0], ins[1], 0.0)
                         layer = entity.Layer
                         handle = entity.Handle
                         align_blocks.append({'point': point, 'layer': layer, 'handle': handle})
@@ -1891,9 +2589,7 @@ class CADDataManager:
                             continue
                         if len(points) != 4:
                             continue
-                        xs = sorted(set(p[0] for p in points))
-                        ys = sorted(set(p[1] for p in points))
-                        if len(xs) == 2 and len(ys) == 2:
+                        if _points_form_convex_quad(points):
                             rect_polylines.append({
                                 'coords': coords, 'layer': entity.Layer, 'handle': entity.Handle
                             })
@@ -1916,7 +2612,7 @@ class CADDataManager:
                 logger.warning("未找到任何对齐点图块")
                 return False
 
-            # 2. 按图层分组，找出每个图层中的矩形框
+            # 2. 按图层分组，找出每个图层中的矩形框（保留4角点，支持旋转/噪声矩形）
             rects_by_layer = {}
             for poly in rect_polylines:
                 coords = poly['coords']
@@ -1929,28 +2625,28 @@ class CADDataManager:
                     continue
                 if len(points) != 4:
                     continue
-                xs = sorted(set(p[0] for p in points))
-                ys = sorted(set(p[1] for p in points))
-                if len(xs) == 2 and len(ys) == 2:
-                    rect_min = (xs[0], ys[0])
-                    rect_max = (xs[1], ys[1])
-                    if layer not in rects_by_layer:
-                        rects_by_layer[layer] = []
-                    rects_by_layer[layer].append((rect_min, rect_max, poly['handle']))
+                xs = [p[0] for p in points]
+                ys = [p[1] for p in points]
+                rect_min = (min(xs), min(ys))
+                rect_max = (max(xs), max(ys))
+                if layer not in rects_by_layer:
+                    rects_by_layer[layer] = []
+                rects_by_layer[layer].append((points, rect_min, rect_max, poly['handle']))
 
             # 3. 匹配对齐点与矩形框（相同图层，且插入点在矩形框角点容差内）
             floors = []
             for (point, layer, attr_value, handle) in align_points:
                 rects = rects_by_layer.get(layer, [])
                 matched_rect = None
-                for rect_min, rect_max, rect_handle in rects:
+                matched_corners = None
+                for corners4, rect_min, rect_max, rect_handle in rects:
                     # 检查插入点是否与矩形某个角点重合（容差内）
-                    corners = [rect_min, (rect_min[0], rect_max[1]), rect_max, (rect_max[0], rect_min[1])]
-                    for corner in corners:
+                    for corner in corners4:
                         dx = point[0] - corner[0]
                         dy = point[1] - corner[1]
                         if math.hypot(dx, dy) < tolerance:
                             matched_rect = (rect_min, rect_max)
+                            matched_corners = corners4
                             break
                     if matched_rect:
                         break
@@ -2003,7 +2699,9 @@ class CADDataManager:
                         align_point=point,
                         rect_min=matched_rect[0],
                         rect_max=matched_rect[1],
-                        layer=layer
+                        layer=layer,
+                        building_id=self._building_id or "",
+                        rect_corners=matched_corners
                     )
                     floor._multi_floor_info = {
                         "type": "group",
@@ -2028,7 +2726,9 @@ class CADDataManager:
                         align_point=point,
                         rect_min=matched_rect[0],
                         rect_max=matched_rect[1],
-                        layer=layer
+                        layer=layer,
+                        building_id=self._building_id or "",
+                        rect_corners=matched_corners
                     )
                     floors.append(floor)
 
@@ -2057,7 +2757,7 @@ class CADDataManager:
                     break   # 只询问一次
 
             self.floors = sorted_floors
-            self.floor_by_name = {f.name: f for f in self.floors}
+            self.floor_by_name = {self._make_floor_key(f.name, f.building_id): f for f in self.floors}
             logger.info(f"成功提取 {len(self.floors)} 个楼层")
             return True
 
@@ -2076,9 +2776,11 @@ class CADDataManager:
             floor.nodes.clear()
             floor.hydrants.clear()
 
-        # 辅助函数：判断点是否在矩形内
-        def point_in_rect(x, y, rect_min, rect_max):
-            return rect_min[0] <= x <= rect_max[0] and rect_min[1] <= y <= rect_max[1]
+        # 辅助函数：判断点是否在楼层矩形框内（有4角点用凸四边形判定，否则轴对齐包围盒）
+        def point_in_rect(x, y, floor):
+            if floor.rect_corners:
+                return _point_in_quad(x, y, floor.rect_corners)
+            return floor.rect_min[0] <= x <= floor.rect_max[0] and floor.rect_min[1] <= y <= floor.rect_max[1]
 
         # 为每个管道分配楼层：管道两个端点都在同一楼层矩形内才归属该楼层
         # 如果只有一个端点在矩形内，仍然归属（用户承担风险）
@@ -2087,8 +2789,8 @@ class CADDataManager:
             end = pipe.end_point
             assigned_floor = None
             for floor in self.floors:
-                start_in = point_in_rect(start[0], start[1], floor.rect_min, floor.rect_max)
-                end_in = point_in_rect(end[0], end[1], floor.rect_min, floor.rect_max)
+                start_in = point_in_rect(start[0], start[1], floor)
+                end_in = point_in_rect(end[0], end[1], floor)
                 if start_in or end_in:
                     assigned_floor = floor
                     break
@@ -2109,12 +2811,11 @@ class CADDataManager:
                     floor.nodes.append(node)
             logger.info(f"楼层 {floor.name}: {len(floor.pipes)} 条管道, {len(floor.nodes)} 个节点")
 
-        # 分配立管到楼层（基于圆心坐标是否在楼层矩形内）
+        # 分配立管到楼层（基于圆心坐标是否在楼层矩形框内）
         for riser in self.risers:
             riser.floor_name = ""
             for floor in self.floors:
-                if (floor.rect_min[0] <= riser.x <= floor.rect_max[0] and
-                    floor.rect_min[1] <= riser.y <= floor.rect_max[1]):
+                if point_in_rect(riser.x, riser.y, floor):
                     riser.floor_name = floor.name
                     break
 
@@ -2132,13 +2833,30 @@ class CADDataManager:
         for hydrant in self.hydrants:
             hydrant.floor_name = ""
             for floor in self.floors:
-                if (floor.rect_min[0] <= hydrant.x <= floor.rect_max[0] and
-                    floor.rect_min[1] <= hydrant.y <= floor.rect_max[1]):
+                if point_in_rect(hydrant.x, hydrant.y, floor):
                     hydrant.floor_name = floor.name
                     floor.hydrants.append(hydrant)
                     break
             if not hydrant.floor_name:
                 logger.warning(f"消火栓 {hydrant.hydrant_id} 坐标 ({hydrant.x:.1f},{hydrant.y:.1f}) 不在任何楼层矩形内")
+
+    def _is_vertical_pipe_endpoint(self, node_id: str) -> bool:
+        """判断节点是否为非水平管道（两端Z差>1mm）的端点。
+
+        用于 assign_node_z_coordinates 的通用保护：此类节点的 Z 代表真实层差
+        （立管/竖向连接管），不得被楼层管网标高覆盖，否则竖段长度归零。
+        在立管生成前调用（读CAD加载流程）时返回 False，不影响原有赋值行为。
+        """
+        try:
+            for pipe in self.pipes:
+                if not pipe.is_active:
+                    continue
+                if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
+                    if abs(pipe.end_point[2] - pipe.start_point[2]) > 1.0:
+                        return True
+        except Exception:
+            pass
+        return False
 
     def align_floors_to_baseline(self):
         """将所有楼层对齐到基准楼层（一层或最低标高楼层）的xy坐标"""
@@ -2177,19 +2895,20 @@ class CADDataManager:
                     pipe.start_point = (start_node.x, start_node.y, pipe.start_point[2])
                 if end_node:
                     pipe.end_point = (end_node.x, end_node.y, pipe.end_point[2])
-            # 平移该楼层内的立管
+            # 平移该楼层内的立管（仅当前楼栋的立管）
+            floor_bid = floor.building_id or ""
             for riser in self.risers:
-                if riser.floor_name == floor.name:
+                if riser.floor_name == floor.name and (not floor_bid or riser.riser_id.startswith(f"{floor_bid}_")):
                     riser.x += dx
                     riser.y += dy
-            # 平移该楼层内的阀门
+            # 平移该楼层内的阀门（仅当前楼栋的阀门）
             for valve in self.valves:
-                if valve.floor_name == floor.name:
+                if valve.floor_name == floor.name and (not floor_bid or valve.valve_id.startswith(f"{floor_bid}_")):
                     valve.x += dx
                     valve.y += dy
-            # 平移该楼层内的消火栓
+            # 平移该楼层内的消火栓（仅当前楼栋的消火栓）
             for hydrant in self.hydrants:
-                if hydrant.floor_name == floor.name:
+                if hydrant.floor_name == floor.name and (not floor_bid or hydrant.hydrant_id.startswith(f"{floor_bid}_")):
                     hydrant.x += dx
                     hydrant.y += dy
 
@@ -2197,6 +2916,8 @@ class CADDataManager:
             floor.align_point = (floor.align_point[0] + dx, floor.align_point[1] + dy, floor.align_point[2])
             floor.rect_min = (floor.rect_min[0] + dx, floor.rect_min[1] + dy)
             floor.rect_max = (floor.rect_max[0] + dx, floor.rect_max[1] + dy)
+            if floor.rect_corners:
+                floor.rect_corners = [[c[0] + dx, c[1] + dy] for c in floor.rect_corners]
 
         # 注意：所有节点坐标已修改，需要重新建立 node_by_id 索引（如果必要）
         self.node_by_id = {node.node_id: node for node in self.nodes}
@@ -2222,22 +2943,34 @@ class CADDataManager:
         else:  # 米
             to_mm = 1.0
 
-        # 按标高从低到高排序
-        sorted_floors = sorted(self.floors, key=lambda x: x.elevation)
-        # 构建上层标高映射
-        for idx, floor in enumerate(sorted_floors):
-            if idx == len(sorted_floors) - 1:
-                # 最高层：没有上层
-                pipe_z_m = floor.elevation + top_offset
-            else:
-                upper_floor = sorted_floors[idx + 1]
-                pipe_z_m = upper_floor.elevation - default_offset
-            floor.pipe_z_offset = pipe_z_m   # 存储本层管网标高（米）
-            # 为楼层内所有节点设置Z坐标
-            z_mm = pipe_z_m * to_mm
-            for node in floor.nodes:
-                node.z = z_mm
-            logger.info(f"楼层 {floor.name}: 楼面标高 {floor.elevation}m -> 管网标高 {pipe_z_m:.3f}m")
+        # 按 building_id 分组，每组独立排序计算 Z 坐标（避免跨楼栋标高混淆）
+        floors_by_bid: dict[str, list] = {}
+        for f in self.floors:
+            bid = f.building_id or ""
+            floors_by_bid.setdefault(bid, []).append(f)
+        for bid, bid_floors in floors_by_bid.items():
+            sorted_floors = sorted(bid_floors, key=lambda x: x.elevation)
+            for idx, floor in enumerate(sorted_floors):
+                if idx == len(sorted_floors) - 1:
+                    pipe_z_m = floor.elevation + top_offset
+                else:
+                    upper_floor = sorted_floors[idx + 1]
+                    pipe_z_m = upper_floor.elevation - default_offset
+                if not floor.pipe_z_offset_set:
+                    floor.pipe_z_offset = pipe_z_m
+                z_mm = pipe_z_m * to_mm
+                for node in floor.nodes:
+                    # 修正分支节点保持创建时的 Z（基于立管节点坐标计算），不可覆盖
+                    if getattr(node, 'is_correction_node', False):
+                        continue
+                    # 竖向/非水平管道端点节点：两端已有层差（立管/连接管），
+                    # 覆盖为本层管网标高会导致竖段长度归零、管件分析误判画图错误。
+                    # 读CAD加载流程中此函数在立管生成前执行，不存在此类节点，行为不变；
+                    # 导入/刷新/改单位时立管已存在，此处跳过以保留层差。
+                    if self._is_vertical_pipe_endpoint(node.node_id):
+                        continue
+                    node.z = z_mm
+                # logger.info(f"楼层 {floor.name}: 楼面标高 {floor.elevation}m -> 管网标高 {pipe_z_m:.3f}m")
 
 
         # 重新计算管道的长度（因为节点Z可能改变）
@@ -2277,14 +3010,14 @@ class CADDataManager:
         def get_next_id(prefix, existing_dict):
             max_num = 0
             for key in existing_dict.keys():
-                if key.startswith(prefix):
+                if self.id_type(key) == prefix:
                     try:
-                        num = int(key.split('_')[1])
+                        num = int(key.split('_')[-1])
                         if num > max_num:
                             max_num = num
                     except:
                         pass
-            return f"{prefix}_{max_num+1:04d}"
+            return self._prefix_id(f"{prefix}_{max_num+1:04d}")
         
         for floor in self.floors:
             if not hasattr(floor, '_multi_floor_info'):
@@ -2438,7 +3171,9 @@ class CADDataManager:
                     align_point=floor.align_point,
                     rect_min=floor.rect_min,
                     rect_max=floor.rect_max,
-                    layer=floor.layer
+                    layer=floor.layer,
+                    building_id=self._building_id or "",
+                    rect_corners=[list(c) for c in floor.rect_corners] if floor.rect_corners else None
                 )
                 new_floor.pipes = new_pipes
                 new_floor.nodes = new_nodes
@@ -2449,7 +3184,7 @@ class CADDataManager:
         
         # 替换楼层列表
         self.floors = new_floors
-        self.floor_by_name = {f.name: f for f in self.floors}
+        self.floor_by_name = {self._make_floor_key(f.name, f.building_id): f for f in self.floors}
         
         # 清理临时属性
         for f in self.floors:
@@ -2571,13 +3306,15 @@ class CADDataManager:
             return True
         # 重置存储
         self.duplicate_risers_by_floor = {}
-        # 按楼层分组
+        # 按楼层分组（使用复合键防跨楼栋碰撞）
         risers_by_floor = {}
         for riser in self.risers:
             if riser.floor_name:
-                if riser.floor_name not in risers_by_floor:
-                    risers_by_floor[riser.floor_name] = []
-                risers_by_floor[riser.floor_name].append(riser)
+                bid = self.get_building_by_entity(riser.riser_id) or ""
+                key = self._make_floor_key(riser.floor_name, bid)
+                if key not in risers_by_floor:
+                    risers_by_floor[key] = []
+                risers_by_floor[key].append(riser)
         
         # 检查每个楼层内的重复编号
         for floor_name, riser_list in risers_by_floor.items():
@@ -2605,7 +3342,7 @@ class CADDataManager:
 
     def match_hydrants_with_nodes(self, tolerance_mm: float):
         """将消火栓匹配到最近的节点"""
-        tolerance = tolerance_mm * 0.001  # 转换为米
+        tolerance = self._mm_to_drawing_units(tolerance_mm)
         matched_count = 0
         for hydrant in self.hydrants:
             point = (hydrant.x, hydrant.y, hydrant.z)
@@ -2623,49 +3360,85 @@ class CADDataManager:
     def match_valves_with_pipes(self, tolerance_mm: float):
         """
         将阀门匹配到对应的管道
+        优先查 _valve_pipe_pairs（合并阶段记录的映射），回退时使用点到线段距离
         """
         try:
-            tolerance = tolerance_mm * 0.001  # 转换为米
+            tolerance = self._mm_to_drawing_units(tolerance_mm)
 
-            logger.info(f"开始匹配阀门与管道，容差: {tolerance_mm}mm")
+            logger.info(f"开始匹配阀门与管道，容差: {tolerance_mm}mm, "
+                        f"阀门数: {len(self.valves)}, 管道数: {len(self.pipes)}, "
+                        f"合并映射数: {len(self._valve_pipe_pairs)}")
+
+            # 构建阀门位置→管道ID的快速映射（支持容差匹配）
+            def _distance_3d(x1, y1, z1, x2, y2, z2):
+                return math.sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
 
             matched_count = 0
 
             for valve in self.valves:
+                # 快速路径：查合并映射（点到点欧氏距离）。
+                # 收集所有 < tolerance 的候选，再按阀门到管道线段的垂距取最小者——
+                # 避免"break 取第一条"在多个候选（残留映射/平行线）时错配。
                 valve_point = (valve.x, valve.y, valve.z)
+                candidates = []   # [(垂距, pipe_id)]
+                for vx, vy, vz, pid in self._valve_pipe_pairs:
+                    if _distance_3d(valve.x, valve.y, valve.z, vx, vy, vz) < tolerance:
+                        pipe = self.pipe_by_id.get(pid)
+                        if not pipe:
+                            continue
+                        dist, _ = self._point_to_line_distance_3d(
+                            valve_point, pipe.start_point, pipe.end_point)
+                        candidates.append((dist, pid))
+                mapped_pipe_id = None
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    mapped_pipe_id = candidates[0][1]
+
+                if mapped_pipe_id:
+                    valve.pipe_id = mapped_pipe_id
+                    valve.distance_on_pipe = 0.5
+                    matched_count += 1
+                    # logger.info(
+                    #     f"阀门 {valve.valve_id} 通过合并映射匹配到管道 {mapped_pipe_id}"
+                    # )
+                    continue
+
+                # 回退路径：点到线段距离
                 min_distance = float('inf')
                 matched_pipe = None
                 best_t = 0.0
 
-                # 遍历所有管道
                 for pipe in self.pipes:
-                    # 计算点到线段的距离（3D）
                     distance, t = self._point_to_line_distance_3d(
                         valve_point,
                         pipe.start_point,
                         pipe.end_point
                     )
-
-                    # 检查是否是最近的管道
                     if distance < min_distance:
                         min_distance = distance
                         matched_pipe = pipe
                         best_t = t
 
-                # 如果找到匹配的管道
                 if matched_pipe and min_distance < tolerance:
                     valve.pipe_id = matched_pipe.pipe_id
                     valve.distance_on_pipe = best_t
                     matched_count += 1
 
-                    logger.debug(
+                    logger.info(
                         f"阀门 {valve.valve_id} 匹配到管道 {matched_pipe.pipe_id}, "
-                        f"距离: {min_distance*1000:.2f}mm"
+                        f"距离: {min_distance:.2f}mm"
                     )
                 else:
-                    logger.debug(
+                    pipe_info = ""
+                    if matched_pipe:
+                        pipe_info = (f", 最近管={matched_pipe.pipe_id} "
+                                     f"sp=({matched_pipe.start_point[0]:.1f},{matched_pipe.start_point[1]:.1f},{matched_pipe.start_point[2]:.1f}) "
+                                     f"ep=({matched_pipe.end_point[0]:.1f},{matched_pipe.end_point[1]:.1f},{matched_pipe.end_point[2]:.1f})")
+                    logger.info(
                         f"阀门 {valve.valve_id} 未能匹配到任何管道 "
-                        f"(最近距离: {min_distance*1000:.2f}mm)"
+                        f"(最近距离: {min_distance:.2f}mm"
+                        f", 阀XYZ=({valve.x:.1f},{valve.y:.1f},{valve.z:.1f})"
+                        f"{pipe_info})"
                     )
 
             logger.info(f"阀门匹配完成: {matched_count}/{len(self.valves)} 匹配成功")
@@ -2695,322 +3468,36 @@ class CADDataManager:
                 )
                 return distance, 0.0
 
-            # 计算投影参数 t
+            # 计算投影参数 t（先钳位到 [0,1]，确保点到线段距离）
             t = (
                 (point[0] - line_start[0]) * dx +
                 (point[1] - line_start[1]) * dy +
                 (point[2] - line_start[2]) * dz
             ) / line_length_sq
+            t_clamped = max(0.0, min(1.0, t))
 
-            # 限制 t 在 [0, 1] 范围内
-            t = max(0.0, min(1.0, t))
-
-            # 计算投影点
-            proj_x = line_start[0] + t * dx
-            proj_y = line_start[1] + t * dy
-            proj_z = line_start[2] + t * dz
-
-            # 计算距离（3D）
+            # 用钳位后的 t 投影到线段上，计算垂距
+            proj_x = line_start[0] + t_clamped * dx
+            proj_y = line_start[1] + t_clamped * dy
+            proj_z = line_start[2] + t_clamped * dz
             distance = math.sqrt(
                 (point[0] - proj_x)**2 +
                 (point[1] - proj_y)**2 +
                 (point[2] - proj_z)**2
             )
 
-            return distance, t
+            return distance, t_clamped
 
         except Exception as e:
             logger.error(f"计算3D距离失败: {e}")
             return float('inf'), 0.0
 
-    def write_back_to_cad(self, element_type: str, elements=None) -> tuple:
+
+
+    def export_to_dataframe(self, element_type: str, supply_pressure_map: dict = None) -> pd.DataFrame:
         """
-        将数据写回CAD
-
-        Returns:
-            tuple: (成功数, 失败数, 错误信息, 是否需要重新加载)
-        """
-        try:
-            # ✅ 强制检查和重建连接
-            if not self.acad:
-                return (0, 0, "CAD未初始化", False)
-
-            # 尝试访问文档，如果失败则重新连接
-            try:
-                _ = self.acad.doc.Name
-            except:
-                logger.warning("CAD连接已失效，尝试重新连接...")
-                try:
-                    # 清空旧连接
-                    self.acad = None
-                    pythoncom.CoUninitialize()
-
-                    # 重新初始化
-                    import time
-                    time.sleep(0.5)
-                    pythoncom.CoInitialize()
-                    self.acad = Autocad()
-
-                    # 验证连接
-                    _ = self.acad.doc.Name
-                    logger.info("CAD连接已恢复")
-                except Exception as reconnect_error:
-                    logger.error(f"无法重新连接CAD: {reconnect_error}")
-                    return (0, 0, "无法连接到AutoCAD，请确保已打开对应的CAD文件", False)
-
-            success_count = 0
-            fail_count = 0
-            error_list = []
-
-            model_space = self.acad.doc.ModelSpace
-
-            if element_type == "pipes":
-                elements = elements or self.pipes
-                for pipe in elements:
-                    try:
-                        self._write_pipe_to_cad_safe(model_space, pipe)
-                        success_count += 1
-                    except Exception as e:
-                        fail_count += 1
-                        error_list.append(f"{pipe.pipe_id}")
-                        logger.debug(f"管道 {pipe.pipe_id} 反写失败: {e}")
-
-            elif element_type == "nodes":
-                elements = elements or self.nodes
-                for node in elements:
-                    try:
-                        self._write_node_to_cad_safe(model_space, node)
-                        success_count += 1
-                    except Exception as e:
-                        fail_count += 1
-                        error_list.append(f"{node.node_id}")
-                        logger.debug(f"节点 {node.node_id} 反写失败: {e}")
-
-            elif element_type == "valves":
-                elements = elements or self.valves
-                for valve in elements:
-                    try:
-                        self._write_valve_to_cad_safe(model_space, valve)
-                        success_count += 1
-                    except Exception as e:
-                        fail_count += 1
-                        error_list.append(f"{valve.valve_id}")
-                        logger.debug(f"阀门 {valve.valve_id} 反写失败: {e}")
-
-            # 生成消息
-            if success_count > 0:
-                message = f"成功反写 {success_count} 个{element_type}"
-                logger.info(message)
-                return (success_count, fail_count, message, False)
-            else:
-                message = f"反写失败，请检查CAD文件是否已打开"
-                logger.error(message)
-                return (0, fail_count, message, False)
-
-        except Exception as e:
-            logger.error(f"反写异常: {e}", exc_info=True)
-            return (0, 0, f"反写异常: {str(e)}", False)
-
-    def _write_pipe_to_cad_safe(self, model_space, pipe: PipeData):
-        """安全的写回管道 - 修正箭头逻辑"""
-        try:
-            # 判断是否来自计算页面
-            is_from_calculation = hasattr(pipe, 'display_text')
-            
-            if is_from_calculation:
-                # 计算页面反写：两行文字
-                data_line = pipe.display_text
-                flow_value = getattr(pipe, 'flow_value', 0.0)
-                show_arrow = getattr(pipe, 'show_arrow', False)
-                
-                # 计算管道方向
-                dx = pipe.end_point[0] - pipe.start_point[0]
-                dy = pipe.end_point[1] - pipe.start_point[1]
-                
-                # 计算管道方向角度（从起点指向终点）
-                pipe_angle = math.degrees(math.atan2(dy, dx)) if dx != 0 or dy != 0 else 0.0
-                
-                # 将角度归一化到0-360度
-                if pipe_angle < 0:
-                    pipe_angle += 360
-                
-                # 计算管道中点
-                mid_x = (pipe.start_point[0] + pipe.end_point[0]) / 2
-                mid_y = (pipe.start_point[1] + pipe.end_point[1]) / 2
-                mid_z = (pipe.start_point[2] + pipe.end_point[2]) / 2
-                
-                # 获取文字高度
-                text_height = self._get_cad_text_height()
-                
-                # 计算管道长度和方向向量
-                length = math.sqrt(dx*dx + dy*dy) if dx != 0 or dy != 0 else 1.0
-                if length > 0:
-                    ux = dx / length
-                    uy = dy / length
-                else:
-                    ux, uy = 1.0, 0.0
-                
-                # 计算管道法向量（垂直于管道方向）
-                nx = -uy
-                ny = ux
-                
-                # 计算文字位置偏移（垂直于管道方向，距离等于字高）
-                offset_x = nx * text_height
-                offset_y = ny * text_height
-                
-                # 第一行文字位置（数据行）
-                data_x = mid_x + offset_x
-                data_y = mid_y + offset_y
-                data_pos = APoint(data_x, data_y, mid_z)
-                
-                # 数据行角度：使用管道角度，但需要避免文字倒置
-                data_angle = pipe_angle
-                if data_angle >= 180:
-                    data_angle -= 180  # 避免文字倒置
-                
-                # 添加数据行文字
-                text_obj1 = model_space.AddText(data_line, data_pos, text_height)
-                text_obj1.Rotation = math.radians(data_angle)
-                text_obj1.Alignment = 10
-                text_obj1.TextAlignmentPoint = data_pos
-                
-                # 添加箭头行（仅当流量不为0且show_arrow为True时）
-                if show_arrow and flow_value != 0:
-                    # 第二行文字位置（箭头行，在数据行下方一个行高）
-                    arrow_x = data_x + nx * text_height
-                    arrow_y = data_y + ny * text_height
-                    arrow_pos = APoint(arrow_x, arrow_y, mid_z)
-                    
-                    # 确定箭头方向
-                    # 流量为正：箭头方向与管道方向一致
-                    # 流量为负：箭头方向与管道方向相反（旋转180度）
-                    if flow_value >= 0:
-                        arrow_angle = pipe_angle
-                    else:
-                        arrow_angle = pipe_angle + 180
-                        # 归一化到0-360度
-                        if arrow_angle >= 360:
-                            arrow_angle -= 360
-                    
-                    # 使用右箭头字符
-                    arrow_text = "→"
-                    text_obj2 = model_space.AddText(arrow_text, arrow_pos, text_height)
-                    text_obj2.Rotation = math.radians(arrow_angle)
-                    text_obj2.Alignment = 10
-                    text_obj2.TextAlignmentPoint = arrow_pos
-                    
-                    logger.debug(f"管道 {pipe.pipe_id} 反写箭头: 流量={flow_value}, "
-                                f"管道角度={pipe_angle:.1f}°, 箭头角度={arrow_angle:.1f}°")
-                
-                logger.debug(f"管道反写数据行: {pipe.pipe_id} -> {data_line}")
-                
-            else:
-                # 管道页面反写：一行文字（保持原有逻辑）
-                text_content = f"{pipe.pipe_id}_{pipe.nominal_diameter}"
-                
-                # 计算管道中点
-                mid_x = (pipe.start_point[0] + pipe.end_point[0]) / 2
-                mid_y = (pipe.start_point[1] + pipe.end_point[1]) / 2
-                mid_z = (pipe.start_point[2] + pipe.end_point[2]) / 2
-                
-                # 计算管道方向
-                dx = pipe.end_point[0] - pipe.start_point[0]
-                dy = pipe.end_point[1] - pipe.start_point[1]
-                
-                # 计算管道方向角度
-                pipe_angle = math.degrees(math.atan2(dy, dx)) if dx != 0 or dy != 0 else 0.0
-                if pipe_angle < 0:
-                    pipe_angle += 360
-                
-                # 避免文字倒置
-                text_angle = pipe_angle
-                if text_angle >= 180:
-                    text_angle -= 180
-                
-                # 获取文字高度
-                text_height = self._get_cad_text_height()
-                
-                # 计算文字位置（简单偏移）
-                if abs(dx) > abs(dy):
-                    offset_x = 0
-                    offset_y = 50
-                else:
-                    offset_x = 50
-                    offset_y = 0
-                
-                text_x = mid_x + offset_x
-                text_y = mid_y + offset_y
-                text_pos = APoint(text_x, text_y, mid_z)
-                
-                # 添加文字到CAD
-                text_obj = model_space.AddText(text_content, text_pos, text_height)
-                text_obj.Rotation = math.radians(text_angle)
-                text_obj.Alignment = 10
-                text_obj.TextAlignmentPoint = text_pos
-                
-                logger.debug(f"管道反写单行: {pipe.pipe_id} -> {text_content}")
-                
-            return True
-            
-        except Exception as e:
-            logger.error(f"管道反写失败 {pipe.pipe_id}: {e}")
-            return False
-
-
-    def _write_node_to_cad_safe(self, model_space, node: NodeData):
-        """安全的写回节点"""
-        text_x = node.x + 50
-        text_y = node.y + 50
-        text_z = node.z
-
-        text_position = APoint(text_x, text_y, text_z)
-        text_height = self._get_cad_text_height()
-
-        model_space.AddText(node.node_id, text_position, text_height)
-
-    def _write_valve_to_cad_safe(self, model_space, valve: ValveData):
-        """安全的写回阀门"""
-        text_x = valve.x + 30
-        text_y = valve.y + 30
-        text_z = valve.z
-
-        text_position = APoint(text_x, text_y, text_z)
-        text_height = self._get_cad_text_height()
-
-        text_obj = model_space.AddText(
-            valve.valve_id, text_position, text_height)
-
-        if valve.pipe_id and valve.pipe_id in self.pipe_by_id:
-            pipe = self.pipe_by_id[valve.pipe_id]
-            if pipe.direction_angle is not None:
-                # 获取原始角度
-                angle = pipe.direction_angle
-
-                # 将角度归一化到0-360度范围
-                angle = angle % 360
-
-                # 如果角度大于等于180度，减去180度，避免字体倒置
-                if angle >= 180:
-                    angle -= 180
-
-                # 应用旋转角度
-                text_obj.Rotation = math.radians(angle)
-
-    def _get_cad_text_height(self) -> float:
-        """获取CAD当前文字高度"""
-        try:
-            if self.acad and self.acad.doc:
-                text_style = self.acad.doc.ActiveTextStyle
-                if hasattr(text_style, 'Height') and text_style.Height > 0:
-                    return text_style.Height
-        except:
-            pass
-
-        return 2.5  # 默认高度
-
-    def export_to_dataframe(self, element_type: str) -> pd.DataFrame:
-        """
-        导出数据为DataFrame
+        导出数据为DataFrame。
+        supply_pressure_map: 可选，节点ID->压力(m) 映射（计算结果）；供水点导出时优先取计算值。
         """
         try:
             if element_type == "pipes":
@@ -3050,7 +3537,8 @@ class CADDataManager:
                 data = [{
                     "供水点组ID": group.group_id,
                     "节点ID列表": ",".join(group.node_ids),
-                    "供水压力": group.pressure,
+                    "供水压力": ((supply_pressure_map or {}).get(group.node_ids[0], group.pressure)
+                                 if group.node_ids else group.pressure),
                     "总流量": group.total_flow
                 } for group in self.supply_nodes]
 
@@ -3122,7 +3610,14 @@ class CADDataManager:
         # 这里只是示例
 
     def clear_data(self):
-        """清空所有数据"""
+        """清空所有数据（每次读取CAD前调用）。
+
+        除主数据外，一并清空跨读取残留的派生状态：
+        _valve_pipe_pairs（阀门合并映射）、self_loop_pipes（自环缓存）、
+        喷头四字段（非喷淋单体读取后残留）——避免同一会话内重读/跨单体读取时错配。
+        注意保留：building_data/building_order/building_file_paths（区域模式跨单体
+        合并必需）、_auto_sprinkler_seen（任一单体含喷头→整体保持喷淋的设计意图）。
+        """
         self.pipes.clear()
         self.nodes.clear()
         self.supply_nodes.clear()
@@ -3141,6 +3636,17 @@ class CADDataManager:
         self.grouped_floors_map.clear()
         self.duplicate_risers_by_floor.clear()
         self.duplicate_pipe_ids_by_floor.clear()
+
+        self.connection_points.clear()
+        self.connection_counters.clear()
+
+        # 跨读取残留的派生状态（同一会话内重读/跨单体读取时可能错配）
+        self._valve_pipe_pairs.clear()
+        self.self_loop_pipes.clear()
+        self.sprinkler_s_node_ids.clear()
+        self.sprinkler_k_map.clear()
+        self.sprinkler_k_overrides.clear()
+        self.manual_dn_pipes.clear()
 
         self.is_loaded = False
         logger.info("所有数据已清空")
@@ -3165,6 +3671,7 @@ class CADDataManager:
         self.grouped_floors_map.clear()
         self.duplicate_risers_by_floor.clear()
         self.duplicate_pipe_ids_by_floor.clear()
+        self._valve_pipe_pairs.clear()
 
         self.is_loaded = False
         self.cad_file_path = None
@@ -3174,6 +3681,14 @@ class CADDataManager:
         self.sprinkler_k_map.clear()
         self.sprinkler_k_overrides.clear()
         self.manual_dn_pipes.clear()
+        self.building_data.clear()
+        self.building_order.clear()
+        self.connection_points.clear()
+        self.connection_counters.clear()
+        self.calibration_rects.clear()
+        self._building_id = ""
+        self._auto_sprinkler_seen = False
+        self.self_loop_pipes.clear()
         logger.info("所有数据已完全清空（含立管、楼层）")
 
     def get_summary(self) -> dict:
@@ -3201,10 +3716,12 @@ class CADDataManager:
             logger.error(f"关闭CAD数据管理器时出错: {e}")
 
     def _ask_user_for_color256_diameter_sync(self):
-        """同步弹窗询问用户随层管道的默认管径，返回管径字符串（如 'DN100'）"""
+        """同步弹窗询问用户随层管道的默认管径，返回管径字符串（如 'DN100'）
+        确认按钮默认聚焦，方便用户按空格直接确认。
+        """
         import threading
         import tkinter as tk
-        from tkinter import simpledialog
+        from tkinter import ttk
 
         result = [None]
         event = threading.Event()
@@ -3214,14 +3731,63 @@ class CADDataManager:
             if root is None:
                 root = tk.Tk()
                 root.withdraw()
-            dlg = simpledialog.askstring(
-                "随层管道管径",
-                "检测到颜色为随层（颜色256）的管道，请指定其公称管径（例如 DN100）：",
-                initialvalue="DN100",
-                parent=root
-            )
-            result[0] = dlg if dlg else "DN100"
-            event.set()
+
+            dlg = tk.Toplevel(root)
+            dlg.title("随层管道管径")
+            dlg.geometry("420x160")
+            dlg.resizable(False, False)
+            dlg.transient(root)
+            dlg.grab_set()
+
+            # 居中于父窗口
+            dlg.update_idletasks()
+            pw = root.winfo_width() or 800
+            ph = root.winfo_height() or 600
+            px = root.winfo_x()
+            py = root.winfo_y()
+            dw, dh = 420, 160
+            dlg.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+
+            frame = ttk.Frame(dlg, padding=16)
+            frame.pack(fill="both", expand=True)
+
+            ttk.Label(frame, text="检测到颜色为随层（颜色256）的管道，\n请指定其公称管径：").pack(anchor="w")
+
+            entry_frame = ttk.Frame(frame)
+            entry_frame.pack(fill="x", pady=(8, 16))
+            ttk.Label(entry_frame, text="公称管径：").pack(side="left")
+            entry_var = tk.StringVar(value="DN100")
+            entry = ttk.Entry(entry_frame, textvariable=entry_var, width=16)
+            entry.pack(side="left", padx=(4, 0))
+            entry.icursor(len(entry_var.get()))
+            entry.selection_range(0, tk.END)
+
+            btn_frame = ttk.Frame(frame)
+            btn_frame.pack(fill="x")
+
+            def on_ok(_evt=None):
+                result[0] = entry_var.get() if entry_var.get() else "DN100"
+                dlg.destroy()
+                event.set()
+
+            def on_cancel():
+                result[0] = "DN100"
+                dlg.destroy()
+                event.set()
+
+            ok_btn = ttk.Button(btn_frame, text="确认", command=on_ok)
+            ok_btn.pack(side="right", padx=(8, 0))
+            cancel_btn = ttk.Button(btn_frame, text="取消", command=on_cancel)
+            cancel_btn.pack(side="right")
+
+            # 确认按钮默认聚焦
+            ok_btn.focus_set()
+            dlg.bind("<Return>", on_ok)
+            # 在输入框内按回车也确认
+            entry.bind("<Return>", on_ok)
+
+            dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+            dlg.wait_window()
 
         root = tk._default_root
         if root:
@@ -3265,7 +3831,7 @@ class CADDataManager:
         """提取立管（圆或圆弧）及引出标注 - 基于最近距离匹配"""
         try:
             riser_layers = config.get("riser_layers", [])
-            tolerance = config.get("tolerance", 10.0) * 0.001  # 米
+            tolerance = self._mm_to_drawing_units(config.get("tolerance", 10.0))
 
             if not riser_layers:
                 logger.warning("未设置立管图层，跳过立管提取")
@@ -3300,20 +3866,20 @@ class CADDataManager:
                         if layer in riser_layers and obj_name in ("AcDbCircle", "AcDbArc"):
                             center = entity.Center
                             riser_entities.append({
-                                'center': (center[0], center[1], center[2]),
+                                'center': (center[0], center[1], 0.0),
                                 'radius': entity.Radius,
                                 'layer': layer,
                                 'handle': entity.Handle
                             })
                         elif layer in riser_note_layers and obj_name == "AcDbLine":
-                            start = (entity.StartPoint[0], entity.StartPoint[1], entity.StartPoint[2])
-                            end = (entity.EndPoint[0], entity.EndPoint[1], entity.EndPoint[2])
+                            start = (entity.StartPoint[0], entity.StartPoint[1], 0.0)
+                            end = (entity.EndPoint[0], entity.EndPoint[1], 0.0)
                             line_entities.append({'start': start, 'end': end, 'handle': entity.Handle})
                         elif obj_name == "AcDbText":
                             ins = entity.InsertionPoint
                             text_entities.append({
                                 'text': entity.TextString,
-                                'pos': (ins[0], ins[1], ins[2])
+                                'pos': (ins[0], ins[1], 0.0)
                             })
                     except Exception:
                         continue
@@ -3324,7 +3890,7 @@ class CADDataManager:
             for idx, ent in enumerate(riser_entities, 1):
                 cx, cy, cz = ent['center']
                 riser = RiserData(
-                    riser_id=f"R_{idx:04d}",
+                    riser_id=self._prefix_id(f"R_{idx:04d}"),
                     x=cx, y=cy, z=cz,
                     radius=ent['radius'],
                     layer=ent['layer'],
@@ -3529,7 +4095,7 @@ class CADDataManager:
 
             # 获取容差（毫米）
             tolerance_mm = config.get("tolerance", 10.0)
-            tolerance = tolerance_mm * 0.001  # 转换为米
+            tolerance = self._mm_to_drawing_units(tolerance_mm)
 
             # 分组
             groups = []
@@ -3588,7 +4154,7 @@ class CADDataManager:
                         base.note = base.note.replace(base.note_diameter, base.nominal_diameter) if base.note_diameter else base.note
                     base.note_diameter = base.nominal_diameter
                 # 记录日志
-                logger.info(f"合并 {len(group)} 个重合立管为 {base.riser_id}，位置({base.x:.2f},{base.y:.2f})")
+                # logger.info(f"合并 {len(group)} 个重合立管为 {base.riser_id}，位置({base.x:.2f},{base.y:.2f})")
                 merged_risers.append(base)
 
             # 替换立管列表和索引
@@ -3745,6 +4311,28 @@ class CADDataManager:
                 matched_count += 1
                 logger.debug(f"立管 {riser.riser_id} 匹配到管道 {pipe.pipe_id} 的 {endpoint_type} 端点")
 
+            # 合并被拉到同一立管圆心的重复端点节点
+            moved_nids = {nid for _, _, nid in unique_mods.values()}
+            if len(moved_nids) > 1:
+                keep = riser.connected_node_id
+                for nid in list(moved_nids):
+                    if nid == keep:
+                        continue
+                    rm_node = node_by_id.get(nid)
+                    keep_node = node_by_id.get(keep)
+                    if rm_node and keep_node:
+                        for pid in rm_node.connected_pipes:
+                            if pid not in keep_node.connected_pipes:
+                                keep_node.connected_pipes.append(pid)
+                    for pipe in self.pipes:
+                        if pipe.start_node_id == nid:
+                            pipe.start_node_id = keep
+                        if pipe.end_node_id == nid:
+                            pipe.end_node_id = keep
+                    self.nodes = [n for n in self.nodes if n.node_id != nid]
+                    node_by_id.pop(nid, None)
+                    logger.debug(f"立管 {riser.riser_id} 合并重复端节点 {nid} -> {keep}")
+
             # ========== 处理中间点打断 ==========
             # 去重：同一管道只打断一次
             unique_middle = {}
@@ -3757,7 +4345,7 @@ class CADDataManager:
                 foot_z = pipe.start_point[2]  # 使用管道Z坐标（假设管道水平）
                 
                 # 创建新节点
-                new_node_id = f"N_{len(self.nodes) + len(new_nodes) + 1:04d}"
+                new_node_id = self._prefix_id(f"N_{len(self.nodes) + len(new_nodes) + 1:04d}")
                 new_node = NodeData(
                     node_id=new_node_id,
                     x=foot_x,
@@ -3772,7 +4360,7 @@ class CADDataManager:
                 
                 # 创建两段新管道
                 # 第一段：从原起点到新节点
-                pipe1_id = f"P_{len(self.pipes) + len(new_pipes) + 1:04d}"
+                pipe1_id = self._prefix_id(f"P_{len(self.pipes) + len(new_pipes) + 1:04d}")
                 pipe1 = PipeData(
                     pipe_id=pipe1_id,
                     start_node_id=pipe.start_node_id,
@@ -3788,7 +4376,7 @@ class CADDataManager:
                     entity_handle=pipe.entity_handle
                 )
                 # 第二段：从新节点到原终点
-                pipe2_id = f"P_{len(self.pipes) + len(new_pipes) + 2:04d}"
+                pipe2_id = self._prefix_id(f"P_{len(self.pipes) + len(new_pipes) + 2:04d}")
                 pipe2 = PipeData(
                     pipe_id=pipe2_id,
                     start_node_id=new_node_id,
@@ -3884,31 +4472,34 @@ class CADDataManager:
         roughness = self.material_manager.get_roughness(pipe_material)
 
         # ----- 分离的 ID 计数器 -----
-        max_riser_id = max((int(pid.split('_')[1]) for pid in self.pipe_by_id if pid.startswith('R_')), default=0)
-        max_link_id  = max((int(pid.split('_')[1]) for pid in self.pipe_by_id if pid.startswith('L_')), default=0)
-        max_node_id  = max((int(nid.split('_')[1]) for nid in self.node_by_id), default=0)
+        max_riser_id = max((int(pid.split('_')[-1]) for pid in self.pipe_by_id if pid.split('_')[-2] == 'R'), default=0)
+        max_link_id  = max((int(pid.split('_')[-1]) for pid in self.pipe_by_id if pid.split('_')[-2] == 'L'), default=0)
+        max_node_id  = max((int(nid.split('_')[-1]) for nid in self.node_by_id), default=0)
 
         def next_riser_pipe_id():
             nonlocal max_riser_id
             max_riser_id += 1
-            return f"R_{max_riser_id:04d}"
+            return self._prefix_id(f"R_{max_riser_id:04d}")
 
         def next_link_pipe_id():
             nonlocal max_link_id
             max_link_id += 1
-            return f"L_{max_link_id:04d}"
+            return self._prefix_id(f"L_{max_link_id:04d}")
 
         def next_node_id():
             nonlocal max_node_id
             max_node_id += 1
-            return f"N_{max_node_id:04d}"
+            return self._prefix_id(f"N_{max_node_id:04d}")
 
         new_pipes = []
         new_nodes = []
 
         # ----- 第一步：为每个立管创建竖向管道（R_开头） -----
+        current_bid = self._building_id or ""
         for riser in self.risers:
-            floor = self.floor_by_name.get(riser.floor_name)
+            if current_bid and not riser.riser_id.startswith(f"{current_bid}_"):
+                continue
+            floor = self.lookup_floor(riser.floor_name, self._building_id or None)
             if not floor:
                 continue
             # 确保 riser.note_number 有值
@@ -3995,14 +4586,18 @@ class CADDataManager:
             if riser.connected_node_id is None or riser.connected_node_id not in self.node_by_id:
                 floor.nodes.append(top_node)
 
-        # 将新节点加入总列表（注意：bottom_node 已包含在 new_nodes 中，但未加入任何楼层）
-        self.nodes.extend(new_nodes)
-
+        # 第一步生成的节点仅加入 node_by_id（第二步通过 node_by_id 访问）；
+        # 全部节点在第二步完成后统一加入 self.nodes（见下方 extend）
         # ----- 第二步：相邻楼层同编号立管连接（L_开头） -----
+        # 重新计算立管ID计数器（第一步已生成 R_ 立管管道），
+        # 避免修正分支竖段ID与第一步立管ID冲突（冲突会导致 pipe_by_id 被覆盖、消火栓拆分错管道）
+        max_riser_id = max((int(pid.split('_')[-1]) for pid in self.pipe_by_id if pid.split('_')[-2] == 'R'), default=0)
         sorted_floors = sorted(self.floors, key=lambda f: f.elevation)
-        # 按楼层收集有编号的立管
+        # 按楼层收集有编号的立管（仅当前楼栋）
         risers_by_floor = {}
         for riser in self.risers:
+            if current_bid and not riser.riser_id.startswith(f"{current_bid}_"):
+                continue
             if riser.note_number:
                 risers_by_floor.setdefault(riser.floor_name, []).append(riser)
 
@@ -4025,57 +4620,153 @@ class CADDataManager:
                 lower_list = lower_by_num[num]
                 upper_list = upper_by_num[num]
 
-                # 找出一对 XY 距离最近的立管（仅配一对，其余不连）
-                best_pair = None
-                min_dist = float('inf')
-                for rl in lower_list:
-                    for ru in upper_list:
-                        d = math.hypot(ru.x - rl.x, ru.y - rl.y)
-                        if d < min_dist:
-                            min_dist = d
-                            best_pair = (ru, rl)
+                # 在上下层同编号立管间贪婪最近匹配（每根立管最多连一次）。
+                # 支持同编号立管在同层出现多根（如 2# 图纸一层/引入管层各两根 2-XHL-25），
+                # 楼层对齐后 XY 重合的多对立管全部连接（原来"仅配一对"只连了第一对）。
+                pairs = []
+                remaining_lower = list(lower_list)
+                remaining_upper = list(upper_list)
+                while remaining_lower and remaining_upper:
+                    best_pair = None
+                    min_dist = float('inf')
+                    for rl in remaining_lower:
+                        for ru in remaining_upper:
+                            d = math.hypot(ru.x - rl.x, ru.y - rl.y)
+                            if d < min_dist:
+                                min_dist = d
+                                best_pair = (ru, rl)
+                    if best_pair is None:
+                        break
+                    pairs.append(best_pair)
+                    remaining_upper.remove(best_pair[0])
+                    remaining_lower.remove(best_pair[1])
 
-                if not best_pair:
-                    continue
-                ru, rl = best_pair
+                for ru, rl in pairs:
+                    # 上层立管下端节点（楼面标高），下层立管上端节点（管网标高）
+                    top_node_id = ru.bottom_node_id        # 上层下端
+                    bottom_node_id = rl.top_node_id        # 下层上端
+                    if top_node_id not in self.node_by_id or bottom_node_id not in self.node_by_id:
+                        continue
+                    top_node = self.node_by_id[top_node_id]
+                    bottom_node = self.node_by_id[bottom_node_id]
 
-                # 上层立管下端节点（楼面标高），下层立管上端节点（管网标高）
-                top_node_id = ru.bottom_node_id        # 上层下端
-                bottom_node_id = rl.top_node_id        # 下层上端
-                if top_node_id not in self.node_by_id or bottom_node_id not in self.node_by_id:
-                    continue
-                top_node = self.node_by_id[top_node_id]
-                bottom_node = self.node_by_id[bottom_node_id]
+                    # 连接管管径：上层立管管径，无则 DN100
+                    dn_conn = ru.nominal_diameter if ru.nominal_diameter else (self.default_color256_diameter or "DN100")
+                    info_conn = self.material_manager.get_diameter_info(pipe_material, dn_conn)
+                    inner_conn = info_conn.get("inner", 100.0) if info_conn else 100.0
 
-                # 连接管管径：上层立管管径，无则 DN100
-                dn_conn = ru.nominal_diameter if ru.nominal_diameter else (self.default_color256_diameter or "DN100")
-                info_conn = self.material_manager.get_diameter_info(pipe_material, dn_conn)
-                inner_conn = info_conn.get("inner", 100.0) if info_conn else 100.0
+                    dx = bottom_node.x - top_node.x
+                    dy = bottom_node.y - top_node.y
+                    dz = bottom_node.z - top_node.z
+                    d_xy = math.hypot(dx, dy)
+                    dz_abs = abs(dz)
 
-                dx = bottom_node.x - top_node.x
-                dy = bottom_node.y - top_node.y
-                dz = bottom_node.z - top_node.z
-                raw_len = math.hypot(dx, dy, dz)
-                pipe_conn = PipeData(
-                    pipe_id=next_link_pipe_id(),        # L_开头
-                    start_node_id=top_node_id,
-                    end_node_id=bottom_node_id,
-                    start_point=(top_node.x, top_node.y, top_node.z),
-                    end_point=(bottom_node.x, bottom_node.y, bottom_node.z),
-                    nominal_diameter=dn_conn,
-                    inner_diameter=inner_conn,
-                    length=raw_len * unit_factor,
-                    raw_length=raw_len,
-                    material=pipe_material,
-                    roughness=roughness,
-                    layer=""                           # 无特定图层
-                )
-                new_pipes.append(pipe_conn)
-                self.pipe_by_id[pipe_conn.pipe_id] = pipe_conn
-                top_node.connected_pipes.append(pipe_conn.pipe_id)
-                bottom_node.connected_pipes.append(pipe_conn.pipe_id)
+                    # 连接管与上下层立管的夹角：连接管偏离竖直方向超过 10° 时夹角 <170°。
+                    # 在本层立管顶部节点（立管向下、连接管向上）与上层立管底部节点（立管向上、连接管向下）
+                    # 两处的夹角相同，均为 180° - 偏离竖直角 alpha。
+                    if dz_abs > 1e-9:
+                        alpha = math.degrees(math.atan2(d_xy, dz_abs))
+                    else:
+                        alpha = 90.0 if d_xy > 1e-9 else 0.0
+                    angle_with_riser = 180.0 - alpha
 
-        # 将所有新管道加入总列表
+                    # 修正分支生成的管道/节点均算在本层（lower）
+                    def register_pipe(pipe, s_node, e_node, floor):
+                        new_pipes.append(pipe)
+                        self.pipe_by_id[pipe.pipe_id] = pipe
+                        s_node.connected_pipes.append(pipe.pipe_id)
+                        e_node.connected_pipes.append(pipe.pipe_id)
+                        floor.pipes.append(pipe)
+
+                    def make_pipe(pipe_id, sn, en, sp, ep, floor):
+                        rl_len = math.hypot(ep[0] - sp[0], ep[1] - sp[1], ep[2] - sp[2])
+                        pipe = PipeData(
+                            pipe_id=pipe_id,
+                            start_node_id=sn,
+                            end_node_id=en,
+                            start_point=sp,
+                            end_point=ep,
+                            nominal_diameter=dn_conn,
+                            inner_diameter=inner_conn,
+                            length=rl_len * unit_factor,
+                            raw_length=rl_len,
+                            material=pipe_material,
+                            roughness=roughness,
+                            layer=""                           # 无特定图层
+                        )
+                        register_pipe(pipe, self.node_by_id[sn], self.node_by_id[en], floor)
+                        return pipe
+
+                    def make_node(x, y, z, floor):
+                        nid = next_node_id()
+                        node = NodeData(
+                            node_id=nid, x=x, y=y, z=z,
+                            cad_key=f"{x:.6f},{y:.6f},{z:.6f}",
+                            connected_pipes=[]
+                        )
+                        # 修正分支节点：Z 由创建时的立管节点坐标确定，
+                        # 不得被 assign_node_z_coordinates 二次覆盖为本层管网标高（否则竖段长度归零）
+                        node.is_correction_node = True
+                        new_nodes.append(node)
+                        self.node_by_id[nid] = node
+                        floor.nodes.append(node)
+                        return nid, node
+
+                    def make_case_a_connection(floor):
+                        """情况A：本层立管顶部向上 H 竖段 + 上层立管底部向下 H 竖段 + 水平横管（两90°弯头）"""
+                        h = dz_abs / 2.0
+                        a1_id, a1 = make_node(bottom_node.x, bottom_node.y, bottom_node.z + h, floor)
+                        make_pipe(next_riser_pipe_id(), bottom_node_id, a1_id,
+                                  (bottom_node.x, bottom_node.y, bottom_node.z),
+                                  (a1.x, a1.y, a1.z), floor)
+                        a2_id, a2 = make_node(top_node.x, top_node.y, top_node.z - h, floor)
+                        make_pipe(next_riser_pipe_id(), a2_id, top_node_id,
+                                  (a2.x, a2.y, a2.z),
+                                  (top_node.x, top_node.y, top_node.z), floor)
+                        make_pipe(next_link_pipe_id(), a1_id, a2_id,
+                                  (a1.x, a1.y, a1.z), (a2.x, a2.y, a2.z), floor)
+
+                    if angle_with_riser >= 170.0:
+                        # 直通：直线直连（现状）
+                        raw_len = math.hypot(dx, dy, dz)
+                        pipe_conn = PipeData(
+                            pipe_id=next_link_pipe_id(),        # L_开头
+                            start_node_id=top_node_id,
+                            end_node_id=bottom_node_id,
+                            start_point=(top_node.x, top_node.y, top_node.z),
+                            end_point=(bottom_node.x, bottom_node.y, bottom_node.z),
+                            nominal_diameter=dn_conn,
+                            inner_diameter=inner_conn,
+                            length=raw_len * unit_factor,
+                            raw_length=raw_len,
+                            material=pipe_material,
+                            roughness=roughness,
+                            layer=""                           # 无特定图层
+                        )
+                        new_pipes.append(pipe_conn)
+                        self.pipe_by_id[pipe_conn.pipe_id] = pipe_conn
+                        top_node.connected_pipes.append(pipe_conn.pipe_id)
+                        bottom_node.connected_pipes.append(pipe_conn.pipe_id)
+                    elif d_xy >= 2.0 * (self.material_manager.get_elbow_90_la_mm(dn_conn)
+                                        or self.material_manager.get_elbow_90_la_mm("DN100") or 200.0) + 50.0:
+                        # 错位较大：两90°弯头 + 水平横管（情况A）
+                        make_case_a_connection(lower)
+                    elif dz_abs - d_xy < 0.0:
+                        # 45° 方案不可行（高差小于错位距离），回退情况A
+                        make_case_a_connection(lower)
+                    else:
+                        # 错位较小：本层立管顶部竖段 Lv + 45° 斜管（两45°弯头，情况B）
+                        lv = dz_abs - d_xy
+                        b1_id, b1 = make_node(bottom_node.x, bottom_node.y, bottom_node.z + lv, lower)
+                        make_pipe(next_riser_pipe_id(), bottom_node_id, b1_id,
+                                  (bottom_node.x, bottom_node.y, bottom_node.z),
+                                  (b1.x, b1.y, b1.z), lower)
+                        make_pipe(next_link_pipe_id(), b1_id, top_node_id,
+                                  (b1.x, b1.y, b1.z),
+                                  (top_node.x, top_node.y, top_node.z), lower)
+
+        # 将所有新管道加入总列表；新节点（含修正分支生成）统一加入节点列表
+        self.nodes.extend(new_nodes)
         self.pipes.extend(new_pipes)
         logger.info(f"立管管道创建完成：竖向 {max_riser_id} 根，连接 {max_link_id} 根，新增节点 {len(new_nodes)} 个")
 
@@ -4086,7 +4777,6 @@ class CADDataManager:
         并生成DN65横管连接到消火栓末端节点。
         新立管管道ID在原ID后加 _A 和 _B，继承原立管编号。
         """
-        logger.info("=== 开始消火栓-立管配对 ===")
         if not self.floors:
             logger.warning("没有楼层数据，跳过配对")
             return
@@ -4097,7 +4787,7 @@ class CADDataManager:
             logger.warning("没有消火栓数据，跳过配对")
             return
     
-        logger.info(f"楼层数: {len(self.floors)}, 立管数: {len(self.risers)}, 消火栓数: {len(self.hydrants)}")
+        # logger.info(f"楼层数: {len(self.floors)}, 立管数: {len(self.risers)}, 消火栓数: {len(self.hydrants)}, 管道数: {len(self.pipes)}, 节点数: {len(self.nodes)}")
     
         # 获取配置参数
         drawing_unit = config.get("drawing_unit", "毫米")
@@ -4115,19 +4805,31 @@ class CADDataManager:
             logger.warning("未找到DN65管径信息，无法生成消火栓支管")
             return
         dn65_inner_mm = dn_info["inner"]
-        logger.info(f"DN65内径: {dn65_inner_mm} mm")
-    
-        # 按楼层分组立管
+        # logger.info(f"DN65内径: {dn65_inner_mm} mm")
+
+        # 基于 max_node_id 的节点 ID 计数器，修复 len(self.nodes)+1 碰撞 bug
+        max_hnode_id = max((int(nid.split('_')[-1]) for nid in self.node_by_id), default=0)
+        def next_hnode_id():
+            nonlocal max_hnode_id
+            max_hnode_id += 1
+            return self._prefix_id(f"N_{max_hnode_id:04d}")
+
+        # 按楼层分组立管（仅当前楼栋）
+        current_bid_h = self._building_id or ""
         risers_by_floor = {}
         for r in self.risers:
+            if current_bid_h and not r.riser_id.startswith(f"{current_bid_h}_"):
+                continue
             if r.floor_name:
                 risers_by_floor.setdefault(r.floor_name, []).append(r)
             else:
                 logger.warning(f"立管 {r.riser_id} 没有楼层名")
     
-        # 按楼层分组消火栓
+        # 按楼层分组消火栓（仅当前楼栋）
         hydrants_by_floor = {}
         for h in self.hydrants:
+            if current_bid_h and not h.hydrant_id.startswith(f"{current_bid_h}_"):
+                continue
             if h.floor_name:
                 hydrants_by_floor.setdefault(h.floor_name, []).append(h)
             else:
@@ -4140,7 +4842,7 @@ class CADDataManager:
             floor_name = floor.name
             risers = risers_by_floor.get(floor_name, [])
             hydrants = hydrants_by_floor.get(floor_name, [])
-            logger.info(f"楼层 {floor_name}: 立管 {len(risers)} 个, 消火栓 {len(hydrants)} 个")
+            # logger.info(f"楼层 {floor_name}: 立管 {len(risers)} 个, 消火栓 {len(hydrants)} 个")
     
             if not risers or not hydrants:
                 continue
@@ -4190,7 +4892,8 @@ class CADDataManager:
                             mid_node = self.node_by_id.get(pipe_b.start_node_id)
                         if mid_node:
                             for hydrant, _, dist in hydrant_list:
-                                self._create_hydrant_branch(hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm)
+                                # logger.info(f"  [{riser_id}] 消火栓 {hydrant.hydrant_id} 复用 mid_node={mid_node.node_id}, 距离={dist:.1f}mm")
+                                self._create_hydrant_branch(hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm, next_hnode_id)
                         else:
                             logger.error(f"立管 {riser_id} 拆分后找不到中间节点")
                     else:
@@ -4202,10 +4905,12 @@ class CADDataManager:
     
                 # 获取原立管管道
                 old_vertical_pipe = self.pipe_by_id.get(riser_id)
-                if not old_vertical_pipe or not old_vertical_pipe.pipe_id.startswith("R_"):
+                if not old_vertical_pipe or self.id_type(old_vertical_pipe.pipe_id) != "R":
                     logger.warning(f"立管 {riser_id} 未找到对应的竖向管道，跳过拆分")
                     continue
     
+                # logger.info(f"  [{riser_id}] 竖向管道: {old_vertical_pipe.pipe_id}, start_node={old_vertical_pipe.start_node_id}, end_node={old_vertical_pipe.end_node_id}")
+
                 # 获取原立管的上下端节点
                 top_node = self.node_by_id.get(old_vertical_pipe.start_node_id)
                 bottom_node = self.node_by_id.get(old_vertical_pipe.end_node_id)
@@ -4214,13 +4919,14 @@ class CADDataManager:
                     continue
                 if top_node.z < bottom_node.z:
                     top_node, bottom_node = bottom_node, top_node
+                # logger.info(f"  [{riser_id}] top_node={top_node.node_id} Z={top_node.z:.1f}, bottom_node={bottom_node.node_id} Z={bottom_node.z:.1f}")
     
                 # 计算1.1m高度处的节点坐标（毫米）
                 floor_elev_mm = floor.elevation * 1000.0
                 new_z_mm = floor_elev_mm + 1100.0
     
                 # 强制创建新节点，不复用任何现有节点
-                mid_node_id = f"N_{len(self.nodes) + 1:04d}"
+                mid_node_id = next_hnode_id()
                 mid_node = NodeData(
                     node_id=mid_node_id,
                     x=riser.x,
@@ -4231,7 +4937,7 @@ class CADDataManager:
                 )
                 self.nodes.append(mid_node)
                 self.node_by_id[mid_node_id] = mid_node
-                # logger.info(f"在立管 {riser_id} 上创建1.1m节点 {mid_node_id} (Z={new_z_mm}mm)")
+                # logger.info(f"  [{riser_id}] 创建1.1m节点 {mid_node_id} 于 ({riser.x:.1f}, {riser.y:.1f}, Z={new_z_mm:.1f})")
     
                 # 删除原立管管道
                 if old_vertical_pipe.pipe_id in top_node.connected_pipes:
@@ -4292,6 +4998,7 @@ class CADDataManager:
                 self.pipes.append(pipe_b)
                 self.pipe_by_id[pipe_b_id] = pipe_b
                 pipe_b.original_riser_id = riser_id
+                # logger.info(f"  [{riser_id}] 拆分为 {pipe_a_id}({pipe_a.start_node_id}→{pipe_a.end_node_id}) 和 {pipe_b_id}({pipe_b.start_node_id}→{pipe_b.end_node_id})")
     
                 # 更新节点连接关系
                 top_node.connected_pipes.append(pipe_a_id)
@@ -4306,16 +5013,20 @@ class CADDataManager:
     
                 # 为每个关联的消火栓创建支管
                 for hydrant, _, dist in hydrant_list:
-                    self._create_hydrant_branch(hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm)
-    
-        logger.info(f"配对完成，共处理消火栓 {len(processed_hydrants)} 个，已拆分立管 {len(split_risers)} 个")
+                    # logger.info(f"  [{riser_id}] 消火栓 {hydrant.hydrant_id} → mid_node={mid_node_id}, 距离={dist:.1f}mm")
+                    self._create_hydrant_branch(hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm, next_hnode_id)
+
+        # logger.info(f"配对完成，共处理消火栓 {len(processed_hydrants)} 个，已拆分立管 {len(split_risers)} 个")
         self.update_pipe_types(config)
-        logger.info("=== 消火栓-立管配对及支管生成完成 ===")
+        # logger.info("=== 消火栓-立管配对及支管生成完成 ===")
     
-    def _create_hydrant_branch(self, hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm):
+    def _create_hydrant_branch(self, hydrant, mid_node, floor, material, dn65_inner_mm, roughness, unit_factors, drawing_unit, tolerance_mm, next_node_id=None):
         """为消火栓创建末端节点和横管（内部辅助方法）"""
         # 创建消火栓末端节点
-        end_node_id = f"N_{len(self.nodes) + 1:04d}"
+        if next_node_id:
+            end_node_id = next_node_id()
+        else:
+            end_node_id = self._prefix_id(f"N_{len(self.nodes) + 1:04d}")
         end_node = NodeData(
             node_id=end_node_id,
             x=hydrant.x,
@@ -4326,10 +5037,10 @@ class CADDataManager:
         )
         self.nodes.append(end_node)
         self.node_by_id[end_node_id] = end_node
-        # logger.info(f"创建消火栓末端节点 {end_node_id} 位于 ({hydrant.x:.2f}, {hydrant.y:.2f}, Z={mid_node.z}mm)")
+        # logger.info(f"  [消火栓 {hydrant.hydrant_id}] 创建末端节点 {end_node_id} 于 ({hydrant.x:.1f}, {hydrant.y:.1f}, Z={mid_node.z:.1f})")
     
         # 创建横管（DN65）
-        branch_pipe_id = f"B_{len(self.pipes) + 1:04d}"
+        branch_pipe_id = self._prefix_id(f"B_{len(self.pipes) + 1:04d}")
         branch_pipe = PipeData(
             pipe_id=branch_pipe_id,
             start_node_id=mid_node.node_id,
@@ -4353,6 +5064,7 @@ class CADDataManager:
         self.pipes.append(branch_pipe)
         self.pipe_by_id[branch_pipe_id] = branch_pipe
         floor.pipes.append(branch_pipe)
+        # logger.info(f"  [消火栓 {hydrant.hydrant_id}] 创建支管 {branch_pipe_id}: {mid_node.node_id}→{end_node_id}, 长度={branch_pipe.length:.3f}m")
 
         # 更新节点连接关系
         mid_node.connected_pipes.append(branch_pipe_id)
@@ -4383,6 +5095,362 @@ class CADDataManager:
             floor.nodes.remove(end_node)
             if branch_pipe_id in mid_node.connected_pipes:
                 mid_node.connected_pipes.remove(branch_pipe_id)
+
+    def attach_hydrant_to_riser(self, pipe_id: str, config: dict):
+        """整体画布手动操作：立管接出消火栓。
+
+        在立管离楼面标高 1.1m 处将立管一分为二（R_xxx → R_xxx_A + R_xxx_B），
+        中间节点接出水平消火栓支管（DN65，正西 0.6m，两端 z = 楼面标高+1.1m），
+        支管末端挂消火栓。与读取 CAD 时 connect_hydrants_to_risers 的生成方式一致。
+
+        返回 (created, error)：created 为 [(obj_type, obj), ...]（obj_type in
+        node/pipe/hydrant，供上层逐个记录 undo）；失败时 created 为 None。
+        """
+        pipe = self.pipe_by_id.get(pipe_id)
+        if (not pipe or self.id_type(pipe_id) != "R"
+                or pipe_id.endswith("_A") or pipe_id.endswith("_B")):
+            return None, "请选择未拆分的立管管道"
+        if not pipe.is_active:
+            return None, "无效管道不能接出消火栓"
+        riser = self.riser_by_id.get(pipe_id)
+        if not riser:
+            return None, f"立管 {pipe_id} 未找到立管数据"
+        if not riser.floor_name:
+            return None, f"立管 {pipe_id} 没有楼层归属"
+        hbid = self.get_building_by_entity(pipe_id)
+        floor = self.lookup_floor(riser.floor_name, hbid)
+        if not floor:
+            return None, f"楼层 {riser.floor_name} 不存在"
+
+        top_node = self.node_by_id.get(pipe.start_node_id)
+        bottom_node = self.node_by_id.get(pipe.end_node_id)
+        if not top_node or not bottom_node:
+            return None, f"立管 {pipe_id} 节点不完整"
+        if top_node.z < bottom_node.z:
+            top_node, bottom_node = bottom_node, top_node
+
+        floor_elev_mm = floor.elevation * 1000.0
+        mid_z = floor_elev_mm + 1100.0
+        if not (bottom_node.z < mid_z < top_node.z):
+            return None, (f"立管 {pipe_id} 高度不足 1.1m"
+                          f"（{bottom_node.z:.0f}~{top_node.z:.0f}mm），无法接出消火栓")
+
+        drawing_unit = config.get("drawing_unit", "毫米")
+        unit_factor = self.unit_factors.get(drawing_unit, 0.001)
+        material = config.get("pipe_material", "镀锌钢管")
+        roughness = self.material_manager.get_roughness(material)
+        dn_info = self.material_manager.get_diameter_info(material, "DN65")
+        if not dn_info or dn_info.get("inner", 0) == 0:
+            return None, "未找到 DN65 管径信息"
+        dn65_inner_mm = dn_info["inner"]
+
+        created = []
+        # 楼栋前缀：区域模式新建对象必须与既有实体同前缀（否则整体画布按楼栋前缀
+        # 过滤投影/绘制后不可见）。不能依赖 _prefix_id——其 _building_id 在导入项目后为空。
+        bid = self.get_building_by_entity(pipe_id) or ""
+
+        def pfx(base):
+            return f"{bid}_{base}" if bid else base
+
+        def next_nid():
+            max_nid = max((int(n.split('_')[-1]) for n in self.node_by_id
+                           if n.split('_')[-1].isdigit()), default=0)
+            return pfx(f"N_{max_nid + 1:04d}")
+
+        def next_pid():
+            max_pid = max((int(p.split('_')[-1]) for p in self.pipe_by_id
+                           if p.split('_')[-1].isdigit()), default=0)
+            return pfx(f"B_{max_pid + 1:04d}")
+
+        def next_hid():
+            max_hid = max((int(h.split('_')[-1]) for h in self.hydrant_by_id
+                           if h.split('_')[-1].isdigit()), default=0)
+            return pfx(f"H_{max_hid + 1:04d}")
+
+        # 1. 1.1m 中间节点
+        mid_node = NodeData(
+            node_id=next_nid(), x=riser.x, y=riser.y, z=mid_z,
+            cad_key=f"{riser.x:.6f},{riser.y:.6f},{mid_z:.6f}",
+            connected_pipes=[]
+        )
+        mid_node.is_correction_node = True  # 防止任何 z 重算覆盖（导入导出坐标保真）
+        self.nodes.append(mid_node)
+        self.node_by_id[mid_node.node_id] = mid_node
+        created.append(('node', mid_node))
+
+        # 2. 立管一分为二
+        for node in (top_node, bottom_node):
+            if pipe_id in node.connected_pipes:
+                node.connected_pipes.remove(pipe_id)
+        if pipe in floor.pipes:
+            floor.pipes.remove(pipe)
+        self.pipes.remove(pipe)
+        del self.pipe_by_id[pipe_id]
+
+        def make_riser_pipe(pid, sn_id, en_id, sp, ep):
+            new_p = PipeData(
+                pipe_id=pid, start_node_id=sn_id, end_node_id=en_id,
+                start_point=sp, end_point=ep,
+                nominal_diameter=pipe.nominal_diameter,
+                inner_diameter=pipe.inner_diameter,
+                material=pipe.material,
+                roughness=pipe.roughness,
+                layer=pipe.layer,
+                riser_number=riser.note_number
+            )
+            new_p.raw_length = math.hypot(ep[0] - sp[0], ep[1] - sp[1], ep[2] - sp[2])
+            new_p.length = new_p.raw_length * unit_factor
+            new_p.original_riser_id = pipe_id
+            return new_p
+
+        pipe_a = make_riser_pipe(f"{pipe_id}_A", top_node.node_id, mid_node.node_id,
+                                 (top_node.x, top_node.y, top_node.z),
+                                 (mid_node.x, mid_node.y, mid_node.z))
+        pipe_b = make_riser_pipe(f"{pipe_id}_B", mid_node.node_id, bottom_node.node_id,
+                                 (mid_node.x, mid_node.y, mid_node.z),
+                                 (bottom_node.x, bottom_node.y, bottom_node.z))
+        self.pipes.append(pipe_a)
+        self.pipe_by_id[pipe_a.pipe_id] = pipe_a
+        self.pipes.append(pipe_b)
+        self.pipe_by_id[pipe_b.pipe_id] = pipe_b
+        top_node.connected_pipes.append(pipe_a.pipe_id)
+        mid_node.connected_pipes.extend([pipe_a.pipe_id, pipe_b.pipe_id])
+        bottom_node.connected_pipes.append(pipe_b.pipe_id)
+        floor.pipes.append(pipe_a)
+        floor.pipes.append(pipe_b)
+        created.append(('pipe', pipe_a))
+        created.append(('pipe', pipe_b))
+
+        # 3. 支管末端节点（正西 0.6m，z 同为楼面+1.1m）
+        BRANCH_LEN_MM = 600.0
+        end_x = mid_node.x - BRANCH_LEN_MM
+        end_node = NodeData(
+            node_id=next_nid(), x=end_x, y=mid_node.y, z=mid_z,
+            cad_key=f"{end_x:.6f},{mid_node.y:.6f},{mid_z:.6f}",
+            connected_pipes=[]
+        )
+        end_node.is_correction_node = True
+        self.nodes.append(end_node)
+        self.node_by_id[end_node.node_id] = end_node
+        created.append(('node', end_node))
+
+        # 4. 水平消火栓支管（DN65）
+        branch = PipeData(
+            pipe_id=next_pid(), start_node_id=mid_node.node_id, end_node_id=end_node.node_id,
+            start_point=(mid_node.x, mid_node.y, mid_node.z),
+            end_point=(end_node.x, end_node.y, end_node.z),
+            nominal_diameter="DN65", inner_diameter=dn65_inner_mm,
+            material=material, roughness=roughness, pipe_type="支管"
+        )
+        branch.raw_length = BRANCH_LEN_MM
+        branch.length = BRANCH_LEN_MM * unit_factor
+        branch.is_hydrant_branch = True
+        self.pipes.append(branch)
+        self.pipe_by_id[branch.pipe_id] = branch
+        mid_node.connected_pipes.append(branch.pipe_id)
+        end_node.connected_pipes.append(branch.pipe_id)
+        floor.pipes.append(branch)
+        created.append(('pipe', branch))
+
+        # 5. 支管末端挂消火栓
+        hydrant = HydrantData(
+            hydrant_id=next_hid(), node_id=end_node.node_id,
+            x=end_node.x, y=end_node.y, z=end_node.z,
+            block_name=config.get("hydrant_block_name", "hydrant").split(",")[0].strip(),
+            entity_handle="", floor_name=floor.name
+        )
+        self.hydrants.append(hydrant)
+        self.hydrant_by_id[hydrant.hydrant_id] = hydrant
+        end_node.hydrants.append(hydrant.hydrant_id)
+        floor.hydrants.append(hydrant)
+        created.append(('hydrant', hydrant))
+
+        # 新节点加入楼层（楼层视图可见）
+        floor.nodes.append(mid_node)
+        floor.nodes.append(end_node)
+
+        self.update_pipe_types(config)
+        return created, None
+
+    def can_merge_riser_segments(self, pipe_id: str):
+        """检查已拆分的立管段（R_xxx_A/_B）是否可合并回原立管。
+
+        条件：两段均有效、同属一立管、共享中间节点、管径一致、
+        中间节点无消火栓且仅连接这两段（支管已删除）。
+        返回 (ok, reason)。
+        """
+        pipe = self.pipe_by_id.get(pipe_id)
+        if not pipe or self.id_type(pipe_id) != "R":
+            return False, "非立管管道"
+        if not (pipe_id.endswith("_A") or pipe_id.endswith("_B")):
+            return False, "非已拆分的立管段"
+        if not pipe.is_active:
+            return False, "无效管道"
+        base_id = pipe_id[:-2]
+        other_id = base_id + ("_B" if pipe_id.endswith("_A") else "_A")
+        other = self.pipe_by_id.get(other_id)
+        if not other:
+            return False, "对端立管段不存在"
+        if not other.is_active:
+            return False, "对端立管段无效"
+        if (pipe.nominal_diameter != other.nominal_diameter
+                or pipe.inner_diameter != other.inner_diameter):
+            return False, "两段立管管径不一致，不执行合并"
+        if (getattr(pipe, 'original_riser_id', '') != getattr(other, 'original_riser_id', '')
+                and getattr(other, 'original_riser_id', '') != base_id):
+            return False, "两段立管不属于同一立管"
+        if pipe_id.endswith("_A"):
+            mid_id, other_mid_id = pipe.end_node_id, other.start_node_id
+        else:
+            mid_id, other_mid_id = pipe.start_node_id, other.end_node_id
+        if mid_id != other_mid_id:
+            return False, "两段立管未共享中间节点"
+        mid = self.node_by_id.get(mid_id)
+        if not mid:
+            return False, "中间节点不存在"
+        if mid.hydrants:
+            return False, "中间节点仍挂有消火栓"
+        if set(mid.connected_pipes) != {pipe_id, other_id}:
+            return False, "中间节点仍连接支管或其他管道"
+        return True, ""
+
+    def merge_riser_segments(self, pipe_id: str):
+        """合并已拆分的立管段 R_xxx_A/_B 回 R_xxx。
+
+        前提：can_merge_riser_segments 通过（中间节点无支管/消火栓，管径一致）。
+        返回 (created, deleted, error)：created 供记录 'add' undo，
+        deleted（A/B 段 + 中间节点）供记录 'delete' undo。
+        """
+        ok, reason = self.can_merge_riser_segments(pipe_id)
+        if not ok:
+            return None, None, reason
+        if pipe_id.endswith("_A"):
+            pipe_a = self.pipe_by_id[pipe_id]
+            pipe_b = self.pipe_by_id[pipe_id[:-2] + "_B"]
+        else:
+            pipe_b = self.pipe_by_id[pipe_id]
+            pipe_a = self.pipe_by_id[pipe_id[:-2] + "_A"]
+        base_id = pipe_id[:-2]
+        mid = self.node_by_id[pipe_a.end_node_id]
+        top_node = self.node_by_id[pipe_a.start_node_id]
+        bottom_node = self.node_by_id[pipe_b.end_node_id]
+        riser = self.riser_by_id.get(base_id)
+
+        drawing_unit = self.config_manager.get_live_config().get("drawing_unit", "毫米")
+        unit_factor = self.unit_factors.get(drawing_unit, 0.001)
+        merged = PipeData(
+            pipe_id=base_id,
+            start_node_id=top_node.node_id,
+            end_node_id=bottom_node.node_id,
+            start_point=(top_node.x, top_node.y, top_node.z),
+            end_point=(bottom_node.x, bottom_node.y, bottom_node.z),
+            nominal_diameter=pipe_a.nominal_diameter,
+            inner_diameter=pipe_a.inner_diameter,
+            material=pipe_a.material,
+            roughness=pipe_a.roughness,
+            layer=pipe_a.layer,
+            riser_number=riser.note_number if riser else pipe_a.riser_number,
+            pipe_type=pipe_a.pipe_type
+        )
+        merged.raw_length = math.hypot(bottom_node.x - top_node.x,
+                                       bottom_node.y - top_node.y,
+                                       bottom_node.z - top_node.z)
+        merged.length = merged.raw_length * unit_factor
+        merged.original_riser_id = base_id
+
+        # 从节点连接移除两段
+        for node in (top_node, mid, bottom_node):
+            for pid in (pipe_a.pipe_id, pipe_b.pipe_id):
+                if pid in node.connected_pipes:
+                    node.connected_pipes.remove(pid)
+        # 楼层清理
+        for floor in self.floors:
+            for p in (pipe_a, pipe_b):
+                if p in floor.pipes:
+                    floor.pipes.remove(p)
+            if mid in floor.nodes:
+                floor.nodes.remove(mid)
+        # 全局移除两段与中间节点
+        for p in (pipe_a, pipe_b):
+            if p in self.pipes:
+                self.pipes.remove(p)
+            self.pipe_by_id.pop(p.pipe_id, None)
+        if mid in self.nodes:
+            self.nodes.remove(mid)
+        self.node_by_id.pop(mid.node_id, None)
+
+        # 添加合并管道
+        self.pipes.append(merged)
+        self.pipe_by_id[base_id] = merged
+        top_node.connected_pipes.append(base_id)
+        bottom_node.connected_pipes.append(base_id)
+        for floor in self.floors:
+            if (top_node in floor.nodes or bottom_node in floor.nodes) and merged not in floor.pipes:
+                floor.pipes.append(merged)
+
+        deleted = [('pipe', pipe_a), ('pipe', pipe_b), ('node', mid)]
+        return [('pipe', merged)], deleted, None
+
+
+# ── Kabsch 算法（阶段九：校准配对自动放置） ──
+
+def solve_kabsch_2d(
+    source_pts: list[tuple[float, float]],
+    target_pts: list[tuple[float, float]]
+) -> tuple[float, float, float]:
+    """2D Kabsch 算法。返回 (dx, dy, angle_deg) 使 target→source RMSD 最小。"""
+    import math
+    n = len(source_pts)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    sx = sum(p[0] for p in source_pts) / n
+    sy = sum(p[1] for p in source_pts) / n
+    tx = sum(p[0] for p in target_pts) / n
+    ty = sum(p[1] for p in target_pts) / n
+    sc = [(p[0] - sx, p[1] - sy) for p in source_pts]
+    tc = [(p[0] - tx, p[1] - ty) for p in target_pts]
+    a, b = 0.0, 0.0
+    for (sxi, syi), (txi, tyi) in zip(sc, tc):
+        a += sxi * txi + syi * tyi
+        b += sxi * tyi - syi * txi
+    if abs(a) < 1e-10 and abs(b) < 1e-10:
+        angle = 0.0
+    else:
+        angle = math.degrees(math.atan2(-b, a))
+    rad = math.radians(angle)
+    # 平移：target 质心旋转后到 source 质心
+    rx = tx * math.cos(rad) - ty * math.sin(rad)
+    ry = tx * math.sin(rad) + ty * math.cos(rad)
+    dx = sx - rx
+    dy = sy - ry
+    return dx, dy, angle
+
+
+def single_pair_placement(
+    src: tuple[float, float, float],
+    tgt: tuple[float, float, float],
+    pipe_dir: tuple[float, float] | None = None
+) -> tuple[float, float, float]:
+    """单对连接点：共线拉直，间距 0.1m (=100mm)。返回 (dx, dy, dz)。
+
+    pipe_dir: 总图供水管方向单位向量 (dx, dy)（xy 平面），
+              若提供则沿该方向放置目标点，保证两管共线不重叠。
+    """
+    if pipe_dir:
+        # 沿供水管方向向外 100mm，保证共线+不重叠
+        nx = src[0] + pipe_dir[0] * 100.0
+        ny = src[1] + pipe_dir[1] * 100.0
+    else:
+        # 回退：沿 src→tgt 方向
+        dx_raw = src[0] - tgt[0]
+        dy_raw = src[1] - tgt[1]
+        dist = math.hypot(dx_raw, dy_raw)
+        if dist < 1e-8:
+            return 0.0, 0.0, 0.0
+        nx = src[0] - (dx_raw / dist) * 100.0
+        ny = src[1] - (dy_raw / dist) * 100.0
+    return nx - tgt[0], ny - tgt[1], src[2] - tgt[2]
+
 
 
 

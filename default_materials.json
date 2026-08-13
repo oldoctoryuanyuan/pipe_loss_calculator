@@ -69,7 +69,6 @@
         }
       }
     },
-
     "加厚钢管": {
       "roughness": 120,
       "color_diameter_table": {
@@ -138,8 +137,7 @@
           "inner": 386.4
         }
       }
-    },    
-
+    },
     "无缝钢管": {
       "roughness": 120,
       "color_diameter_table": {
@@ -209,14 +207,13 @@
         }
       }
     },
-
     "钢丝网骨架PE管": {
       "roughness": 140,
       "color_diameter_table": {
         "50": {
           "nominal": "d50",
           "inner": 41.0
-        },        
+        },
         "60": {
           "nominal": "d63",
           "inner": 52.0
@@ -267,7 +264,6 @@
         }
       }
     },
-
     "CPVC管": {
       "roughness": 150,
       "color_diameter_table": {
@@ -297,7 +293,6 @@
         }
       }
     },
-
     "K9球墨铸铁管": {
       "roughness": 130,
       "color_diameter_table": {

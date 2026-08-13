@@ -9,15 +9,21 @@ CAD_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
+# 判断线段是否退化为点（长度接近零）的阈值。
+# 注意：不能用 tolerance（容差），否则长度小于容差的合法短管会被误丢弃
+# （曾导致 41.5mm 短线丢失、阀门 V_0012 匹配失败，2026-08-05 修复）。
+MIN_LINE_LENGTH = 1e-9
+
 class SimpleLine:
     """模拟的直线实体，用于替换原始的多段线"""
-    def __init__(self, start, end, color, layer, handle):
+    def __init__(self, start, end, color, layer, handle, valve_pos=None):
         self.ObjectName = "AcDbLine"
         self.StartPoint = start
         self.EndPoint = end
         self.Color = color
         self.Layer = layer
         self.Handle = handle
+        self.valve_pos = valve_pos
         self.Length = math.sqrt((end[0]-start[0])**2 + (end[1]-start[1])**2 + (end[2]-start[2])**2)
 
 def merge_collinear_segments(segments, tolerance):
@@ -41,7 +47,7 @@ def merge_collinear_segments(segments, tolerance):
     def point_line_distance(px, py, x1, y1, x2, y2):
         dx = x2 - x1
         dy = y2 - y1
-        if abs(dx) < tolerance and abs(dy) < tolerance:
+        if abs(dx) < MIN_LINE_LENGTH and abs(dy) < MIN_LINE_LENGTH:
             return math.hypot(px - x1, py - y1)
         return abs(dy * px - dx * py + x2 * y1 - y2 * x1) / math.hypot(dx, dy)
 
@@ -51,7 +57,7 @@ def merge_collinear_segments(segments, tolerance):
         x2, y2, _ = seg['end']
         dx = x2 - x1
         dy = y2 - y1
-        if abs(dx) < tolerance and abs(dy) < tolerance:
+        if abs(dx) < MIN_LINE_LENGTH and abs(dy) < MIN_LINE_LENGTH:
             return None
         ang = math.atan2(dy, dx)
         if ang < 0:
@@ -177,7 +183,7 @@ def preprocess_cad_data(acad, pipe_layers: List[str], tolerance_mm: float) -> Li
     """
     主入口函数：从 AutoCAD 模型空间提取实体，进行预处理，返回模拟的直线段列表
     """
-    tolerance = tolerance_mm * 0.001  # 转换为米
+    tolerance = tolerance_mm
     model_space = acad.doc.ModelSpace
 
     # 第一步：拆分多段线为直线段，同时收集直线
@@ -196,16 +202,15 @@ def preprocess_cad_data(acad, pipe_layers: List[str], tolerance_mm: float) -> Li
             if entity.ObjectName in ["AcDbPolyline", "AcDb2dPolyline"]:
                 # 处理多段线：获取所有顶点
                 coords = entity.Coordinates
-                elevation = getattr(entity, 'Elevation', 0.0)
                 # 判断坐标维度
                 if len(coords) % 2 == 0:
                     points = []
                     for i in range(0, len(coords), 2):
-                        points.append((coords[i], coords[i+1], elevation))
+                        points.append((coords[i], coords[i+1], 0.0))
                 else:
                     points = []
                     for i in range(0, len(coords), 3):
-                        points.append((coords[i], coords[i+1], coords[i+2]))
+                        points.append((coords[i], coords[i+1], 0.0))
                 # 生成相邻点之间的线段
                 for i in range(len(points)-1):
                     seg = {
@@ -218,8 +223,8 @@ def preprocess_cad_data(acad, pipe_layers: List[str], tolerance_mm: float) -> Li
                     segments.append(seg)
             elif entity.ObjectName == "AcDbLine":
                 # 直线直接作为一段
-                start = (entity.StartPoint[0], entity.StartPoint[1], entity.StartPoint[2])
-                end = (entity.EndPoint[0], entity.EndPoint[1], entity.EndPoint[2])
+                start = (entity.StartPoint[0], entity.StartPoint[1], 0.0)
+                end = (entity.EndPoint[0], entity.EndPoint[1], 0.0)
                 seg = {
                     'start': start,
                     'end': end,
@@ -412,14 +417,14 @@ def _point_distance_along(p, a, b):
         return 0
     return (ap[0]*ab[0] + ap[1]*ab[1] + ap[2]*ab[2]) / ab_len_sq
 
-def merge_pipes_at_valves(simple_lines: List[SimpleLine], acad, valve_block_name: str, tolerance_mm: float) -> List[SimpleLine]:
+def merge_pipes_at_valves(simple_lines: List[SimpleLine], acad, valve_block_names: list, tolerance_mm: float) -> List[SimpleLine]:
     """
     将被阀门图块打断的两条线段合并为一条
     """
     if acad is None:
         return simple_lines
 
-    tolerance = tolerance_mm * 0.001  # 转换为米
+    tolerance = tolerance_mm
     model_space = acad.doc.ModelSpace
 
     # 收集阀门插入点
@@ -428,10 +433,10 @@ def merge_pipes_at_valves(simple_lines: List[SimpleLine], acad, valve_block_name
         try:
             if entity.ObjectName != "AcDbBlockReference":
                 continue
-            if entity.Name != valve_block_name:
+            if entity.Name not in valve_block_names:
                 continue
             ins = entity.InsertionPoint
-            valves.append((ins[0], ins[1], ins[2]))
+            valves.append((ins[0], ins[1], 0.0))
         except Exception as e:
             logger.debug(f"读取阀门图块时出错: {e}")
             continue
@@ -468,9 +473,9 @@ def merge_pipes_at_valves(simple_lines: List[SimpleLine], acad, valve_block_name
         d1 = math.hypot(px - x1, py - y1)
         d2 = math.hypot(px - x2, py - y2)
         if d1 > d2:
-            return (x1, y1, line.StartPoint[2])
+            return (x1, y1, 0.0)
         else:
-            return (x2, y2, line.EndPoint[2])
+            return (x2, y2, 0.0)
 
     for vx, vy, vz in valves:
         candidates = []
@@ -494,7 +499,8 @@ def merge_pipes_at_valves(simple_lines: List[SimpleLine], acad, valve_block_name
             end=end2,
             color=line1.Color,
             layer=line1.Layer,
-            handle=f"{line1.Handle}|{line2.Handle}"
+            handle=f"{line1.Handle}|{line2.Handle}",
+            valve_pos=(vx, vy, vz)
         )
         new_lines.append(new_line)
         used_indices.add(idx1)
@@ -513,7 +519,7 @@ def preprocess_from_segments(segments, tolerance_mm):
     从预提取的线段列表开始预处理（跳过 model_space 遍历），
     与 preprocess_cad_data 后续步骤完全一致。
     """
-    tolerance = tolerance_mm * 0.001
+    tolerance = tolerance_mm
 
     # 合并共线重合线段
     if segments:
@@ -662,7 +668,7 @@ def merge_pipes_at_valves_from_points(simple_lines, valve_points, tolerance_mm):
     与 merge_pipes_at_valves 后续处理完全一致。
     valve_points: [(x, y, z), ...] 列表
     """
-    tolerance = tolerance_mm * 0.001
+    tolerance = tolerance_mm
 
     if not valve_points:
         return simple_lines
@@ -695,9 +701,9 @@ def merge_pipes_at_valves_from_points(simple_lines, valve_points, tolerance_mm):
         d1 = math.hypot(px - x1, py - y1)
         d2 = math.hypot(px - x2, py - y2)
         if d1 > d2:
-            return (x1, y1, line.StartPoint[2])
+            return (x1, y1, 0.0)
         else:
-            return (x2, y2, line.EndPoint[2])
+            return (x2, y2, 0.0)
 
     for vx, vy, vz in valve_points:
         candidates = []
@@ -721,7 +727,8 @@ def merge_pipes_at_valves_from_points(simple_lines, valve_points, tolerance_mm):
             end=end2,
             color=line1.Color,
             layer=line1.Layer,
-            handle=f"{line1.Handle}|{line2.Handle}"
+            handle=f"{line1.Handle}|{line2.Handle}",
+            valve_pos=(vx, vy, vz)
         )
         new_lines.append(new_line)
         used_indices.add(idx1)

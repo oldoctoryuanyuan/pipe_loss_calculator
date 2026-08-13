@@ -142,7 +142,12 @@ class MainApplication:
         status_frame = ttk.Frame(self.root, height=25)
         status_frame.grid(row=1, column=0, sticky="ew")
         status_frame.grid_propagate(False)  # 固定高度
-        
+
+        # 三栏布局
+        status_frame.grid_columnconfigure(0, weight=1)
+        status_frame.grid_columnconfigure(1, weight=8)
+        status_frame.grid_columnconfigure(2, weight=1)
+
         # CAD状态
         self.cad_status_label = ttk.Label(
             status_frame,
@@ -151,7 +156,7 @@ class MainApplication:
             anchor=tk.W,
             padding=(5, 0)
         )
-        self.cad_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.cad_status_label.grid(row=0, column=0, sticky="ew")
         
         # 数据状态
         self.data_status_label = ttk.Label(
@@ -161,17 +166,18 @@ class MainApplication:
             anchor=tk.W,
             padding=(5, 0)
         )
-        self.data_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.data_status_label.grid(row=0, column=1, sticky="ew")
         
-        # 版本信息
-        version_label = ttk.Label(
+        # 免责声明（红字）
+        disclaimer_label = ttk.Label(
             status_frame,
-            text="管网水损计算程序 v1.0",
+            text="本程序未经专业机构测试认证，计算结果仅供参考，不可用于工程实践！",
+            foreground="red",
             relief=tk.SUNKEN,
-            anchor=tk.E,
+            anchor=tk.W,
             padding=(5, 0)
         )
-        version_label.pack(side=tk.RIGHT)
+        disclaimer_label.grid(row=0, column=2, sticky="ew")
     
     def update_status(self):
         """更新状态栏"""
@@ -362,6 +368,8 @@ class MainApplication:
                               command=self.import_project,
                               accelerator="Ctrl+I")
         file_menu.add_separator()
+        file_menu.add_command(label="关于", command=self.show_about)
+        file_menu.add_separator()
         file_menu.add_command(label="退出", command=self.on_closing)
         menubar.add_cascade(label="文件", menu=file_menu)
 
@@ -370,6 +378,14 @@ class MainApplication:
         self.root.bind_all("<Control-E>", lambda e: self.export_project())
         self.root.bind_all("<Control-i>", lambda e: self.import_project())
         self.root.bind_all("<Control-I>", lambda e: self.import_project())
+
+    def show_about(self):
+        """显示关于对话框"""
+        messagebox.showinfo(
+            "关于",
+            "管网水损计算程序 v1.50\n\n作者：高歌\n联系方式：27881969@qq.com",
+            parent=self.root
+        )
 
     def export_project(self):
         """导出项目到文件"""
@@ -383,7 +399,8 @@ class MainApplication:
         cad_path = self.cad_data_manager.cad_file_path or ""
         cad_name = os.path.splitext(os.path.basename(cad_path))[0] if cad_path else "project"
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"{cad_name}_{date_str}"
+        region_prefix = "区域模式_" if self.cad_data_manager.building_order else ""
+        default_name = f"{region_prefix}{cad_name}_{date_str}"
 
         # 询问模型名
         model_name = simpledialog.askstring(
@@ -469,7 +486,6 @@ class MainApplication:
             )
             
             if not success:
-                messagebox.showerror("导入失败", "导入过程中发生错误，请查看日志")
                 return
 
             # 恢复配置到设置页面
@@ -478,7 +494,8 @@ class MainApplication:
             if hasattr(self.settings_page, "update_all_widgets"):
                 self.settings_page.update_all_widgets()
 
-            # 刷新所有页面
+            # 刷新所有页面（导入期间跳过 pipe_z_offset 重算，保留导入值）
+            self.preview_page._skip_z_recalc = True
             self.refresh_all_pages()
             self.notify_units_changed()
             self.update_status()
@@ -486,11 +503,10 @@ class MainApplication:
             # 重建预览页面楼层标签
             if hasattr(self.preview_page, "refresh_data"):
                 self.preview_page.refresh_data()
+            self.preview_page._skip_z_recalc = False
 
             messagebox.showinfo("导入成功",
-                                f"项目已从导入恢复:\n{zip_path}\n\n"
-                                "当前为导入模式，CAD写回功能不可用。\n"
-                                "您可以查看数据、编辑参数和重新计算。")
+                                f"项目已从导入恢复:\n{zip_path}")
 
         except Exception as e:
             logger.error(f"导入失败: {e}", exc_info=True)

@@ -16,6 +16,8 @@ import zipfile
 import tempfile
 import shutil
 
+from tkinter import messagebox
+
 from gui.preview_module import MaintenanceZone
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,12 @@ _TUPLE_FIELDS_MAP: Dict[str, set] = {
 _PIPE_EXTRA_ATTRS = [
     "display_text", "flow_value", "show_arrow",
     "original_riser_id", "is_hydrant_branch",
+    "static_equiv", "dynamic_equiv",
+]
+
+# NodeData 上运行时动态添加的非dataclass属性
+_NODE_EXTRA_ATTRS = [
+    "is_correction_node",
 ]
 
 
@@ -84,11 +92,29 @@ def _collect_pipe_extra_attrs(pipe) -> Optional[dict]:
     return extra if extra else None
 
 
+def _collect_node_extra_attrs(node) -> Optional[dict]:
+    """收集NodeData上不在dataclass定义中的动态属性（如 is_correction_node）。"""
+    extra = {}
+    for attr in _NODE_EXTRA_ATTRS:
+        if hasattr(node, attr):
+            val = getattr(node, attr)
+            if val is not None:
+                extra[attr] = val
+    return extra if extra else None
+
+
 def _restore_pipe_extra_attrs(pipe, extra: Optional[dict]):
     """恢复PipeData的动态属性。"""
     if extra:
         for k, v in extra.items():
             setattr(pipe, k, v)
+
+
+def _restore_node_extra_attrs(node, extra: Optional[dict]):
+    """恢复NodeData的动态属性。"""
+    if extra:
+        for k, v in extra.items():
+            setattr(node, k, v)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +170,9 @@ class ProjectExporter:
             self._write_json("preview_state.json", self._export_preview_state())
             self._write_json("selection_state.json", self._export_selection_state())
 
+        # 标高管材分段（内存状态随项目导出，不写入通用json）
+        self._write_json("elevation_materials.json", self._export_elevation_materials())
+
         if self.calc_page:
             results = self._export_calc_results()
             if results is not None:
@@ -195,6 +224,7 @@ class ProjectExporter:
             "hydrants_count": len(cdm.hydrants),
             "risers_count": len(cdm.risers),
             "floors_count": len(cdm.floors),
+            "region_mode_enabled": self.cfg.get_global_setting("region_mode_enabled", False),
         }
 
     def _export_cad_data(self) -> dict:
@@ -210,17 +240,23 @@ class ProjectExporter:
                     extra = _collect_pipe_extra_attrs(obj)
                     if extra:
                         d["_extra_attrs"] = extra
+                # 收集NodeData动态属性
+                elif cls_name == "NodeData":
+                    extra = _collect_node_extra_attrs(obj)
+                    if extra:
+                        d["_extra_attrs"] = extra
                 result.append(d)
             return result
 
-        # 楼层存ID列表而非对象引用
+        # 楼层存ID列表而非对象引用（使用复合键避免区域模式跨楼栋同名楼层覆盖）
         floor_pipe_ids = {}
         floor_node_ids = {}
         floor_hydrant_ids = {}
         for floor in cdm.floors:
-            floor_pipe_ids[floor.name] = [p.pipe_id for p in floor.pipes]
-            floor_node_ids[floor.name] = [n.node_id for n in floor.nodes]
-            floor_hydrant_ids[floor.name] = [h.hydrant_id for h in floor.hydrants]
+            fkey = f"{floor.building_id}|{floor.name}" if floor.building_id else floor.name
+            floor_pipe_ids[fkey] = [p.pipe_id for p in floor.pipes]
+            floor_node_ids[fkey] = [n.node_id for n in floor.nodes]
+            floor_hydrant_ids[fkey] = [h.hydrant_id for h in floor.hydrants]
 
         floors_data = []
         for floor in cdm.floors:
@@ -229,6 +265,9 @@ class ProjectExporter:
             fd.pop("pipes", None)
             fd.pop("nodes", None)
             fd.pop("hydrants", None)
+            # rect_corners 为 None 时剔除（保持旧导出格式，旧数据无此键）
+            if fd.get("rect_corners") is None:
+                fd.pop("rect_corners", None)
             floors_data.append(fd)
 
         # 将duplicate_risers_by_floor中的RiserData转为ID
@@ -268,13 +307,45 @@ class ProjectExporter:
             "sprinkler_k_overrides": list(cdm.sprinkler_k_overrides),
             "manual_dn_pipes": list(cdm.manual_dn_pipes),
             "current_project_dir": cdm.current_project_dir or "",
+            "building_data": copy.deepcopy(cdm.building_data),
+            "building_order": copy.deepcopy(cdm.building_order),
+            "connection_points": [dataclasses.asdict(cp) for cp in cdm.connection_points],
+            "connection_counters": dict(cdm.connection_counters),
+            "calibration_rects": [
+                {
+                    "rect_id": r.rect_id,
+                    "base_building_id": r.base_building_id,
+                    "target_building_id": r.target_building_id,
+                    "target_floor_name": r.target_floor_name,
+                    "pairings": [list(p) for p in r.pairings],
+                    "is_calibrated": r.is_calibrated,
+                    "is_spliced": r.is_spliced,
+                    "transform_dx": r.transform_dx,
+                    "transform_dy": r.transform_dy,
+                    "transform_angle": r.transform_angle,
+                    "rect_min_x": r.rect_min_x,
+                    "rect_min_y": r.rect_min_y,
+                    "rect_max_x": r.rect_max_x,
+                    "rect_max_y": r.rect_max_y,
+                }
+                for r in cdm.calibration_rects
+            ],
         }
 
     def _export_config(self) -> dict:
-        """获取当前设置页面的内存配置。"""
+        """获取当前设置页面的内存配置。
+
+        system_type 以读取 CAD 时的自动检测结果（live_config）为准覆盖：
+        方案配置中残留的旧值（如 indoor_hydrant）会导致导入后计算类型错误。
+        """
         if self.settings_page and hasattr(self.settings_page, "current_config"):
-            return copy.deepcopy(self.settings_page.current_config)
-        return copy.deepcopy(self.cfg.get_current_config())
+            cfg = copy.deepcopy(self.settings_page.current_config)
+        else:
+            cfg = copy.deepcopy(self.cfg.get_current_config())
+        live = self.cfg.get_live_config()
+        if live and live.get("system_type"):
+            cfg["system_type"] = live["system_type"]
+        return cfg
 
     def _export_materials(self) -> dict:
         return {"materials": copy.deepcopy(self.mat.materials)}
@@ -319,6 +390,7 @@ class ProjectExporter:
             "show_node_ids": pp.show_node_ids.get(),
             "show_pipe_id": pp.show_pipe_id.get(),
             "show_elevation": pp.show_elevation.get(),
+            "show_connection_id_var": pp.show_connection_id_var.get(),
             "show_node_pressure": pp.show_node_pressure.get(),
             "show_occlusion_var": pp.show_occlusion_var.get(),
             "show_riser_warning": pp.show_riser_warning.get(),
@@ -388,6 +460,12 @@ class ProjectExporter:
             "redo_count": len(pp.redo_stack),
         }
 
+    def _export_elevation_materials(self) -> dict:
+        """导出标高管材分段（内存状态，纯读取不修改）。"""
+        if self.settings_page and hasattr(self.settings_page, "elevation_materials"):
+            return copy.deepcopy(self.settings_page.elevation_materials)
+        return {"enabled": False, "segments": [], "outdoor_material": ""}
+
 
 # ---------------------------------------------------------------------------
 # ProjectImporter —— 导入
@@ -412,16 +490,28 @@ class ProjectImporter:
         # 1. 验证
         manifest = self._read_json(export_dir, "manifest.json")
         if manifest is None:
-            logger.error("导入失败：manifest.json 不存在或损坏")
+            messagebox.showerror("导入失败", "项目中的 manifest.json 文件不存在或已损坏")
             return False
 
         if manifest.get("version", "") != "1.0":
             logger.warning(f"导出版本 {manifest.get('version')} 与当前版本 1.0 不一致，尝试导入")
 
+        # 检查区域管网模式是否匹配
+        exported_region = manifest.get("region_mode_enabled", False)
+        current_region = self.cfg.get_global_setting("region_mode_enabled", False)
+        if exported_region != current_region:
+            mode_str = {True: "区域管网模式", False: "普通模式"}
+            messagebox.showerror(
+                "导入失败",
+                f"导出时为【{mode_str[exported_region]}】，当前为【{mode_str[current_region]}】。\n\n"
+                f"请先在「设置页面」将管网模式切换到【{mode_str[exported_region]}】，再重新导入。"
+            )
+            return False
+
         # 2. 按顺序加载
         cad_data = self._read_json(export_dir, "cad_data.json")
         if cad_data is None:
-            logger.error("导入失败：cad_data.json 不存在或损坏")
+            messagebox.showerror("导入失败", "项目中的 cad_data.json 文件不存在或已损坏")
             return False
 
         self._load_cad_data(cad_data)
@@ -449,6 +539,11 @@ class ProjectImporter:
         selection_state = self._read_json(export_dir, "selection_state.json")
         if selection_state:
             self._load_selection_state(selection_state)
+
+        # 标高管材分段：纯恢复内存状态（管道管材已含在 cad_data.json 中，不做任何管道操作）
+        elev_mat = self._read_json(export_dir, "elevation_materials.json")
+        if elev_mat is not None:
+            self._load_elevation_materials(elev_mat)
 
         # 3. 标记导入模式
         self.cdm.is_loaded = True
@@ -505,6 +600,7 @@ class ProjectImporter:
             PipeData, NodeData, SupplyNodeData,
             DemandNodeData, DemandGroupData,
             ValveData, HydrantData, RiserData, FloorData,
+            ConnectionPointData, CalibrationRectData,
         )
 
         # 2. 重建主列表
@@ -516,7 +612,9 @@ class ProjectImporter:
             cdm.pipe_by_id[pipe.pipe_id] = pipe
 
         for item in data.get("nodes", []):
+            extra = item.pop("_extra_attrs", None)
             node = _dict_to_dataclass(NodeData, item, "NodeData")
+            _restore_node_extra_attrs(node, extra)
             cdm.nodes.append(node)
             cdm.node_by_id[node.node_id] = node
 
@@ -558,30 +656,37 @@ class ProjectImporter:
 
         for fdata in data.get("floors", []):
             fname = fdata["name"]
+            fbid = fdata.get("building_id", "")
+            # 使用与导出时一致的复合键查找（兼容旧版导出文件使用纯楼层名）
+            fkey = f"{fbid}|{fname}" if fbid else fname
             # 移除自动生成的 fields（dataclass 的 field 默认值）
             fdata.pop("pipes", None)
             fdata.pop("nodes", None)
             fdata.pop("hydrants", None)
+            fdata.setdefault("pipe_z_offset_set", False)  # 兼容旧导出文件
             floor = _dict_to_dataclass(FloorData, fdata, "FloorData")
 
-            # 按ID恢复引用
+            # 按ID恢复引用（先尝试复合键，回退纯楼层名）
+            pipe_ids = floor_pipe_ids.get(fkey) or floor_pipe_ids.get(fname, [])
+            node_ids = floor_node_ids.get(fkey) or floor_node_ids.get(fname, [])
+            hydrant_ids = floor_hydrant_ids.get(fkey) or floor_hydrant_ids.get(fname, [])
             floor.pipes = [
                 cdm.pipe_by_id[pid]
-                for pid in floor_pipe_ids.get(fname, [])
+                for pid in pipe_ids
                 if pid in cdm.pipe_by_id
             ]
             floor.nodes = [
                 cdm.node_by_id[nid]
-                for nid in floor_node_ids.get(fname, [])
+                for nid in node_ids
                 if nid in cdm.node_by_id
             ]
             floor.hydrants = [
                 cdm.hydrant_by_id[hid]
-                for hid in floor_hydrant_ids.get(fname, [])
+                for hid in hydrant_ids
                 if hid in cdm.hydrant_by_id
             ]
             cdm.floors.append(floor)
-            cdm.floor_by_name[fname] = floor
+            cdm.floor_by_name[cdm._make_floor_key(fname, floor.building_id)] = floor
 
         # 4. 恢复其他状态
         cdm.grouped_floors_map = data.get("grouped_floors_map", {})
@@ -606,13 +711,55 @@ class ProjectImporter:
         cdm.sprinkler_k_overrides = set(data.get("sprinkler_k_overrides", []))
         cdm.manual_dn_pipes = set(data.get("manual_dn_pipes", []))
         cdm.current_project_dir = data.get("current_project_dir") or None
+        cdm.building_data = data.get("building_data", {})
+        # 兼容旧导出：ZT 室外管网缺省补基准属性（基准判定统一检查 is_base）
+        if "ZT" in cdm.building_data:
+            cdm.building_data["ZT"]["is_base"] = True
+        cdm.building_order = data.get("building_order", [])
+        cdm.connection_points = [
+            _dict_to_dataclass(ConnectionPointData, item, "ConnectionPointData")
+            for item in data.get("connection_points", [])
+        ]
+        cdm.connection_counters = data.get("connection_counters", {})
+        cdm.calibration_rects = []
+        for rdata in data.get("calibration_rects", []):
+            r = CalibrationRectData(
+                rect_id=rdata["rect_id"],
+                base_building_id=rdata.get("base_building_id", ""),
+                target_building_id=rdata.get("target_building_id", ""),
+                target_floor_name=rdata.get("target_floor_name", ""),
+                pairings=[tuple(p) for p in rdata.get("pairings", [])],
+                is_calibrated=rdata.get("is_calibrated", False),
+                is_spliced=rdata.get("is_spliced", False),
+                transform_dx=rdata.get("transform_dx", 0.0),
+                transform_dy=rdata.get("transform_dy", 0.0),
+                transform_angle=rdata.get("transform_angle", 0.0),
+                rect_min_x=rdata.get("rect_min_x", 0.0),
+                rect_min_y=rdata.get("rect_min_y", 0.0),
+                rect_max_x=rdata.get("rect_max_x", 0.0),
+                rect_max_y=rdata.get("rect_max_y", 0.0),
+            )
+            cdm.calibration_rects.append(r)
+        # 旧数据迁移：rect 未标记但 building 已标记 → 视为已拼接
+        for r in cdm.calibration_rects:
+            if not r.is_spliced and cdm.building_data.get(r.target_building_id, {}).get("is_spliced"):
+                r.is_spliced = True
 
     def _load_config(self, data: dict):
-        """恢复配置到ConfigManager。"""
+        """恢复配置到ConfigManager。
+
+        system_type 按 CAD 数据重新判定（图纸有喷头 → 喷淋，否则消火栓），
+        兼容旧导出包中写错的 system_type（如喷淋图纸却存 indoor_hydrant）。
+        """
+        cfg = copy.deepcopy(data)
+        if self.cdm and getattr(self.cdm, "sprinkler_s_node_ids", None):
+            cfg["system_type"] = "sprinkler"
+        else:
+            cfg["system_type"] = "indoor_hydrant"
         # 用导入的配置覆盖"临时方案"，确保下次启动可见
-        self.cfg.save_temp_scheme(copy.deepcopy(data))
+        self.cfg.save_temp_scheme(cfg)
         # 同时设为live_config
-        self.cfg.set_live_config(copy.deepcopy(data))
+        self.cfg.set_live_config(cfg)
 
     def _load_materials(self, data: dict):
         """恢复管材数据。"""
@@ -655,6 +802,7 @@ class ProjectImporter:
             "show_node_ids": pp.show_node_ids,
             "show_pipe_id": pp.show_pipe_id,
             "show_elevation": pp.show_elevation,
+            "show_connection_id_var": pp.show_connection_id_var,
             "show_node_pressure": pp.show_node_pressure,
             "show_occlusion_var": pp.show_occlusion_var,
             "show_riser_warning": pp.show_riser_warning,
@@ -666,8 +814,8 @@ class ProjectImporter:
             if key in data:
                 var.set(data[key])
 
-        # if "current_view_mode" in data:
-        #     pp.current_view_mode = data["current_view_mode"]
+        if "current_view_mode" in data:
+            pp.current_view_mode = data["current_view_mode"]
         if "global_view_angle" in data:
             pp.global_view_angle = data["global_view_angle"]
         if "global_view_elevation" in data:
@@ -693,6 +841,18 @@ class ProjectImporter:
 
         pp._sep_cache_key = None
         pp._cached_grouped_floors_map = None
+
+        # 恢复楼栋视角状态
+        if "building_states" in data and hasattr(pp, '_building_managers'):
+            for bid, st in data["building_states"].items():
+                mgr = pp._building_managers.get(bid)
+                if mgr:
+                    mgr.current_floor_name = st.get("current_floor_name")
+                    mgr.current_view_mode = st.get("current_view_mode")
+                    mgr.floor_view_state = {
+                        k: tuple(v) if isinstance(v, list) else v
+                        for k, v in st.get("floor_view_state", {}).items()
+                    }
 
         # 检修区恢复
         if "maintenance_zones" in data:
@@ -743,3 +903,31 @@ class ProjectImporter:
         # 撤销栈无法恢复，清空
         pp.undo_stack.clear()
         pp.redo_stack.clear()
+
+    def _load_elevation_materials(self, data: dict):
+        """恢复标高管材分段到设置页内存（纯读取，不做任何管道操作：
+        管道管材已含在 cad_data.json 中，导入后数据是什么就是什么）。"""
+        sp = self.app.settings_page if self.app else None
+        if sp is None or not hasattr(sp, "elevation_materials"):
+            return
+        segments = data.get("segments", [])
+        if not isinstance(segments, list):
+            segments = []
+        cleaned = []
+        for seg in segments[:3]:
+            if not isinstance(seg, dict):
+                continue
+            cleaned.append({
+                "material": seg.get("material", "") or "",
+                "lower": seg.get("lower"),
+                "upper": seg.get("upper"),
+            })
+        # 补齐默认三行（缺行时用默认管材/留空：行1镀锌、行2加厚、行3无缝）
+        defaults = ["镀锌钢管", "加厚钢管", "无缝钢管"]
+        while len(cleaned) < 3:
+            cleaned.append({"material": defaults[len(cleaned)], "lower": None, "upper": None})
+        sp.elevation_materials = {
+            "enabled": bool(data.get("enabled", False)),
+            "segments": cleaned,
+            "outdoor_material": data.get("outdoor_material", "") or "",
+        }
