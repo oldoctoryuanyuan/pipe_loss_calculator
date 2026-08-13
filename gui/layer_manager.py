@@ -157,23 +157,35 @@ class LayerManager:
         """包装frame的grid方法"""
         self.frame.grid(**kwargs)
         
-class MultiLayerManager(ttk.LabelFrame):
-    """多图层管理器：同时管理横管、立管、立管标注图层"""
-    def __init__(self, parent, config_manager, callbacks):
-        super().__init__(parent, text="图层设置")
+class MultiLayerManager(ttk.Frame):
+    """多图层管理器：可管理任意类型（图层/图块）的多值输入+历史"""
+    def __init__(self, parent, config_manager, callbacks=None,
+                 types=None, history_prefix="layers"):
+        super().__init__(parent)
         self.config_manager = config_manager
-        self.callbacks = callbacks
+        self.callbacks = callbacks or {}
+        self.types = types or [
+            ('pipe', '横管图层'),
+            ('riser', '立管图层'),
+            ('riser_note', '立管标注图层'),
+        ]
+        self.history_prefix = history_prefix
         self.widgets = {}
         self.create_widgets()
         self.load_history()
 
+    def _history_key(self, key):
+        """获取指定类型的完整历史键名"""
+        prefix = self.widgets.get(key, {}).get('history_prefix', self.history_prefix)
+        return f"history_{prefix}_{key}"
+
     def create_widgets(self):
-        types = [
-            ('pipe', '横管图层'),
-            ('riser', '立管图层'),
-            ('riser_note', '立管标注图层')
-        ]
-        for key, label_text in types:
+        for item in self.types:
+            if len(item) >= 3:
+                key, label_text, key_prefix = item
+            else:
+                key, label_text = item
+                key_prefix = self.history_prefix
             # 输入行
             input_frame = ttk.Frame(self)
             input_frame.pack(fill='x', padx=5, pady=(5 if key=='pipe' else 2, 0))
@@ -184,7 +196,7 @@ class MultiLayerManager(ttk.LabelFrame):
             # 历史行
             hist_frame = ttk.Frame(self)
             hist_frame.pack(fill='x', padx=5, pady=(0, 2))
-            ttk.Label(hist_frame, text=f"历史图层:").pack(side='left', padx=(0,5))
+            ttk.Label(hist_frame, text=f"历史名称:").pack(side='left', padx=(0,5))
             hist_container = ttk.Frame(hist_frame)
             hist_container.pack(side='left', fill='x', expand=True)
             
@@ -192,14 +204,15 @@ class MultiLayerManager(ttk.LabelFrame):
                 'entry_var': entry_var,
                 'entry': entry,
                 'hist_container': hist_container,
-                'history': []
+                'history': [],
+                'history_prefix': key_prefix,
             }
             entry.bind('<FocusOut>', lambda e, k=key: self.process_entry(k))
             entry.bind('<Return>', lambda e, k=key: self.process_entry(k))
 
     def load_history(self):
         for key in self.widgets:
-            history_key = f"history_layers_{key}"
+            history_key = self._history_key(key)
             self.widgets[key]['history'] = self.config_manager.get_global_setting(history_key, [])
             self.update_history_display(key)
 
@@ -208,22 +221,22 @@ class MultiLayerManager(ttk.LabelFrame):
         entry_text = entry_var.get().strip()
         if not entry_text:
             return
-        new_layers = [l.strip() for l in entry_text.split(',') if l.strip()]
-        if not new_layers:
+        new_items = [l.strip() for l in entry_text.split(',') if l.strip()]
+        if not new_items:
             return
-        history_key = f"history_layers_{key}"
+        history_key = self._history_key(key)
         current_history = self.widgets[key]['history']
-        for layer in new_layers:
-            if layer and layer not in current_history:
-                current_history.append(layer)
+        for item in new_items:
+            if item and item not in current_history:
+                current_history.append(item)
                 full_history = self.config_manager.get_global_setting(history_key, [])
-                if layer not in full_history:
-                    full_history.append(layer)
+                if item not in full_history:
+                    full_history.append(item)
                     self.config_manager.update_global_setting(history_key, full_history)
         self.widgets[key]['history'] = current_history
         self.update_history_display(key)
         if self.callbacks and key in self.callbacks:
-            self.callbacks[key](new_layers)
+            self.callbacks[key](new_items)
 
     def update_history_display(self, key):
         hist_container = self.widgets[key]['hist_container']
@@ -255,7 +268,7 @@ class MultiLayerManager(ttk.LabelFrame):
         self.widgets[key]['entry'].focus_set()
 
     def delete_history_layer(self, layer, key):
-        history_key = f"history_layers_{key}"
+        history_key = self._history_key(key)
         full_history = self.config_manager.get_global_setting(history_key, [])
         if layer in full_history:
             full_history.remove(layer)

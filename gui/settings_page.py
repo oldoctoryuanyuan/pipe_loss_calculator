@@ -1,7 +1,7 @@
 # pipe_loss_calculator/gui/settings_page.py
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, messagebox
+from tkinter import ttk, filedialog, messagebox
 from config.config_manager import ConfigManager
 from config.material_manager import MaterialManager
 from .layer_manager import MultiLayerManager
@@ -51,9 +51,23 @@ class SettingsPage(ttk.Frame):
         
         self.is_loading_cad = False
         self.loading_status_var = tk.StringVar(value="等待读取")
+        self.region_mode_var = tk.BooleanVar(
+            value=self.config_manager.get_global_setting("region_mode_enabled", False)
+        )
 
         # 当前内存中的配置（不自动保存到方案）
         self.current_config = {}
+
+        # 标高管材分段（内存持有，导出项目时同步导出；不写入通用json）
+        self.elevation_materials = {
+            "enabled": False,
+            "segments": [
+                {"material": "镀锌钢管", "lower": None, "upper": None},
+                {"material": "加厚钢管", "lower": None, "upper": None},
+                {"material": "无缝钢管", "lower": None, "upper": None},
+            ],
+            "outdoor_material": "K9球墨铸铁管",
+        }
         
         # 创建滚动容器
         self.create_scrollable_container()
@@ -63,9 +77,6 @@ class SettingsPage(ttk.Frame):
         
         # 创建所有控件
         self.create_widgets()
-        
-        # 绑定方案切换事件
-        self.bind_events()
         
         # 初始加载数据
         self.update_all_widgets()
@@ -79,10 +90,6 @@ class SettingsPage(ttk.Frame):
         # 使用深拷贝确保每个方案的配置完全独立
         self.current_config = copy.deepcopy(scheme_config)
     
-    def save_current_config(self):
-        """保存当前内存配置到当前方案"""
-        self.config_manager.update_current_config(self.current_config)
-
     def create_scrollable_container(self):
         """创建可滚动的容器"""
         # 创建画布和滚动条
@@ -179,6 +186,10 @@ class SettingsPage(ttk.Frame):
         
         # 强制设置初始分隔位置
         self.after(100, lambda: self.set_initial_paned_position(main_paned))
+        
+        # 启动时若上次为区域模式，更新状态提示
+        if self.region_mode_var.get():
+            self.loading_status_var.set("进入区域管网模式")
     
     def set_initial_paned_position(self, paned_window):
         """设置 PanedWindow 的初始分隔位置"""
@@ -199,47 +210,6 @@ class SettingsPage(ttk.Frame):
     
     def create_left_panel(self, parent):
         """创建左面板内容"""
-        # 方案管理区域
-        scheme_frame = ttk.LabelFrame(parent, text="方案管理")
-        scheme_frame.pack(fill="x", padx=5, pady=(0, 10))
-        
-        ttk.Label(scheme_frame, text="当前方案:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        
-        # 方案下拉框（不显示临时方案）
-        self.scheme_combo = ttk.Combobox(
-            scheme_frame,
-            values=self.config_manager.get_visible_schemes(),
-            state="readonly",
-            width=20
-        )
-        self.scheme_combo.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        
-        # 保存按钮
-        ttk.Button(
-            scheme_frame,
-            text="保存",
-            command=self.save_as_new_scheme,
-            width=6
-        ).grid(row=0, column=2, padx=2, pady=5)
-        
-        # 更新按钮
-        ttk.Button(
-            scheme_frame,
-            text="更新",
-            command=self.update_current_scheme,
-            width=6
-        ).grid(row=0, column=3, padx=2, pady=5)
-        
-        # 删除按钮
-        ttk.Button(
-            scheme_frame,
-            text="删除",
-            command=self.delete_current_scheme,
-            width=6
-        ).grid(row=0, column=4, padx=2, pady=5)
-        
-        scheme_frame.grid_columnconfigure(1, weight=1)
-        
         # CAD文件设置区域
         cad_frame = ttk.LabelFrame(parent, text="CAD文件设置（需在autocad中同步打开需计算的cad文件）")
         cad_frame.pack(fill="x", padx=5, pady=(0, 10))
@@ -278,15 +248,14 @@ class SettingsPage(ttk.Frame):
         )
         dxf_read_check.pack(side="left", padx=(0, 10))
 
-        # 预处理复选框（放在左侧）
-        self.preprocess_var = tk.BooleanVar(value=self.current_config.get("preprocess_cad", False))
-        preprocess_check = ttk.Checkbutton(
+        # 区域管网模式复选框
+        self.region_mode_check = ttk.Checkbutton(
             row2,
-            text="预处理",
-            variable=self.preprocess_var,
-            command=lambda: self.on_config_change("preprocess_cad", self.preprocess_var.get())
+            text="区域管网模式",
+            variable=self.region_mode_var,
+            command=self._on_region_mode_toggle
         )
-        preprocess_check.pack(side="left", padx=(0, 10))
+        self.region_mode_check.pack(side="left", padx=(0, 10))
         
         # 读取按钮
         self.load_button = ttk.Button(
@@ -308,31 +277,13 @@ class SettingsPage(ttk.Frame):
         # 为读取按钮添加 tooltip
         ToolTip(self.load_button, "需要多端点多段线拆分和跨线分割时，勾选预处理框")
         
-        # 第三行：局部水损比例和管网类型选择（同一行）
+        # 第三行：管网类型选择（同一行）
         row3 = ttk.Frame(cad_frame)
         row3.pack(fill="x", padx=10, pady=(0, 5))
         
-        # 局部水损比例
-        ttk.Label(row3, text="局部水损比例:").pack(side="left", padx=(0,5))
-        self.local_loss_ratio_var = tk.StringVar(value=str(self.current_config.get("local_loss_ratio", 0.3)))
-        local_loss_entry = ttk.Entry(row3, textvariable=self.local_loss_ratio_var, width=6)
-        local_loss_entry.pack(side="left", padx=(0,10))
-        local_loss_entry.bind("<FocusOut>", lambda e: self.on_config_change("local_loss_ratio", float(self.local_loss_ratio_var.get())))
-        
-        # 管网类型
-        ttk.Label(row3, text="管网类型:").pack(side="left", padx=(10,5))
-        self.system_type_var = tk.StringVar(value=self.current_config.get("system_type", "outdoor_hydrant"))
-        # 室外消火栓
-        ttk.Radiobutton(row3, text="室外消火栓", variable=self.system_type_var,
-                        value="outdoor_hydrant", command=self.on_system_type_changed).pack(side="left", padx=5)
-        # 室内消火栓
-        ttk.Radiobutton(row3, text="室内消火栓", variable=self.system_type_var,
-                        value="indoor_hydrant", command=self.on_system_type_changed).pack(side="left", padx=5)
-        # 喷淋
-        ttk.Radiobutton(row3, text="喷淋", variable=self.system_type_var,
-                        value="sprinkler", command=self.on_system_type_changed).pack(side="left", padx=5)
-      
-        # 多图层管理（横管、立管、立管标注）
+        # 图层图块设置（合并）
+        combined_frame = ttk.LabelFrame(parent, text="图层图块设置")
+
         def on_pipe_layers(layers):
             self.on_config_change("pipe_layers", layers)
         def on_riser_layers(layers):
@@ -341,15 +292,58 @@ class SettingsPage(ttk.Frame):
             self.on_config_change("riser_note_layers", layers)
 
         self.multi_layer_manager = MultiLayerManager(
-            parent,
+            combined_frame,
             self.config_manager,
             callbacks={
                 'pipe': on_pipe_layers,
                 'riser': on_riser_layers,
-                'riser_note': on_riser_note_layers
+                'riser_note': on_riser_note_layers,
             }
         )
-        self.multi_layer_manager.pack(fill="x", padx=5, pady=(0, 10))
+        self.multi_layer_manager.pack(fill="x", padx=5, pady=(5, 0))
+
+        ttk.Separator(combined_frame, orient="horizontal").pack(fill="x", padx=20, pady=5)
+
+        def on_valve_block(values):
+            self.on_config_change("valve_block_name", ", ".join(values))
+        def on_hydrant_block(values):
+            self.on_config_change("hydrant_block_name", ", ".join(values))
+        def on_sprinkler_block(values):
+            self.on_config_change("sprinkler_block_name", ", ".join(values))
+
+        self.multi_block_manager = MultiLayerManager(
+            combined_frame,
+            self.config_manager,
+            callbacks={
+                'valve': on_valve_block,
+                'hydrant': on_hydrant_block,
+                'sprinkler': on_sprinkler_block,
+            },
+            types=[
+                ('valve', '阀门块名'),
+                ('hydrant', '消火栓块名'),
+                ('sprinkler', '喷头块名'),
+            ],
+            history_prefix="blocks"
+        )
+        self.multi_block_manager.pack(fill="x", padx=5, pady=(0, 5))
+
+        align_frame = ttk.Frame(combined_frame)
+        align_frame.pack(fill="x", padx=5, pady=(0, 5))
+        ttk.Label(align_frame, text="对齐点块名:").pack(side="left")
+        self.align_block_var = tk.StringVar(value=self.current_config.get("align_block_name", "Floorbase"))
+        align_entry = ttk.Entry(align_frame, textvariable=self.align_block_var)
+        align_entry.pack(side="left", fill="x", expand=True, padx=(5, 10))
+        align_entry.bind("<FocusOut>",
+                         lambda e: self.on_config_change("align_block_name", self.align_block_var.get()))
+        ttk.Label(align_frame, text="属性字段:").pack(side="left")
+        self.align_attr_var = tk.StringVar(value=self.current_config.get("align_attribute_name", "Elevation"))
+        attr_entry = ttk.Entry(align_frame, textvariable=self.align_attr_var)
+        attr_entry.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        attr_entry.bind("<FocusOut>",
+                        lambda e: self.on_config_change("align_attribute_name", self.align_attr_var.get()))
+
+        combined_frame.pack(fill="x", padx=5, pady=(0, 10))
 
         # 单位与管材设置（合并）
         unit_material_frame = ttk.LabelFrame(parent, text="单位与管材设置")
@@ -419,9 +413,13 @@ class SettingsPage(ttk.Frame):
         # 列5：管材管理按钮 + 管材下拉框（按钮在上，下拉框在下）
         unit_col5 = ttk.Frame(columns_frame)
         unit_col5.pack(side="left", padx=5, fill="y", expand=True)
-        # 管理按钮
-        manage_btn = ttk.Button(unit_col5, text="管理", command=self.manage_materials, width=8)
-        manage_btn.pack(anchor="w", pady=(0, 5))
+        # 按钮行：管材C值（原"管理"按钮）+ 局部水损系数
+        btn_row5 = ttk.Frame(unit_col5)
+        btn_row5.pack(anchor="w", pady=(0, 5))
+        manage_btn = ttk.Button(btn_row5, text="管材C值", command=self.manage_materials, width=8)
+        manage_btn.pack(side="left")
+        ttk.Button(btn_row5, text="局部水损系数", command=self.edit_local_loss_coeffs, width=11).pack(side="left", padx=(5, 0))
+        ttk.Button(btn_row5, text="标高管材", command=self.edit_elevation_materials, width=9).pack(side="left", padx=(5, 0))
         # 管材下拉框（移除标签）
         self.material_var = tk.StringVar(value=self.current_config.get("pipe_material", "镀锌钢管"))
         self.material_combo = ttk.Combobox(
@@ -457,67 +455,7 @@ class SettingsPage(ttk.Frame):
 
         unit_material_frame.bind("<Configure>", update_tolerance_wraplength)
         
-        # 图块设置区域
-        block_frame = ttk.LabelFrame(parent, text="图块设置")
-        block_frame.pack(fill="x", padx=5, pady=(0, 10))
 
-        # 创建一个网格布局，3列（阀门+消火栓、对齐点、喷头）
-        block_row = ttk.Frame(block_frame)
-        block_row.pack(fill="x", padx=5, pady=5)
-        for i in range(3):
-            block_row.columnconfigure(i, weight=1)
-
-        # 阀门图块列
-        valve_col = ttk.Frame(block_row)
-        valve_col.grid(row=0, column=0, padx=5, sticky="nsew")
-        valve_row1 = ttk.Frame(valve_col)
-        valve_row1.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(valve_row1, text="阀门块名:").pack(side="left")
-        self.valve_block_var = tk.StringVar(value=self.current_config.get("valve_block_name", "valve"))
-        valve_entry = ttk.Entry(valve_row1, textvariable=self.valve_block_var)
-        valve_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        valve_entry.bind("<FocusOut>",
-                         lambda e: self.on_config_change("valve_block_name", self.valve_block_var.get()))
-        valve_row2 = ttk.Frame(valve_col)
-        valve_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(valve_row2, text="消火栓名:").pack(side="left")
-        self.hydrant_block_var = tk.StringVar(value=self.current_config.get("hydrant_block_name", "hydrant"))
-        hydrant_entry = ttk.Entry(valve_row2, textvariable=self.hydrant_block_var)
-        hydrant_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        hydrant_entry.bind("<FocusOut>",
-                        lambda e: self.on_config_change("hydrant_block_name", self.hydrant_block_var.get()))
-
-        # 对齐点图块列
-        align_col = ttk.Frame(block_row)
-        align_col.grid(row=0, column=1, padx=5, sticky="nsew")
-        align_row1 = ttk.Frame(align_col)
-        align_row1.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(align_row1, text="对齐点块:").pack(side="left")
-        self.align_block_var = tk.StringVar(value=self.current_config.get("align_block_name", "Floorbase"))
-        align_entry = ttk.Entry(align_row1, textvariable=self.align_block_var)
-        align_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        align_entry.bind("<FocusOut>",
-                         lambda e: self.on_config_change("align_block_name", self.align_block_var.get()))
-        align_row2 = ttk.Frame(align_col)
-        align_row2.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(align_row2, text="属性字段:").pack(side="left")
-        self.align_attr_var = tk.StringVar(value=self.current_config.get("align_attribute_name", "Elevation"))
-        align_attr_entry = ttk.Entry(align_row2, textvariable=self.align_attr_var)
-        align_attr_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        align_attr_entry.bind("<FocusOut>",
-                              lambda e: self.on_config_change("align_attribute_name", self.align_attr_var.get()))
-
-        # 喷头图块列
-        sprinkler_col = ttk.Frame(block_row)
-        sprinkler_col.grid(row=0, column=2, padx=5, sticky="nsew")
-        s_row1 = ttk.Frame(sprinkler_col)
-        s_row1.pack(anchor="w", pady=(0, 2), fill="x")
-        ttk.Label(s_row1, text="喷头块名:").pack(side="left")
-        self.sprinkler_block_var = tk.StringVar(value=self.current_config.get("sprinkler_block_name", ""))
-        sprinkler_entry = ttk.Entry(s_row1, textvariable=self.sprinkler_block_var)
-        sprinkler_entry.pack(side="left", padx=(5, 0), fill="x", expand=True)
-        sprinkler_entry.bind("<FocusOut>",
-                             lambda e: self.on_config_change("sprinkler_block_name", self.sprinkler_block_var.get()))
 
 
         # 计算公式区域
@@ -557,6 +495,9 @@ class SettingsPage(ttk.Frame):
         self.hak_var = tk.StringVar(value=str(self.current_config.get("hydrant_Hak", 2.0)))
         self.max_velocity_var = tk.StringVar(value=str(self.current_config.get("max_velocity", 5.0)))
         self.min_velocity_var = tk.StringVar(value=str(self.current_config.get("min_velocity", 2.0)))
+        self.up_pipe_len_var = tk.StringVar(value=str(self.current_config.get("sprinkler_up_pipe_len", 0.6)))
+        self.down_pipe_len_var = tk.StringVar(value=str(self.current_config.get("sprinkler_down_pipe_len", 0.2)))
+        self.pressure_tol_var = tk.StringVar(value=str(self.current_config.get("pressure_tolerance", 0.1)))
         
         # 喷头K输入框改为Combobox，可输入可选择
         k_combo = ttk.Combobox(param_frame, textvariable=self.k_var, values=[80, 115, 161, 200, 202, 242, 320, 363], width=8, state='readonly')
@@ -571,6 +512,18 @@ class SettingsPage(ttk.Frame):
         min_v_entry = ttk.Entry(param_frame, textvariable=self.min_velocity_var, width=8)
         max_v_entry.grid(row=1, column=5, padx=5, pady=2)
         min_v_entry.grid(row=1, column=6, padx=5, pady=2)
+
+        # 喷头短立管长度输入框单独一行（避免被遮挡）
+        ttk.Label(param_frame, text="上喷短管长度(m):").grid(row=2, column=0, sticky="e", padx=5, pady=2)
+        up_len_entry = ttk.Entry(param_frame, textvariable=self.up_pipe_len_var, width=8)
+        up_len_entry.grid(row=2, column=1, sticky="w", padx=5, pady=2)
+        ttk.Label(param_frame, text="下喷短管长度(m):").grid(row=2, column=2, sticky="e", padx=5, pady=2)
+        down_len_entry = ttk.Entry(param_frame, textvariable=self.down_pipe_len_var, width=8)
+        down_len_entry.grid(row=2, column=3, sticky="w", padx=5, pady=2)
+        # 计算结果允许误差（模式C二分主判据：最不利用水点超压≤该值即终止，缺省0.1m）
+        ttk.Label(param_frame, text="计算结果允许误差(m):").grid(row=2, column=4, sticky="e", padx=5, pady=2)
+        tol_entry = ttk.Entry(param_frame, textvariable=self.pressure_tol_var, width=8)
+        tol_entry.grid(row=2, column=5, sticky="w", padx=5, pady=2)
         
         max_v_entry.bind("<FocusOut>", lambda e: self.on_velocity_changed())
         min_v_entry.bind("<FocusOut>", lambda e: self.on_velocity_changed())
@@ -606,7 +559,9 @@ class SettingsPage(ttk.Frame):
 
         for var, key in [(self.k_var, "sprinkler_K"), (self.ad_var, "hydrant_Ad"),
                          (self.ld_var, "hydrant_Ld"), (self.b_var, "hydrant_B"),
-                         (self.hak_var, "hydrant_Hak")]:
+                         (self.hak_var, "hydrant_Hak"), (self.up_pipe_len_var, "sprinkler_up_pipe_len"),
+                         (self.down_pipe_len_var, "sprinkler_down_pipe_len"),
+                         (self.pressure_tol_var, "pressure_tolerance")]:
             var.trace('w', lambda *a, v=var, k=key: on_param_change(v, k))
         
 
@@ -639,15 +594,17 @@ class SettingsPage(ttk.Frame):
 
         parent.bind("<Configure>", update_note_wraplength)
         
-    def bind_events(self):
-        """绑定事件"""
-        self.scheme_combo.bind("<<ComboboxSelected>>", self.on_scheme_changed)
-    
     def on_config_change(self, key: str, value):
         """配置发生变化时更新内存配置"""
         self.current_config[key] = value
+        new = copy.deepcopy(self.current_config)
+        # 非系统类型改动时保留读取 CAD 时的自动检测结果（防止检测值被方案旧值覆盖）
+        if key != "system_type":
+            live = self.config_manager.get_live_config()
+            if live and live.get("system_type"):
+                new["system_type"] = live["system_type"]
         # 同步到config_manager的live_config
-        self.config_manager.set_live_config(self.current_config)
+        self.config_manager.set_live_config(new)
         # 如果更改的是单位，通知所有页面
         if key in ['flow_unit', 'pressure_unit']:
             root = self.winfo_toplevel()
@@ -657,17 +614,11 @@ class SettingsPage(ttk.Frame):
     def on_material_changed(self):
         """管材类型变化处理"""
         material = self.material_var.get()
-        old_material = self.current_config.get("pipe_material")
         self.on_config_change("pipe_material", material)
         self.color_table.set_material(material)
         self.update_all_material_combos()
-        # 如果管材改变了，并且已有CAD数据加载，则更新所有管道的材料
-        if material != old_material and self.cad_data_manager.is_loaded:
-            self.cad_data_manager.update_all_pipes_material(material)
-            # 刷新各页面
-            root = self.winfo_toplevel()
-            if hasattr(root, 'main_app'):
-                root.main_app.refresh_all_pages()
+        # 注意：切换管材只影响后续读取CAD时的默认管材，
+        # 已读入管道的管材/内径保持CAD读入时状态，不作更改
     
     def on_tolerance_changed(self):
         """容差变化处理"""
@@ -707,6 +658,157 @@ class SettingsPage(ttk.Frame):
             self.config_manager.update_global_setting("last_cad_file", file_path)
             self.loading_status_var.set("已选择文件，点击'读取CAD数据'按钮开始读取")
     
+    def _on_region_mode_toggle(self):
+        """区域管网模式复选框切换"""
+        new_state = self.region_mode_var.get()
+        self.config_manager.update_global_setting("region_mode_enabled", new_state)
+
+        if new_state:
+            # 进入区域管网模式
+            if self.cad_data_manager and self.cad_data_manager.is_loaded:
+                result = messagebox.askyesno(
+                    "确认操作",
+                    "此操作相当于重启程序，将删除内存中的所有数据，且无法撤销。",
+                    icon="warning"
+                )
+                if result:
+                    self._clear_and_enter_region_mode("进入区域管网模式")
+                else:
+                    self.region_mode_var.set(False)
+                    self.config_manager.update_global_setting("region_mode_enabled", False)
+            else:
+                self.loading_status_var.set("进入区域管网模式")
+        else:
+            # 退出区域管网模式
+            if self.cad_data_manager and self.cad_data_manager.is_loaded:
+                result = messagebox.askyesno(
+                    "确认操作",
+                    "此操作相当于重启程序，将删除内存中的所有数据，且无法撤销。",
+                    icon="warning"
+                )
+                if result:
+                    self._clear_and_enter_region_mode("退出区域管网模式")
+                else:
+                    self.region_mode_var.set(True)
+                    self.config_manager.update_global_setting("region_mode_enabled", True)
+            else:
+                self.loading_status_var.set("退出区域管网模式")
+
+    def _clear_and_enter_region_mode(self, status_text: str):
+        """清空所有数据并更新状态"""
+        self.cad_data_manager.clear_all_data()
+        self.loading_status_var.set(status_text)
+        root = self.winfo_toplevel()
+        if hasattr(root, 'main_app'):
+            root.main_app.reset_calculation_and_preview()
+            root.main_app.update_status()
+            # 刷新所有数据页面
+            for name in ['管道', '节点', '阀门', '供水点和用水点']:
+                if name in root.main_app.pages:
+                    root.main_app.pages[name].refresh_data()
+
+    def _prompt_building_id(self) -> str | None:
+        """弹出楼栋ID输入对话框（区域模式专用）。返回楼栋ID或None（取消）"""
+        import re
+        dialog = tk.Toplevel(self)
+        dialog.title("楼栋信息")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.update_idletasks()
+        w, h = 450, 240
+        pw = self.winfo_toplevel().winfo_width()
+        ph = self.winfo_toplevel().winfo_height()
+        px = self.winfo_toplevel().winfo_x()
+        py = self.winfo_toplevel().winfo_y()
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        result = {'id': '', 'confirmed': False}
+
+        id_frame = ttk.Frame(dialog, padding=10)
+        id_frame.pack(fill='x')
+        ttk.Label(id_frame, text="楼栋ID：").pack(side='left')
+        id_var = tk.StringVar()
+        id_entry = ttk.Entry(id_frame, textvariable=id_var, width=20)
+        id_entry.pack(side='left', padx=(10, 0))
+        id_entry.focus_set()
+
+        outdoor_frame = ttk.Frame(dialog, padding=10)
+        outdoor_frame.pack(fill='x')
+        outdoor_var = tk.BooleanVar(value=False)
+        outdoor_check = ttk.Checkbutton(
+            outdoor_frame,
+            text="标记为室外管网",
+            variable=outdoor_var,
+            command=lambda: _on_outdoor_toggle()
+        )
+        outdoor_check.pack(side='left')
+        if 'ZT' in self.cad_data_manager.building_data:
+            outdoor_check.config(state='disabled')
+
+        def _on_outdoor_toggle():
+            if outdoor_var.get():
+                id_var.set('ZT')
+                id_entry.config(state='disabled')
+            else:
+                id_var.set('')
+                id_entry.config(state='normal')
+
+        # 管网类型选择
+        type_frame = ttk.Frame(dialog, padding=10)
+        type_frame.pack(fill='x')
+        ttk.Label(type_frame, text="管网类型:").pack(side='left')
+        # 区域单体缺省为室内消火栓（不沿用当前配置——当前配置可能是上次读入单体的类型）
+        sys_type_var = tk.StringVar(value="indoor_hydrant")
+        for text, val in [("室外消火栓", "outdoor_hydrant"), ("室内消火栓", "indoor_hydrant"), ("喷淋", "sprinkler")]:
+            ttk.Radiobutton(type_frame, text=text, variable=sys_type_var,
+                            value=val).pack(side='left', padx=5)
+
+        type_name_map = {"outdoor_hydrant": "室外消火栓", "indoor_hydrant": "室内消火栓", "sprinkler": "喷淋"}
+        type_hint = ttk.Label(dialog, text=f"⚠ 当前管网类型：室内消火栓（务必与CAD图纸一致）",
+                              foreground="red", padding=(10, 0))
+        type_hint.pack(fill='x')
+
+        def _on_type_changed(*_):
+            """单选按钮变化时同步更新警示文字"""
+            type_hint.config(
+                text=f"⚠ 当前管网类型：{type_name_map.get(sys_type_var.get(), '未知')}（务必与CAD图纸一致）")
+
+        for child in type_frame.winfo_children():
+            if isinstance(child, ttk.Radiobutton):
+                child.configure(command=_on_type_changed)
+        sys_type_var.trace_add("write", _on_type_changed)
+
+        error_label = ttk.Label(dialog, text="", foreground="red", padding=10)
+        error_label.pack(fill='x')
+
+        def _on_ok():
+            bid = id_var.get().strip()
+            if not re.match(r'^[a-zA-Z0-9_]+$', bid):
+                error_label.config(text="楼栋ID格式错误：仅允许字母、数字、下划线")
+                return
+            if bid in self.cad_data_manager.building_data:
+                error_label.config(text=f"楼栋ID '{bid}' 已存在，请换一个")
+                return
+            result['id'] = bid
+            # 保存管网类型到配置
+            self.current_config["system_type"] = sys_type_var.get()
+            self.on_config_change("system_type", sys_type_var.get())
+            result['confirmed'] = True
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog, padding=10)
+        btn_frame.pack(fill='x')
+        ttk.Button(btn_frame, text="确定", command=_on_ok).pack(side='right', padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side='right', padx=5)
+        dialog.bind('<Return>', lambda e: _on_ok())
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return result['id'] if result['confirmed'] else None
+
     def load_cad_data(self):
         """读取CAD数据"""
         if self.is_loading_cad:
@@ -721,11 +823,28 @@ class SettingsPage(ttk.Frame):
         if not os.path.exists(cad_file):
             self.loading_status_var.set("错误：文件不存在")
             return
+
+        is_region = self.region_mode_var.get()
+        building_id = ""
+        if is_region:
+            building_id = self._prompt_building_id()
+            if building_id is None:
+                return
+            # 检查文件是否已作为其他单体读入
+            existing_bid = self.cad_data_manager.get_building_id_by_file(cad_file)
+            if existing_bid is not None and existing_bid != building_id:
+                if not messagebox.askyesno("提示",
+                        f"此CAD文件已作为单体「{existing_bid}」读入。\n"
+                        f"是否继续以新楼栋号「{building_id}」读入？"):
+                    return
+                # 移除旧关联，后续 load_cad_file 会写入新关联
+                if building_id in self.cad_data_manager.building_file_paths:
+                    del self.cad_data_manager.building_file_paths[building_id]
         
         # 禁用按钮，防止重复点击
         self.is_loading_cad = True
         self.load_button.config(state=tk.DISABLED)
-        self.loading_status_var.set("正在读取CAD文件...")
+        self.loading_status_var.set(f"[{building_id}] 正在读取CAD文件..." if building_id else "正在读取CAD文件...")
         self.update_idletasks()  # 强制更新UI
         
         # 在新线程中读取
@@ -733,9 +852,14 @@ class SettingsPage(ttk.Frame):
         
         def load_cad_thread():
             try:
+                # 在线程内设置 _building_id，防止早期 return 未清理
+                if building_id:
+                    self.cad_data_manager._building_id = building_id
                 # 定义进度回调，通过 after 更新UI
                 def progress_callback(message):
-                    self.after(0, lambda: self.loading_status_var.set(message))
+                    self.after(0, lambda msg=message: self.loading_status_var.set(
+                        f"[{building_id}] {msg}" if building_id else msg
+                    ))
                 # 调用CAD数据管理器加载文件
                 success = self.cad_data_manager.load_cad_file(
                     cad_file, 
@@ -749,17 +873,58 @@ class SettingsPage(ttk.Frame):
                     pipes_count = summary.get("管道数量", 0)
                     nodes_count = summary.get("节点数量", 0)
                     
+                    prefix = f"[{building_id}] " if building_id else ""
+                    # 管件画图错误分析（每栋读取完毕即弹非模态列表）
+                    error_items = []
+                    try:
+                        from core.fitting_analyzer import analyze_fittings
+                        # 区域模式逐单体读取：只分析当前单体的管道（ID带"{building_id}_"前缀），
+                        # 避免重复提示其它已读单体的画图错误。
+                        pipe_ids = None
+                        if building_id:
+                            pipe_ids = {
+                                p.pipe_id for p in self.cad_data_manager.pipes
+                                if p.pipe_id.startswith(f"{building_id}_")
+                            }
+                        analysis = analyze_fittings(self.cad_data_manager, pipe_ids=pipe_ids)
+                        error_items = list(analysis.error_nodes)
+                        # 缓存自环管道列表供计算时直接读取（避免重复分析）；
+                        # 区域模式只缓存当前单体的自环管道（避免覆盖其它单体的缓存）
+                        if building_id:
+                            current_self_loops = set(getattr(
+                                self.cad_data_manager, 'self_loop_pipes', []) or [])
+                            current_self_loops.update(analysis.self_loop_pipes)
+                            self.cad_data_manager.self_loop_pipes = list(current_self_loops)
+                        else:
+                            self.cad_data_manager.self_loop_pipes = list(analysis.self_loop_pipes)
+                        # 自环管道（起点=终点）：不阻塞计算但需提醒用户修复CAD
+                        for pid in analysis.self_loop_pipes:
+                            pipe = self.cad_data_manager.pipe_by_id.get(pid)
+                            node_id = pipe.start_node_id if pipe else ""
+                            length = f"，长度{pipe.length:.3f}m" if pipe else ""
+                            error_items.append(
+                                (node_id, f"自环管道{pid}（起点=终点{length}），请在CAD中检查该管道"))
+                    except Exception:
+                        error_items = []
                     # 在主线程中更新UI
                     self.after(0, lambda: self.show_load_result(
                         True, 
-                        f"成功读取 {pipes_count} 条管道，{nodes_count} 个节点"
+                        f"{prefix}成功读取 {pipes_count} 条管道，{nodes_count} 个节点"
                     ))
+                    if error_items:
+                        from gui.fitting_error_dialog import show_fitting_error_dialog
+                        self.after(0, lambda items=error_items: show_fitting_error_dialog(
+                            self.winfo_toplevel(), items))
                 else:
-                    self.after(0, lambda: self.show_load_result(False, "CAD文件读取失败"))
+                    prefix = f"[{building_id}] " if building_id else ""
+                    self.after(0, lambda: self.show_load_result(False, f"{prefix}CAD文件读取失败"))
                 
             except Exception as e:
                 error_msg = str(e)
                 self.after(0, lambda: self.show_load_result(False, f"读取出错: {error_msg}"))
+            finally:
+                if building_id:
+                    self.cad_data_manager._building_id = ""
         
         # 启动读取线程
         thread = threading.Thread(target=load_cad_thread, daemon=True)
@@ -780,9 +945,11 @@ class SettingsPage(ttk.Frame):
             root = self.winfo_toplevel()
             if hasattr(root, 'main_app'):
                 root.main_app.update_status()
-            root.main_app.reset_calculation_and_preview()
-            if '供水点和用水点' in root.main_app.pages:
-                root.main_app.pages['供水点和用水点'].refresh_data()
+            if not self.region_mode_var.get():
+                root.main_app.reset_calculation_and_preview()
+            for name in ['管道', '节点', '阀门', '供水点和用水点']:
+                if name in root.main_app.pages:
+                    root.main_app.pages[name].refresh_data()
             if '管网预览' in root.main_app.pages:
                 root.main_app.pages['管网预览'].refresh_data()
         else:
@@ -791,23 +958,6 @@ class SettingsPage(ttk.Frame):
      
 
 
-    def on_scheme_changed(self, event=None):
-        """方案选择变化"""
-        scheme_name = self.scheme_combo.get()
-        if scheme_name in self.config_manager.get_visible_schemes():
-            # 重要：这里不再保存到临时方案！
-            # 直接切换方案
-            self.config_manager.set_current_scheme(scheme_name)
-            
-            # 重新加载配置
-            self.load_current_config()
-            
-            # 更新所有控件
-            self.update_all_widgets()
-            
-            # 更新方案下拉框
-            self.scheme_combo.set(scheme_name)
-    
     def update_all_widgets(self):
         """更新所有控件显示"""
         # 更新CAD文件路径
@@ -832,27 +982,24 @@ class SettingsPage(ttk.Frame):
         self.material_var.set(material)
         
         # 更新图块设置
-        self.valve_block_var.set(self.current_config.get("valve_block_name", "valve"))
+        self.multi_block_manager.set_entry_text('valve', self.current_config.get("valve_block_name", "valve"))
+        self.multi_block_manager.set_entry_text('hydrant', self.current_config.get("hydrant_block_name", "hydrant"))
+        self.multi_block_manager.set_entry_text('sprinkler', self.current_config.get("sprinkler_block_name", ""))
         self.align_block_var.set(self.current_config.get("align_block_name", "Floorbase"))
         self.align_attr_var.set(self.current_config.get("align_attribute_name", "Elevation"))
-        self.sprinkler_block_var.set(self.current_config.get("sprinkler_block_name", ""))
 
         
         # 更新计算设置
         self.tolerance_var.set(str(self.current_config.get("tolerance", 10.0)))
-        self.local_loss_ratio_var.set(str(self.current_config.get("local_loss_ratio", 0.3)))
         
         # 更新颜色管径对照表
         self.color_table.set_material(material)
-        self.preprocess_var.set(self.current_config.get("preprocess_cad", False))
         self.dxf_read_var.set(self.current_config.get("use_dxf_read", False))
         
         # 更新新增的配置
-        self.hydrant_block_var.set(self.current_config.get("hydrant_block_name", "hydrant"))
         self.max_velocity_var.set(str(self.current_config.get("max_velocity", 5.0)))
         self.min_velocity_var.set(str(self.current_config.get("min_velocity", 2.0)))
-        self.system_type_var.set(self.current_config.get("system_type", "outdoor_hydrant"))
-        
+
 
     def update_all_material_combos(self):
         """更新所有管材下拉框"""
@@ -905,68 +1052,311 @@ class SettingsPage(ttk.Frame):
                 self.material_var.set(materials[0])
                 self.on_material_changed()
 
-    def update_current_scheme(self):
-        """更新当前方案"""
-        # 获取当前输入框中的图层
-        current_layers = self.layer_manager.get_current_layers()
-        if current_layers:
-            self.on_config_change("pipe_layers", current_layers)
-        
-        # 获取方案名称
-        scheme_name = self.scheme_combo.get()
-        
-        try:
-            # 保存到当前方案（使用深拷贝）
-            self.config_manager.update_current_config(copy.deepcopy(self.current_config))
-            # 可选：显示成功消息
-            # messagebox.showinfo("成功", f"方案 '{scheme_name}' 已更新")
-        except Exception as e:
-            messagebox.showerror("错误", str(e))
-    
-    def save_as_new_scheme(self):
-        """保存为新方案"""
-        # 获取当前输入框中的图层
-        current_layers = self.layer_manager.get_current_layers()
-        if current_layers:
-            self.on_config_change("pipe_layers", current_layers)
-        
-        # 获取新方案名称
-        scheme_name = simpledialog.askstring("新方案", "请输入新方案名称:")
-        
-        if scheme_name and scheme_name.strip():
-            scheme_name = scheme_name.strip()
-            
+    def edit_local_loss_coeffs(self):
+        """局部水损系数对话框：3x2表格（消火栓/喷淋 x 局部水损比例法/当量长度法/支状喷淋倒推法）
+
+        当前计算使用 A1 单元格（消火栓-局部水损比例法）的值，其余单元格备用；
+        第三行「支状喷淋倒推法」仅喷淋适用：消火栓列显示"—"且不可编辑。
+        修改经"确定"保存到 config.json，可记住用户设置。
+        """
+        cfg = self.current_config
+
+        def get_value(new_key, old_key, default):
+            if new_key in cfg:
+                return cfg[new_key]
+            if old_key and old_key in cfg:
+                return cfg[old_key]
+            return default
+
+        values = {
+            "row1": (get_value("local_loss_ratio_hydrant", "local_loss_method_ratio", 0.3),
+                     get_value("local_loss_ratio_sprinkler", None, 0.5)),
+            "row2": (get_value("equiv_len_ratio_hydrant", None, 0.1),
+                     get_value("equiv_len_ratio_sprinkler", "equiv_length_method_ratio", 0.05)),
+            "row3": ("—", get_value("tz_ratio_sprinkler", None, 0.015)),
+        }
+
+        dialog = tk.Toplevel(self)
+        dialog.title("局部水损系数")
+        dialog.geometry("400x230")
+        self.center_dialog(dialog)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        table = ttk.Treeview(dialog, columns=("A", "B"), show="tree headings", height=3)
+        table.heading("#0", text="计算方法")
+        table.heading("A", text="消火栓局部水损")
+        table.heading("B", text="喷淋局部水损")
+        table.column("#0", width=130, anchor="center")
+        table.column("A", width=120, anchor="center")
+        table.column("B", width=120, anchor="center")
+        table.insert("", "end", iid="row1", text="局部水损比例法",
+                     values=(values["row1"][0], values["row1"][1]))
+        table.insert("", "end", iid="row2", text="当量长度法",
+                     values=(values["row2"][0], values["row2"][1]))
+        table.insert("", "end", iid="row3", text="支状喷淋倒推法",
+                     values=(values["row3"][0], values["row3"][1]))
+        table.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+
+        tip = ttk.Label(dialog, text="双击单元格修改数值（支状喷淋倒推法仅喷淋适用）",
+                        foreground="#666666")
+        tip.pack(anchor="w", padx=10, pady=(0, 5))
+
+        # 双击编辑单元格（模式参考 supply_demand_module 的树双击编辑）
+        def on_double_click(event):
+            region = table.identify("region", event.x, event.y)
+            if region not in ("cell", "tree"):
+                return
+            item_id = table.identify_row(event.y)
+            col = table.identify_column(event.x)
+            if not item_id or not col.startswith("#"):
+                return
+            col_index = 1 if col == "#1" else 2  # #0 为行名不可编辑
+            if col == "#0":
+                return
+            if item_id == "row3" and col == "#1":
+                return  # 支状喷淋倒推法仅喷淋可用：消火栓列"—"锁定不可修改
+            x, y, width, height = table.bbox(item_id, col)
+            if not x:
+                return
+            current_value = table.set(item_id, col)
+            edit_var = tk.StringVar(value=current_value)
+            edit_entry = ttk.Entry(table, textvariable=edit_var, width=width // 8)
+            edit_entry.place(x=x, y=y, width=width, height=height)
+            edit_entry.focus_set()
+            edit_entry.select_range(0, tk.END)
+
+            def save_edit(event=None):
+                new_text = edit_var.get().strip()
+                edit_entry.destroy()
+                try:
+                    float(new_text)
+                except ValueError:
+                    table.set(item_id, col, current_value)
+                    return
+                table.set(item_id, col, new_text)
+
+            def cancel_edit(event=None):
+                edit_entry.destroy()
+
+            edit_entry.bind("<Return>", save_edit)
+            edit_entry.bind("<FocusOut>", save_edit)
+            edit_entry.bind("<Escape>", cancel_edit)
+
+        table.bind("<Double-1>", on_double_click)
+
+        def save_and_close():
             try:
-                # 添加新方案（使用深拷贝）
-                self.config_manager.add_scheme(scheme_name, copy.deepcopy(self.current_config))
-                
-                # 更新方案下拉框
-                self.scheme_combo['values'] = self.config_manager.get_visible_schemes()
-                self.scheme_combo.set(scheme_name)
-                
-                # 可选：显示成功消息
-                # messagebox.showinfo("成功", f"方案 '{scheme_name}' 已保存")
-            except ValueError as e:
-                messagebox.showerror("错误", str(e))
-    
-    def delete_current_scheme(self):
-        """删除当前方案"""
-        scheme_name = self.scheme_combo.get()
-        
-        if scheme_name == "默认方案":
-            messagebox.showwarning("警告", "不能删除默认方案")
+                new_vals = {
+                    "local_loss_ratio_hydrant": float(table.set("row1", "A")),      # A1 当前计算使用
+                    "local_loss_ratio_sprinkler": float(table.set("row1", "B")),    # B1 备用
+                    "equiv_len_ratio_hydrant": float(table.set("row2", "A")),       # A2 备用
+                    "equiv_len_ratio_sprinkler": float(table.set("row2", "B")),     # B2 备用
+                    "tz_ratio_sprinkler": float(table.set("row3", "B")),            # B3 支状喷淋倒推法
+                }
+            except ValueError:
+                messagebox.showerror("错误", "所有单元格必须是有效数字", parent=dialog)
+                return
+            for key, value in new_vals.items():
+                self.current_config[key] = value
+            self.config_manager.set_live_config(self.current_config)
+            for key, value in new_vals.items():
+                self.config_manager.update_current_config(key, value)
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(0, 10))
+        ttk.Button(btn_frame, text="确定", command=save_and_close, width=10).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy, width=10).pack(side="left", padx=5)
+
+    def edit_elevation_materials(self):
+        """标高管材分段对话框。
+
+        加压管网底部压力最大、顶部最小：行1~3 管材按承压从低到高固定排列
+        （行1 镀锌、行2 加厚、行3 无缝），标高范围表达式与之配套——
+        承压最低的行1 对应最高标高段（压力最小），承压最高的行3 对应最低标高段（压力最大）：
+          行1：H > [下限]（[下限] < H）
+          行2：[下限] < H ≤ [上限]
+          行3：H ≤ [上限]
+        管材留空 = 该行不生效；输入框留空 = 该端不限。
+        行4 为室外管网专属（管材下拉可用，标高列不可用，显示"不参与标高分段"）。
+        顶部「启用标高管材」复选框：
+        - 打开时记录快照；确定时按快照与当前状态对比分派
+          （内容未变 → 仅保存；勾选 → 应用；取消勾选且原本勾选 → 恢复统一管材）；
+        - 「取消」按钮不保存任何修改。
+        """
+        materials = self.material_manager.get_materials()
+        if not materials:
+            messagebox.showwarning("无管材", "管材列表为空，请先添加管材", parent=self)
             return
-        
-        if messagebox.askyesno("确认删除", f"确定要删除方案 '{scheme_name}' 吗？"):
-            self.config_manager.delete_scheme(scheme_name)
-            
-            # 更新方案下拉框
-            self.scheme_combo['values'] = self.config_manager.get_visible_schemes()
-            
-            # 切换到默认方案
-            self.scheme_combo.set("默认方案")
-            self.on_scheme_changed()
-    
+
+        # 打开时快照（对比用）
+        initial = copy.deepcopy(self.elevation_materials)
+        cur = self.elevation_materials
+
+        dialog = tk.Toplevel(self)
+        dialog.title("标高管材分段")
+        dialog.geometry("520x300")
+        self.center_dialog(dialog)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        # 启用复选框
+        enabled_var = tk.BooleanVar(value=bool(cur.get("enabled", False)))
+        enable_chk = ttk.Checkbutton(dialog, text="启用标高管材（按标高分段赋予不同管材）",
+                                     variable=enabled_var)
+        enable_chk.pack(anchor="w", padx=10, pady=(10, 5))
+
+        tip = ttk.Label(dialog,
+                        text="说明：低标高层压力最大，请将承压高的管材放在低标高分段。\n"
+                             "H 为楼面标高；管材留空表示该分段不生效。",
+                        foreground="#666666", justify="left")
+        tip.pack(anchor="w", padx=10, pady=(0, 5))
+
+        # 分段表格区（常驻控件）：行1~3 室内分段（承压从低到高：镀锌/加厚/无缝），行4 室外管网（标高不可用）
+        segs = cur.get("segments", [])
+        default_segs = [
+            {"material": "镀锌钢管", "lower": None, "upper": None},
+            {"material": "加厚钢管", "lower": None, "upper": None},
+            {"material": "无缝钢管", "lower": None, "upper": None},
+        ]
+        seg_data = [
+            segs[i] if i < len(segs) else default_segs[i] for i in range(3)
+        ]
+
+        grid = ttk.Frame(dialog)
+        grid.pack(fill="x", padx=10, pady=(0, 5))
+
+        # 表头
+        ttk.Label(grid, text="分段", width=8).grid(row=0, column=0, padx=(0, 8), pady=2)
+        ttk.Label(grid, text="管材", width=12).grid(row=0, column=1, padx=(0, 8), pady=2)
+        ttk.Label(grid, text="标高范围(m)", width=26).grid(row=0, column=2, pady=2)
+
+        row_names = ["行1", "行2", "行3"]
+        # 行1（镀锌，承压最低）: 下限 < H（最高段，压力最小）
+        # 行2（加厚）        : 下限 < H ≤ 上限
+        # 行3（无缝，承压最高）: H ≤ 上限（最低段，压力最大）
+        row_modes = ["lower_only", "both", "upper_only"]
+        seg_vars = []       # [StringVar(material), StringVar(lower), StringVar(upper)]
+        combos = []
+        for i, name in enumerate(row_names):
+            seg = seg_data[i]
+            ttk.Label(grid, text=name, width=8).grid(row=i + 1, column=0, padx=(0, 8), pady=2)
+            mat_var = tk.StringVar(value=seg.get("material", "") or "")
+            combo = ttk.Combobox(grid, textvariable=mat_var, values=materials,
+                                 state="readonly", width=12)
+            combo.grid(row=i + 1, column=1, padx=(0, 8), pady=2)
+            combos.append(combo)
+
+            lower_var = tk.StringVar(
+                value="" if seg.get("lower") is None else str(seg["lower"]))
+            upper_var = tk.StringVar(
+                value="" if seg.get("upper") is None else str(seg["upper"]))
+
+            range_frame = ttk.Frame(grid)
+            range_frame.grid(row=i + 1, column=2, pady=2, sticky="w")
+            mode = row_modes[i]
+            if mode == "lower_only":
+                # [下限] < H
+                e1 = ttk.Entry(range_frame, textvariable=lower_var, width=8)
+                e1.pack(side="left")
+                ttk.Label(range_frame, text="< H").pack(side="left", padx=(4, 0))
+            elif mode == "both":
+                # [下限] < H ≤ [上限]
+                e1 = ttk.Entry(range_frame, textvariable=lower_var, width=8)
+                e1.pack(side="left")
+                ttk.Label(range_frame, text="< H ≤").pack(side="left", padx=(4, 0))
+                e2 = ttk.Entry(range_frame, textvariable=upper_var, width=8)
+                e2.pack(side="left", padx=(4, 0))
+            else:
+                # H ≤ [上限]
+                ttk.Label(range_frame, text="H ≤").pack(side="left")
+                e = ttk.Entry(range_frame, textvariable=upper_var, width=8)
+                e.pack(side="left", padx=(4, 0))
+
+            seg_vars.append((mat_var, lower_var, upper_var))
+
+        # 行4：室外管网（管材下拉可用，标高不可用），默认 K9球墨铸铁管
+        ttk.Label(grid, text="室外管网", width=8).grid(row=4, column=0, padx=(0, 8), pady=2)
+        outdoor_default = cur.get("outdoor_material", "") or ""
+        if not outdoor_default and materials:
+            k9 = next((m for m in materials if "K9" in m or "铸铁" in m), "")
+            outdoor_default = k9
+        outdoor_var = tk.StringVar(value=outdoor_default)
+        ttk.Combobox(grid, textvariable=outdoor_var, values=materials,
+                     state="readonly", width=12).grid(row=4, column=1, padx=(0, 8), pady=2)
+        ttk.Label(grid, text="室外管网不参与标高分段", foreground="#999999"
+                  ).grid(row=4, column=2, pady=2, sticky="w")
+
+        def build_state():
+            """从控件读取当前编辑内容（未保存）"""
+            new_segs = []
+            for mat_var, lower_var, upper_var in seg_vars:
+                lower_s = lower_var.get().strip()
+                upper_s = upper_var.get().strip()
+                new_segs.append({
+                    "material": mat_var.get().strip(),
+                    "lower": float(lower_s) if lower_s else None,
+                    "upper": float(upper_s) if upper_s else None,
+                })
+            outdoor = outdoor_var.get().strip()
+            return new_segs, outdoor
+
+        def apply_or_restore(new_segs, outdoor):
+            """按快照与当前状态对比分派：应用 / 恢复 / 仅保存"""
+            cdm = self.cad_data_manager
+            if not cdm or not getattr(cdm, "is_loaded", False):
+                return
+            try:
+                if enabled_var.get():
+                    count = cdm.apply_elevation_materials(new_segs, outdoor)
+                    if count:
+                        messagebox.showinfo("标高管材",
+                                            f"已按标高管材分段更新 {count} 条管道的管材。\n"
+                                            f"请重新进行水力计算以获取新结果。",
+                                            parent=dialog)
+                elif initial.get("enabled"):
+                    count = cdm.restore_uniform_material()
+                    if count:
+                        messagebox.showinfo("标高管材",
+                                            f"已恢复 {count} 条管道为统一管材。\n"
+                                            f"请重新进行水力计算以获取新结果。",
+                                            parent=dialog)
+            except Exception as e:
+                logger = __import__("logging").getLogger(__name__)
+                logger.error(f"标高管材应用失败: {e}", exc_info=True)
+                messagebox.showerror("应用失败", f"标高管材应用失败:\n{e}", parent=dialog)
+
+        def save_and_close():
+            try:
+                new_segs, outdoor = build_state()
+            except ValueError:
+                messagebox.showerror("错误", "标高必须是数字或留空", parent=dialog)
+                return
+            new_enabled = enabled_var.get()
+            # 快照与当前对比：内容未变且勾选状态未变 → 仅保存
+            changed = (new_enabled != initial.get("enabled")
+                       or outdoor != initial.get("outdoor_material")
+                       or new_segs != initial.get("segments"))
+            cur["enabled"] = new_enabled
+            cur["segments"] = new_segs
+            cur["outdoor_material"] = outdoor
+            if changed:
+                apply_or_restore(new_segs, outdoor)
+            # 刷新所有页面（管材变化影响表格/预览显示）
+            root = self.winfo_toplevel()
+            if hasattr(root, "main_app") and changed:
+                try:
+                    root.main_app.refresh_all_pages()
+                except Exception:
+                    pass
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=(0, 10))
+        ttk.Button(btn_frame, text="确定", command=save_and_close, width=10).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy, width=10).pack(side="left", padx=5)
+
     def manage_materials(self):
         """管理管材对话框（简化版，只管理基本信息）"""
         dialog = tk.Toplevel(self)
@@ -1578,6 +1968,3 @@ class SettingsPage(ttk.Frame):
             self.max_velocity_var.set(str(self.current_config.get("max_velocity", 5.0)))
             self.min_velocity_var.set(str(self.current_config.get("min_velocity", 2.0)))
     
-    def on_system_type_changed(self):
-        """系统类型变化时保存配置"""
-        self.on_config_change("system_type", self.system_type_var.get())

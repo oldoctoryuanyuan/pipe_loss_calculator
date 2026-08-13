@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
 import logging
+from gui.building_tab_manager import BuildingTabManager
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ class NodePage(ttk.Frame):
         self.cad_data_manager = cad_data_manager
         
         self.node_data = []
+        self.building_tabs = BuildingTabManager(self, cad_data_manager)
         self.create_widgets()
         self.setup_context_menu()
     
@@ -34,9 +36,10 @@ class NodePage(ttk.Frame):
         # )
         # refresh_btn.pack(side=tk.LEFT, padx=2)
         
+        self.building_tabs.build()
         # 节点数据表格
         self.create_node_table()
-
+    
     def create_node_table(self):
         """创建节点数据表格"""
         style = ttk.Style()
@@ -70,11 +73,11 @@ class NodePage(ttk.Frame):
             label="跳转至楼层预览",
             command=self.jump_to_node_floor
         )
-        self.context_menu.add_separator()
         self.context_menu.add_command(
-            label="刷新",
-            command=self.refresh_data
+            label="跳转至拼接预览",
+            command=self.jump_to_node_spliced
         )
+        self.context_menu.add_separator()
         
         # 绑定右键事件
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -83,23 +86,21 @@ class NodePage(ttk.Frame):
         """刷新节点数据（静默模式）"""
         try:
             if not self.cad_data_manager.is_loaded:
-                # 不显示弹窗，只清空表格
                 for item in self.tree.get_children():
                     self.tree.delete(item)
+                self.node_data = []
+                self.building_tabs.rebuild_tabs()
                 return
             
-            # 直接从 CADDataManager 获取最新节点数据
             self.node_data = self.cad_data_manager.nodes
+            self.building_tabs.rebuild_tabs()
 
-            # 关键修改：确保用水点节点的状态从需求组同步
             for node in self.node_data:
-                # 检查是否为用水点
                 if node.node_type and node.node_type.startswith("用水点"):
-                    # 查找对应的需求节点
                     for group_id, group in self.cad_data_manager.demand_groups.items():
                         for demand_node in group.demand_nodes:
                             if demand_node.node_id == node.node_id:
-                                # 同步状态
+                                # 同步显示状态（检修/勾选时 demand_node.status 与 node.status 已双向一致）
                                 node.status = demand_node.status
                                 break
 
@@ -111,9 +112,15 @@ class NodePage(ttk.Frame):
     
     def update_table(self):
         """更新表格数据（仅当列数变化时才重设列，否则只更新行）"""
+        bid = self.building_tabs.current_id
+        display_data = self.node_data
+        if bid is not None:
+            prefix = bid + '_'
+            display_data = [n for n in display_data if n.node_id.startswith(prefix)]
+        
         # 1. 计算当前所需最大连接管道数
         max_connections = 0
-        for node in self.node_data:
+        for node in display_data:
             conn_len = len(node.connected_pipes) if node.connected_pipes else 0
             if conn_len > max_connections:
                 max_connections = conn_len
@@ -135,7 +142,7 @@ class NodePage(ttk.Frame):
             self.tree.delete(item)
 
         # 5. 插入新数据（列数已确定）
-        for node in self.node_data:
+        for node in display_data:
             values = [
                 node.node_id,
                 node.status,
@@ -199,3 +206,23 @@ class NodePage(ttk.Frame):
         preview = self._switch_to_preview()[0]
         if preview:
             preview.jump_to_node(values[0], to_global=False)
+
+    def jump_to_node_spliced(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()[0]
+        if preview:
+            preview.jump_to_spliced_view(entity_type="node", entity_id=values[0])
+
+    def _on_delete_building(self, building_id: str):
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if not main_app:
+            return
+        preview = main_app.pages.get("管网预览")
+        if preview:
+            preview._on_delete_building(building_id)

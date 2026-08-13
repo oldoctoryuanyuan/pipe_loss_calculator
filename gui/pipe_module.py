@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 import os
 
 import logging
+from gui.building_tab_manager import BuildingTabManager
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +21,14 @@ class PipePage(ttk.Frame):
         self.status_callback = status_callback
         
         self.pipe_data = []
+        self.building_tabs = BuildingTabManager(self, cad_data_manager)
         self.create_widgets()
         self.setup_context_menu()
     
     def create_widgets(self):
         """创建界面控件"""
         
+        self.building_tabs.build()
         # 管道数据表格
         self.create_pipe_table()
     
@@ -68,7 +71,7 @@ class PipePage(ttk.Frame):
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
         # 配置无效行样式
         self.tree.tag_configure('inactive', foreground='gray')
-    
+
     def setup_context_menu(self):
         """设置右键菜单"""
         self.context_menu = tk.Menu(self, tearoff=0)
@@ -81,23 +84,26 @@ class PipePage(ttk.Frame):
             label="跳转至楼层预览",
             command=self.jump_to_pipe_floor
         )
-        self.context_menu.add_separator()
         self.context_menu.add_command(
-            label="刷新",
-            command=self.refresh_data
+            label="跳转至拼接预览",
+            command=self.jump_to_pipe_spliced
         )
+        self.context_menu.add_separator()
         
         # 绑定右键事件
         self.tree.bind("<Button-3>", self.show_context_menu)
     def refresh_data(self):
         """刷新管道数据"""
         if not self.cad_data_manager.is_loaded:
-            if self.status_callback:
-                self.status_callback("请先在设置页面读取CAD数据", is_error=True)
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.pipe_data = []
+            self.building_tabs.rebuild_tabs()
             return
         
         try:
             self.pipe_data = self.cad_data_manager.pipes
+            self.building_tabs.rebuild_tabs()
             self.update_table()
             
             if len(self.pipe_data) == 0:
@@ -114,8 +120,14 @@ class PipePage(ttk.Frame):
         for item in self.tree.get_children():
             self.tree.delete(item)
         
+        bid = self.building_tabs.current_id
+        data = self.pipe_data
+        if bid is not None:
+            prefix = bid + '_'
+            data = [p for p in data if p.pipe_id.startswith(prefix)]
+        
         # 添加新数据
-        for pipe in self.pipe_data:
+        for pipe in data:
             values = (
                 pipe.pipe_id,
                 pipe.start_node_id,
@@ -172,3 +184,23 @@ class PipePage(ttk.Frame):
         preview = self._switch_to_preview()
         if preview:
             preview.jump_to_pipe(values[0], to_global=False)
+
+    def jump_to_pipe_spliced(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_spliced_view(entity_type="pipe", entity_id=values[0])
+
+    def _on_delete_building(self, building_id: str):
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if not main_app:
+            return
+        preview = main_app.pages.get("管网预览")
+        if preview:
+            preview._on_delete_building(building_id)

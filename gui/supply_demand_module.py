@@ -309,13 +309,21 @@ class SupplyDemandPage(ttk.Frame):
             width = col_widths.get(col, 100)
             tree.column(col, width=width, anchor="center")
 
-        # 添加数据
+        # 添加数据（优先显示计算结果：节点ID -> raw_flow/raw_pressure；无计算结果时回退原值）
+        node_map = self._get_calc_result_map()
         for node in group.demand_nodes:
+            info = node_map.get(node.node_id)
+            if info:
+                flow_val = info.get("raw_flow", 0.0)
+                pressure_val = info.get("raw_pressure", 0.0)
+            else:
+                flow_val = node.flow
+                pressure_val = node.pressure
             tree.insert("", tk.END, values=(
                 node.node_id,
                 node.status,
-                f"{node.flow:.2f}",
-                f"{node.pressure:.2f}"
+                f"{flow_val:.2f}",
+                f"{pressure_val:.2f}"
             ))
 
         tree.pack(fill=tk.BOTH, expand=True, padx=5, pady=(0, 5))
@@ -347,6 +355,19 @@ class SupplyDemandPage(ttk.Frame):
                 self.update_demand_table_display(group_obj)
                 break
     
+    def _get_calc_result_map(self) -> dict:
+        """获取计算页面的节点结果映射（节点ID -> raw_flow/raw_pressure），无计算结果时返回空字典"""
+        try:
+            root = self.winfo_toplevel()
+            main_app = getattr(root, 'main_app', None)
+            if main_app:
+                calc_page = main_app.pages.get('计算')
+                if calc_page:
+                    return getattr(calc_page, '_node_result_map', {}) or {}
+        except Exception:
+            pass
+        return {}
+
     def update_demand_table_display(self, group):
         """只更新指定组的表格显示，不刷新整个页面"""
         if hasattr(group, 'tree_widget'):
@@ -354,12 +375,20 @@ class SupplyDemandPage(ttk.Frame):
             group.tree_widget.configure(height=tree_height)
             for item in group.tree_widget.get_children():
                 group.tree_widget.delete(item)
+            node_map = self._get_calc_result_map()
             for node in group.demand_nodes:
+                info = node_map.get(node.node_id)
+                if info:
+                    flow_val = info.get("raw_flow", 0.0)
+                    pressure_val = info.get("raw_pressure", 0.0)
+                else:
+                    flow_val = node.flow
+                    pressure_val = node.pressure
                 group.tree_widget.insert("", tk.END, values=(
                     node.node_id,
                     node.status,
-                    f"{node.flow:.2f}",
-                    f"{node.pressure:.2f}"
+                    f"{flow_val:.2f}",
+                    f"{pressure_val:.2f}"
                 ))
     
     def update_node_page(self):
@@ -439,24 +468,8 @@ class SupplyDemandPage(ttk.Frame):
         edit_entry.bind("<Escape>", cancel_edit)
     
     def setup_context_menu(self):
-        """设置右键菜单"""
-        self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(
-            label="导出选中组为CSV",
-            command=self.export_selected_groups
-        )
-        self.context_menu.add_separator()
-        self.context_menu.add_command(
-            label="刷新数据",
-            command=self.full_refresh
-        )
-        
-        # ✅ 绑定右键事件到多个区域
-        self.supply_tree.bind("<Button-3>", self.show_context_menu)
-        self.canvas.bind("<Button-3>", self.show_context_menu)
-        self.inner_frame.bind("<Button-3>", self.show_context_menu)
-        self.supply_frame.bind("<Button-3>", self.show_context_menu)
-        self.demand_container.bind("<Button-3>", self.show_context_menu)
+        """设置右键菜单（按需求移除所有菜单项）"""
+        pass
 
     def full_refresh(self):
         """完整刷新页面（包括单位）"""
@@ -485,11 +498,8 @@ class SupplyDemandPage(ttk.Frame):
             logger.error(f"完整刷新页面失败: {e}")
 
     def show_context_menu(self, event):
-        """显示右键菜单"""
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+        """显示右键菜单（已按需求移除菜单项，此方法保留为空实现避免残留绑定报错）"""
+        pass
     
     def export_selected_groups(self):
         """导出选中组为CSV"""

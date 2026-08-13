@@ -10,6 +10,7 @@ import json
 import time
 from datetime import datetime
 import logging
+from typing import Dict
 
 # 导入核心计算模块
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -126,6 +127,16 @@ class CalculationPage(ttk.Frame):
         )
         self.export_btn.pack(side="left")
 
+        # 当量长度分配明细按钮（仅当量长度法计算后可用）
+        self.equiv_detail_btn = ttk.Button(
+            buttons_frame,
+            text="当量明细",
+            command=self.show_equiv_detail_dialog,
+            state="disabled",
+            width=9
+        )
+        self.equiv_detail_btn.pack(side="left", padx=(3, 0))
+
         # 单位选择框区域
         unit_frame = ttk.Frame(control_container)
         unit_frame.pack(side="left", fill="y", padx=(0, 10))
@@ -160,18 +171,21 @@ class CalculationPage(ttk.Frame):
         )
         self.show_zero_flow_check.pack(side="left", padx=(10, 0))
 
-        # 右侧进度区域
+        # 内径减1mm计算（仅影响计算输入，不改动管道数据）
+        self.inner_minus1_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            unit_frame,
+            text="内径减1mm计算",
+            variable=self.inner_minus1_var
+        ).pack(side="left", padx=(10, 0))
+
+        # 右侧状态文字区域（显示计算进程步骤）
+        # 参与弹性伸展，长提示（如"第N轮平差｜第K轮：迭代 x/y..."）不被裁剪
         progress_frame = ttk.Frame(control_container)
-        progress_frame.pack(side="left", fill="y")
+        progress_frame.pack(side="left", fill="x", expand=True)
 
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='determinate', length=120)
-        self.progress_bar.pack(side="left", padx=(0, 5))
-
-        self.status_label = ttk.Label(progress_frame, text="就绪", width=15)
-        self.status_label.pack(side="left")
-
-        # 中间的弹性空间，确保左右两侧不重叠
-        ttk.Frame(control_container).pack(side="left", fill="x", expand=True)
+        self.status_label = ttk.Label(progress_frame, text="就绪", width=45, anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True)
 
         # 创建垂直分割的 PanedWindow，直接放在 self 中
         self.vertical_paned = ttk.PanedWindow(self, orient="vertical")
@@ -205,9 +219,13 @@ class CalculationPage(ttk.Frame):
 
         # 设置列标题 - 根据压力单位选择显示不同的单位
         pressure_unit = "MPa" if self.show_pressure_in_mpa else "m"
-        self.paths_tree.heading("path_id", text="路径ID")
-        self.paths_tree.heading("total_loss", text=f"总水损({pressure_unit})")
+        self.paths_tree.heading("path_id", text="路径ID", command=lambda: self.sort_paths_tree("path_id"))
+        self.paths_tree.heading("total_loss", text=f"总水损({pressure_unit})", command=lambda: self.sort_paths_tree("total_loss"))
         self.paths_tree.heading("nodes_path", text="节点路径", command=self.toggle_path_display)
+
+        # 路径表排序状态：缺省按总水损从大到小（降序）
+        self.paths_sort_column = "total_loss"
+        self.paths_sort_reverse = True
 
         # 设置列宽度 - 前四列宽度进一步缩小，最后一列宽度加大
         self.paths_tree.column("path_id", width=70, minwidth=70, stretch=False)
@@ -237,6 +255,15 @@ class CalculationPage(ttk.Frame):
             pipe_results = self.original_results.get("pipe_results", [])
             self.update_pipes_table(pipe_results)
 
+    def sort_paths_tree(self, col):
+        """路径表排序：新列首次点击时总水损降序、路径ID升序；再次点击同列翻转方向"""
+        if self.paths_sort_column == col:
+            self.paths_sort_reverse = not self.paths_sort_reverse
+        else:
+            self.paths_sort_column = col
+            self.paths_sort_reverse = (col == "total_loss")  # 总水损首次降序，路径ID首次升序
+        self._refresh_paths_table()
+
     def toggle_path_display(self):
         """切换路径显示模式：节点路径 ↔ 管道路径"""
         if self.path_display_mode == 'nodes':
@@ -251,13 +278,20 @@ class CalculationPage(ttk.Frame):
             self._refresh_paths_table()
 
     def _refresh_paths_table(self):
-        """根据当前显示模式重新填充路径表格"""
+        """根据当前显示模式重新填充路径表格（按当前排序状态排列）"""
         # 清空表格
         for item in self.paths_tree.get_children():
             self.paths_tree.delete(item)
         
+        # 按当前排序状态排列（总水损按数值、路径ID按字符串，均等宽格式可字典序）
+        sorted_paths = list(self.all_paths_for_preview)
+        if self.paths_sort_column == "total_loss":
+            sorted_paths.sort(key=lambda p: p["total_loss"], reverse=self.paths_sort_reverse)
+        else:
+            sorted_paths.sort(key=lambda p: str(p["id"]), reverse=self.paths_sort_reverse)
+        
         path_row = 0
-        for path_data in self.all_paths_for_preview:
+        for path_data in sorted_paths:
             if self.path_display_mode == 'nodes':
                 display_str = path_data["node_path"]
             else:
@@ -274,9 +308,13 @@ class CalculationPage(ttk.Frame):
 
     def create_pipes_table(self, parent):
         """创建管道结果表格 - 添加排序功能"""
-        columns = ("pipe_id", "node1", "node2", "nominal_diameter", "inner_diameter", 
-                "length", "material", "flow", "velocity", "unit_headloss", 
-                "loss", "status")
+        columns = ("pipe_id", "node1", "node1_pressure", "node2", "node2_pressure",
+                   "nominal_diameter", "inner_diameter", "length", "calc_length",
+                   "material", "flow", "velocity", "unit_headloss", "loss",
+                   "static_equiv",
+                   "eq_45elbow", "eq_90elbow", "eq_reducer", "eq_valve",
+                   "dynamic_equiv",
+                   "eq_tees", "eq_teeside", "eq_cross_s", "eq_cross_side", "eq_cross_mix")
         
         self.pipes_tree = ttk.Treeview(parent, columns=columns, show="headings", height=12)
         
@@ -284,16 +322,29 @@ class CalculationPage(ttk.Frame):
         column_headers = {
             "pipe_id": "管道ID",
             "node1": "起点",
+            "node1_pressure": "起点压力",
             "node2": "终点", 
+            "node2_pressure": "终点压力",
             "nominal_diameter": "公称管径",
-            "inner_diameter": "内径(mm)",
+            "inner_diameter": "计算内径(mm)",
             "length": "管长(m)",
+            "calc_length": "计算长度",
             "material": "管材",
             "flow": "流量",
             "velocity": "流速(m/s)",
             "unit_headloss": "单位水损",
             "loss": "水损",
-            "status": "状态"
+            "static_equiv": "静态当量(m)",
+            "eq_45elbow": "45弯头(m)",
+            "eq_90elbow": "90弯头(m)",
+            "eq_reducer": "异径(m)",
+            "eq_valve": "蝶阀(m)",
+            "dynamic_equiv": "动态当量(m)",
+            "eq_tees": "三通直通(m)",
+            "eq_teeside": "三通侧通(m)",
+            "eq_cross_s": "四通直通(m)",
+            "eq_cross_side": "四通侧通(m)",
+            "eq_cross_mix": "四通混合(m)"
         }
         
         for col, header in column_headers.items():
@@ -303,16 +354,29 @@ class CalculationPage(ttk.Frame):
         column_widths = {
             "pipe_id": 60,
             "node1": 60,
+            "node1_pressure": 80,
             "node2": 60,
+            "node2_pressure": 80,
             "nominal_diameter": 80,
             "inner_diameter": 80,
             "length": 70,
+            "calc_length": 80,
             "material": 80,
             "flow": 70,
             "velocity": 70,
             "unit_headloss": 100,
             "loss": 100,
-            "status": 60
+            "static_equiv": 88,
+            "eq_45elbow": 70,
+            "eq_90elbow": 70,
+            "eq_reducer": 70,
+            "eq_valve": 70,
+            "dynamic_equiv": 88,
+            "eq_tees": 80,
+            "eq_teeside": 80,
+            "eq_cross_s": 80,
+            "eq_cross_side": 80,
+            "eq_cross_mix": 80
         }
         for col, width in column_widths.items():
             self.pipes_tree.column(col, width=width)
@@ -429,6 +493,7 @@ class CalculationPage(ttk.Frame):
         pipes_context_menu = tk.Menu(self, tearoff=0)
         pipes_context_menu.add_command(label="跳转至整体预览", command=self.jump_to_pipe_global)
         pipes_context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_pipe_floor)
+        pipes_context_menu.add_command(label="跳转至拼接预览", command=self.jump_to_pipe_spliced)
         pipes_context_menu.add_separator()
         pipes_context_menu.add_command(
             label="校正管径（全管网）",
@@ -454,12 +519,21 @@ class CalculationPage(ttk.Frame):
         flow_factor = 3.6 if self.show_flow_in_m3h else 1.0
         pressure_factor = 0.00980665 if self.show_pressure_in_mpa else 1.0
         self.update_table_headers()
+
+        # 节点压力映射（node_id -> 压力m），用于起点/终点压力列
+        node_pressure_map = {}
+        if getattr(self, 'original_results', None):
+            for node_res in self.original_results.get("node_results", []):
+                nid = node_res.get("node_id")
+                if nid:
+                    node_pressure_map[nid] = node_res.get("pressure_m", 0.0)
         
         # 收集所有管道数据用于排序
         pipe_display_data = []
         for pipe in pipe_results:
             pipe_id = pipe.get("pipe_id", "")
-            if pipe_id.startswith("VP_") or pipe_id.startswith("VD_") or pipe_id == "RESERVOIR":
+            pid_upper = pipe_id.upper()
+            if (pid_upper.startswith(("VP_", "VD_")) or pid_upper == "RESERVOIR"):
                 continue
             pipe_data = None
             if self.cad_data_manager:
@@ -470,12 +544,13 @@ class CalculationPage(ttk.Frame):
                             pipe_data = p
                             break
             if pipe_data:
-                inner_diameter = pipe_data.inner_diameter
+                # 计算内径 = 原内径 + 修正量（勾选"内径减1mm计算"时为 -1.0）
+                inner_diameter = pipe_data.inner_diameter + self._get_inner_diameter_offset()
                 nominal_diameter = pipe_data.nominal_diameter
                 length = pipe_data.length
                 material = pipe_data.material
             else:
-                inner_diameter = pipe.get("inner_diameter", 0.0)
+                inner_diameter = pipe.get("inner_diameter", 0.0) + self._get_inner_diameter_offset()
                 nominal_diameter = pipe.get("nominal_diameter", "")
                 length = pipe.get("length", 0.0)
                 material = pipe.get("material", "")
@@ -489,30 +564,74 @@ class CalculationPage(ttk.Frame):
             if unit_loss == 0.0 and length > 0:
                 unit_loss = headloss_per_km / 1000.0
 
-            local_loss_ratio = self.config_manager.get_live_config().get("local_loss_ratio", 0.3)
-            loss = unit_loss * length * (1 + local_loss_ratio)
+            # 计算长度：当量长度法结果含 calc_length；否则局部水损系数法 = 几何长度×(1+系数)
+            config = self.config_manager.get_live_config()
+            calc_length = pipe.get("calc_length", 0.0) or 0.0
+            if calc_length <= 0.0:
+                # 局部水损系数法：按管网类型取对应系数
+                system_type = config.get("system_type", "indoor_hydrant")
+                if system_type == "sprinkler":
+                    ratio = config.get("local_loss_ratio_sprinkler",
+                                       config.get("local_loss_method_ratio", 0.5))
+                else:
+                    ratio = config.get("local_loss_ratio_hydrant",
+                                       config.get("local_loss_method_ratio", 0.3))
+                calc_length = length * (1 + ratio)
 
+            # 水损 = 单位水损 × 计算长度（当量长度法用引擎结果，局部水损系数法用放大后长度）
+            loss = unit_loss * calc_length
             # 用于显示的单位水损（可保留为 unit_loss，也可用 headloss_per_km/1000）
             unit_headloss = unit_loss
             
             flow_display = abs(flow) * flow_factor
             loss_display = loss * pressure_factor
             unit_headloss_display = unit_headloss * pressure_factor
+
+            # 当量长度分配数据（仅当量长度法计算后存在，否则为 None 显示 "—"）
+            static_equiv = getattr(pipe_data, 'static_equiv', None) if pipe_data else None
+            dynamic_equiv = getattr(pipe_data, 'dynamic_equiv', None) if pipe_data else None
+            
+            # 当量来源明细 {显示名: 长度m}，供静态/动态明细列拆分显示
+            equiv_detail_map = {}
+            if pipe_data:
+                detail = getattr(pipe_data, 'equiv_detail', None)
+                if detail:
+                    for name, val in detail:
+                        equiv_detail_map[name] = val
+
+            # 起点/终点压力（原始m，显示时乘 pressure_factor）
+            node1 = pipe.get("node1", "")
+            node2 = pipe.get("node2", "")
+            node1_pressure = node_pressure_map.get(node1, None)
+            node2_pressure = node_pressure_map.get(node2, None)
             
             # 存储显示值和排序用的数值
             pipe_display_data.append({
                 "pipe_id": pipe_id,
-                "node1": pipe.get("node1", ""),
-                "node2": pipe.get("node2", ""),
+                "node1": node1,
+                "node1_pressure": node1_pressure,
+                "node2": node2,
+                "node2_pressure": node2_pressure,
                 "nominal_diameter": nominal_diameter,
                 "inner_diameter": inner_diameter,
                 "length": length,
+                "calc_length": calc_length,
                 "material": material,
                 "flow": flow_display,
                 "velocity": velocity,
                 "unit_headloss": unit_headloss_display,
                 "loss": loss_display,
-                "status": pipe.get("status", "Open"),
+                "static_equiv": static_equiv,
+                "dynamic_equiv": dynamic_equiv,
+                "eq_45elbow": equiv_detail_map.get("45弯头"),
+                "eq_90elbow": equiv_detail_map.get("90弯头"),
+                "eq_reducer": equiv_detail_map.get("异径"),
+                "eq_valve": equiv_detail_map.get("蝶阀"),
+                "eq_tees": equiv_detail_map.get("三通直通"),
+                "eq_teeside": equiv_detail_map.get("三通侧通"),
+                "eq_cross_s": equiv_detail_map.get("四通直通"),
+                "eq_cross_side": equiv_detail_map.get("四通侧通"),
+                "eq_cross_mix": equiv_detail_map.get("四通混合"),
                 "raw_flow": flow,                # 原始流量（带符号）用于预览页面
                 "sort_flow": abs(flow),          # 绝对值用于排序
                 "sort_velocity": velocity,
@@ -536,6 +655,12 @@ class CalculationPage(ttk.Frame):
             pipe_display_data.sort(key=lambda x: x["sort_unit_headloss"], reverse=reverse)
         elif col == "loss":
             pipe_display_data.sort(key=lambda x: x["sort_loss"], reverse=reverse)
+        elif col in ("node1_pressure", "node2_pressure", "calc_length",
+                     "static_equiv", "dynamic_equiv",
+                     "eq_45elbow", "eq_90elbow", "eq_reducer", "eq_valve",
+                     "eq_tees", "eq_teeside", "eq_cross_s", "eq_cross_side", "eq_cross_mix"):
+            pipe_display_data.sort(key=lambda x: x[col] if x[col] is not None else -1e18,
+                                   reverse=reverse)
         else:
             # 默认按管道ID排序
             pipe_display_data.sort(key=lambda x: x["pipe_id"], reverse=reverse)
@@ -566,16 +691,29 @@ class CalculationPage(ttk.Frame):
             item_id = self.pipes_tree.insert("", "end", values=(
                 pipe["pipe_id"],
                 pipe["node1"],
+                f"{pipe['node1_pressure'] * pressure_factor:.2f}" if pipe['node1_pressure'] is not None else "—",
                 pipe["node2"],
+                f"{pipe['node2_pressure'] * pressure_factor:.2f}" if pipe['node2_pressure'] is not None else "—",
                 pipe["nominal_diameter"],
                 f"{pipe['inner_diameter']:.1f}" if pipe['inner_diameter'] else "0.0",
                 f"{pipe['length']:.2f}" if pipe['length'] else "0.00",
+                f"{pipe['calc_length']:.2f}" if pipe['calc_length'] else "0.00",
                 pipe["material"],
                 f"{pipe['flow']:.3f}",
                 f"{pipe['velocity']:.3f}" if pipe['velocity'] else "0.00",
                 f"{pipe['unit_headloss']:.6f}",
                 f"{pipe['loss']:.4f}",
-                pipe["status"]
+                f"{pipe['static_equiv']:.3f}" if pipe['static_equiv'] is not None else "—",
+                f"{pipe['eq_45elbow']:.3f}" if pipe['eq_45elbow'] is not None else "—",
+                f"{pipe['eq_90elbow']:.3f}" if pipe['eq_90elbow'] is not None else "—",
+                f"{pipe['eq_reducer']:.3f}" if pipe['eq_reducer'] is not None else "—",
+                f"{pipe['eq_valve']:.3f}" if pipe['eq_valve'] is not None else "—",
+                f"{pipe['dynamic_equiv']:.3f}" if pipe['dynamic_equiv'] is not None else "—",
+                f"{pipe['eq_tees']:.3f}" if pipe['eq_tees'] is not None else "—",
+                f"{pipe['eq_teeside']:.3f}" if pipe['eq_teeside'] is not None else "—",
+                f"{pipe['eq_cross_s']:.3f}" if pipe['eq_cross_s'] is not None else "—",
+                f"{pipe['eq_cross_side']:.3f}" if pipe['eq_cross_side'] is not None else "—",
+                f"{pipe['eq_cross_mix']:.3f}" if pipe['eq_cross_mix'] is not None else "—"
             ))
             base_tag = "evenrow" if row_number % 2 == 0 else "oddrow"
             all_tags = (base_tag,) + tuple(tags) if tags else (base_tag,)
@@ -588,6 +726,7 @@ class CalculationPage(ttk.Frame):
         self.context_menu = tk.Menu(self, tearoff=0)
         self.context_menu.add_command(label="跳转至整体预览", command=self.jump_to_node_global)
         self.context_menu.add_command(label="跳转至楼层预览", command=self.jump_to_node_floor)
+        self.context_menu.add_command(label="跳转至拼接预览", command=self.jump_to_node_spliced)
         self.nodes_tree.bind("<Button-3>", self.show_context_menu)
         self.paths_tree.bind("<Button-3>", self.show_context_menu)
 
@@ -682,13 +821,12 @@ class CalculationPage(ttk.Frame):
         except Exception as e:
             logger.warning(f"获取用水点组数据失败: {e}")
         self.status_label.config(text="正在生成INP文件...")
-        self.progress_bar.start()
         success, message, demand_models = self.inp_generator.generate_inp_file(
             self.cad_data_manager,
             project_dir,
-            demand_groups
+            demand_groups,
+            inner_diameter_offset=self._get_inner_diameter_offset()
         )
-        self.progress_bar.stop()
         if success:
             self.status_label.config(text=f"INP文件生成成功: {message}")
             self.calculate_btn.config(state="normal")
@@ -713,22 +851,56 @@ class CalculationPage(ttk.Frame):
         config = self.config_manager.get_live_config()
         system_type = config.get("system_type", "outdoor_hydrant")
 
-        # 模式A：室外消火栓或任何有总流量的情况
+        # 模式A：消火栓管网（无喷头，读取CAD时自动判定为 indoor_hydrant）可用
         if mode == 'A':
-            if system_type != "outdoor_hydrant":
-                messagebox.showwarning("不匹配", "模式A（有总流量）仅支持室外消火栓管网类型，请在设置页面选择室外消火栓")
+            if system_type == "sprinkler":
+                messagebox.showwarning("不匹配", "模式A（有总流量）仅支持消火栓管网，喷淋管网请使用模式B/C")
                 return
             self.run_mode_A(system_type)
         elif mode in ('B', 'C'):
             if system_type not in ("indoor_hydrant", "sprinkler"):
                 messagebox.showwarning("不匹配", "模式B/C（压力驱动）仅支持室内消火栓或喷淋，请在设置页面选择对应类型")
                 return
-            self.run_pressure_driven(mode, system_type)
+            # B/C模式弹出计算方法选择菜单：局部水损系数法 / 当量长度法
+            self._show_method_menu(mode, system_type)
         else:
             pass
 
+    def _show_method_menu(self, mode, system_type):
+        """在计算按钮处弹出计算方法选择菜单"""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="局部水损系数法",
+                         command=lambda: self._on_method_selected(mode, system_type, "ratio"))
+        menu.add_command(label="当量长度法",
+                         command=lambda: self._on_method_selected(mode, system_type, "equiv"))
+        # 支状喷淋倒推法：仅喷淋管网，且需存在设置了最低水压的勾选用水点组
+        has_min_pressure = any(
+            g.is_selected and g.min_pressure > 0
+            for g in self.cad_data_manager.demand_groups.values())
+        if system_type == "sprinkler" and has_min_pressure:
+            menu.add_command(label="支状喷淋倒推法",
+                             command=lambda: self._on_method_selected(mode, system_type, "tz"))
+        try:
+            x = self.calculate_btn.winfo_rootx()
+            y = self.calculate_btn.winfo_rooty() + self.calculate_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _on_method_selected(self, mode, system_type, method):
+        """用户从菜单中选择计算方法后，立即按对应方法计算"""
+        if method == "equiv":
+            self.run_equiv_length(mode, system_type)
+        elif method == "tz":
+            self.run_tianzheng(mode, system_type)
+        else:
+            self.run_pressure_driven(mode, system_type)
+
     def run_mode_A(self, system_type):
         """模式A：室外消防，使用虚拟节点"""
+        # 与B/C模式一致：先确定项目目录并记录当前CAD文件，
+        # 否则切换页面触发 refresh_data 时 current_cad_file 为空，会误清空计算结果表
+        self.get_current_project_dir()
         # 准备用水点组数据（同原有逻辑）
         demand_groups = {}
         try:
@@ -751,7 +923,8 @@ class CalculationPage(ttk.Frame):
             self.current_project_dir,
             demand_groups,
             no_virtual=False,          # 模式A使用虚拟节点
-            calc_type=system_type       # 传入系统类型（可能用于将来扩展）
+            calc_type=system_type,       # 传入系统类型（可能用于将来扩展）
+            inner_diameter_offset=self._get_inner_diameter_offset()
         )
 
         if not success:
@@ -804,37 +977,18 @@ class CalculationPage(ttk.Frame):
         if not self.is_calculating:
             return
         status = self.epanet_calc.get_status()
-        self.progress_bar["value"] = status["progress"]
-        self.status_label.config(text=status["status"])
+        # 当量长度法：引擎 _notify 已向状态栏推送"第N轮平差"提示，
+        # 此处不再覆盖，避免轮次提示被"正在计算模型..."冲掉。
+        if not getattr(self, '_engine_progress_msg', False):
+            self.status_label.config(text=status["status"])
         if status["is_running"]:
             self.after(500, self.monitor_calculation_progress)
 
     def run_pressure_driven(self, mode, system_type):
-        """启动压力驱动计算线程"""
+        """启动压力驱动计算线程（局部水损系数法）"""
         self.get_current_project_dir()
         # 获取计算参数
-        config = self.config_manager.get_live_config()
-        K = config.get("sprinkler_K", 80)
-        Ad = config.get("hydrant_Ad", 0.00172)
-        Ld = config.get("hydrant_Ld", 25)
-        B = config.get("hydrant_B", 1.577)
-        Hak = config.get("hydrant_Hak", 2.0)
-
-        # 映射系统类型到求解器的 calc_type
-        if system_type == "indoor_hydrant":
-            calc_type = "hydrant"
-        else:
-            calc_type = "sprinkler"
-
-        # 构建 per-node K 值映射
-        k_value_map: Dict[str, float] = {}
-        default_K = float(K)
-        for node_id, k_val in self.cad_data_manager.sprinkler_k_map.items():
-            k_value_map[node_id] = k_val
-        for group in self.cad_data_manager.demand_groups.values():
-            for demand_node in group.demand_nodes:
-                if demand_node.node_id not in k_value_map:
-                    k_value_map[demand_node.node_id] = default_K
+        K, Ad, Ld, B, Hak, calc_type, k_value_map, tolerance = self._prepare_solver_params(system_type)
 
         # 导入求解器
         from core.pressure_driven_solver import PressureDrivenSolver
@@ -849,7 +1003,9 @@ class CalculationPage(ttk.Frame):
             hydrant_Ld=Ld,
             hydrant_B=B,
             hydrant_Hak=Hak,
-            progress_callback=self._update_solver_progress
+            progress_callback=self._update_solver_progress,
+            pressure_tolerance=tolerance,
+            inner_diameter_offset=self._get_inner_diameter_offset(),
         )
         solver.k_value_map = k_value_map
 
@@ -862,28 +1018,383 @@ class CalculationPage(ttk.Frame):
         self.export_btn.config(state="disabled")
         self.calculation_thread = threading.Thread(target=thread_func, daemon=True)
         self.calculation_thread.start()
+        self._engine_progress_msg = False
+        self._engine_round_msg = None
         self.monitor_calculation_progress()
 
+    def _get_inner_diameter_offset(self) -> float:
+        """内径修正量（mm）：勾选"内径减1mm计算"时返回 -1.0，否则 0.0。
+
+        显示层（管道结果表"计算内径"列）与计算层共用同一来源，保证一致。
+        """
+        return -1.0 if getattr(self, 'inner_minus1_var', None) and self.inner_minus1_var.get() else 0.0
+
+    def _prepare_solver_params(self, system_type):
+        """准备压力驱动求解器公共参数（局部水损系数法与当量长度法共用）"""
+        config = self.config_manager.get_live_config()
+        K = config.get("sprinkler_K", 80)
+        Ad = config.get("hydrant_Ad", 0.00172)
+        Ld = config.get("hydrant_Ld", 25)
+        B = config.get("hydrant_B", 1.577)
+        Hak = config.get("hydrant_Hak", 2.0)
+
+        # 映射系统类型到求解器的 calc_type
+        if system_type == "indoor_hydrant":
+            calc_type = "hydrant"
+        else:
+            calc_type = "sprinkler"
+
+        # 构建 per-node K 值映射
+        # sprinkler_k_map 的键是喷头短管起点节点（base，如 N_0584，不带 _S），
+        # 而用水点节点是喷头短管末端（N_0584_S），计算时按用水点节点 ID 查 K，
+        # 因此这里将 base 与 _S 双向映射，保证预览页修改的 K 值真正生效。
+        k_value_map: Dict[str, float] = {}
+        default_K = float(K)
+        for node_id, k_val in self.cad_data_manager.sprinkler_k_map.items():
+            k_value_map.setdefault(node_id, k_val)
+            if node_id.endswith("_S"):
+                k_value_map.setdefault(node_id[:-2], k_val)
+            else:
+                k_value_map.setdefault(node_id + "_S", k_val)
+        for group in self.cad_data_manager.demand_groups.values():
+            for demand_node in group.demand_nodes:
+                nid = demand_node.node_id
+                if nid not in k_value_map:
+                    base_id = nid[:-2] if nid.endswith("_S") else nid
+                    k_value_map[nid] = k_value_map.get(base_id, default_K)
+
+        # 模式C主判据：最不利用水点超压≤该值即终止本轮二分（用户可配置，缺省0.1m）
+        tolerance = float(config.get("pressure_tolerance", 0.1))
+        return K, Ad, Ld, B, Hak, calc_type, k_value_map, tolerance
+
+    def run_equiv_length(self, mode, system_type):
+        """启动当量长度法计算线程（B/C模式）"""
+        self.get_current_project_dir()
+        K, Ad, Ld, B, Hak, calc_type, k_value_map, tolerance = self._prepare_solver_params(system_type)
+
+        # 导入当量长度法引擎
+        from core.equiv_length_engine import EquivLengthEngine
+
+        engine = EquivLengthEngine(
+            cad_data_manager=self.cad_data_manager,
+            config_manager=self.config_manager,
+            calc_type=calc_type,
+            mode=mode,
+            sprinkler_K=K,
+            hydrant_Ad=Ad,
+            hydrant_Ld=Ld,
+            hydrant_B=B,
+            hydrant_Hak=Hak,
+            k_value_map=k_value_map,
+            progress_callback=self._update_solver_progress,
+            pressure_tolerance=tolerance,
+            inner_diameter_offset=self._get_inner_diameter_offset(),
+        )
+
+        # 读取CAD时已缓存的自环管道列表（起点=终点），无需重新分析。
+        # 提醒用户计算时会忽略，确认后继续
+        self_loop_pipes = list(getattr(self.cad_data_manager, 'self_loop_pipes', []) or [])
+        if self_loop_pipes:
+            detail = "\n".join(
+                f"管道{pid}（起点=终点，长度"
+                f"{self.cad_data_manager.pipe_by_id[pid].length:.3f}m）"
+                if pid in self.cad_data_manager.pipe_by_id else f"管道{pid}"
+                for pid in self_loop_pipes
+            )
+            proceed = messagebox.askyesno(
+                "发现自环管道",
+                f"以下自环管道（起点=终点）在计算中将被自动忽略，不参与水力计算：\n\n"
+                f"{detail}\n\n是否继续计算？\n"
+                f"（建议在CAD中删除这些管道后重新读取）",
+                icon="warning")
+            if not proceed:
+                logger.info("当量长度法：用户取消计算（自环管道警告）")
+                return
+
+        def thread_func():
+            success, results, message = engine.solve()
+            self.after(0, self._on_equiv_length_finished, success, results, message, engine)
+
+        self.is_calculating = True
+        self.calculate_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.calculation_thread = threading.Thread(target=thread_func, daemon=True)
+        self.calculation_thread.start()
+        self._engine_progress_msg = True   # 当量长度法：状态栏由引擎"第N轮平差"提示驱动
+        self._engine_round_msg = None      # "第N轮平差"常驻前缀（solver 二分提示拼在其右侧）
+        self.monitor_calculation_progress()
+
+    def run_tianzheng(self, mode, system_type):
+        """启动支状喷淋倒推法计算线程（独立逐段计算，不使用 WNTR）"""
+        self.get_current_project_dir()
+        config = self.config_manager.get_live_config()
+        tz_ratio = float(config.get("tz_ratio_sprinkler", 0.015))
+        # 复用公共参数准备：K 值、per-node K 映射
+        K, Ad, Ld, B, Hak, calc_type, k_value_map, tolerance = self._prepare_solver_params(system_type)
+
+        # 勾选的用水点节点（跳过状态为"关"的用水点，如位于检修管道上的用水点）
+        selected_node_ids = set()
+        for group in self.cad_data_manager.demand_groups.values():
+            if not group.is_selected:
+                continue
+            for demand_node in group.demand_nodes:
+                if demand_node.status == "关":
+                    logger.info(f"用水点 {demand_node.node_id} 状态为关，跳过（不参与计算）")
+                    continue
+                node = self.cad_data_manager.node_by_id.get(demand_node.node_id)
+                if node and node.is_active:
+                    selected_node_ids.add(demand_node.node_id)
+        if not selected_node_ids:
+            messagebox.showwarning("缺少输入", "没有可用的勾选喷头节点，请先勾选用水点组")
+            return
+        # 目标压力 = 勾选组最低工作压力最大值
+        targets = [g.min_pressure for g in self.cad_data_manager.demand_groups.values()
+                   if g.is_selected and g.min_pressure > 0]
+        if not targets:
+            messagebox.showwarning("缺少输入", "支状喷淋倒推法需要至少一个勾选用水点组设置了最低工作压力")
+            return
+        target_min_pressure = max(targets)
+
+        from core.tianzheng_tree_solver import TianzhengTreeSolver
+        solver = TianzhengTreeSolver(
+            cad_data_manager=self.cad_data_manager,
+            sprinkler_K=K,
+            target_min_pressure=target_min_pressure,
+            selected_node_ids=selected_node_ids,
+            k_value_map=k_value_map,
+            tz_ratio=tz_ratio,
+            progress_callback=self._update_solver_progress,
+            inner_diameter_offset=self._get_inner_diameter_offset(),
+        )
+
+        def thread_func():
+            success, results, message = solver.solve()
+            self.after(0, self._on_tianzheng_finished, success, results, message, solver)
+
+        self.is_calculating = True
+        self.calculate_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.calculation_thread = threading.Thread(target=thread_func, daemon=True)
+        self.calculation_thread.start()
+        self._engine_progress_msg = True   # 状态栏由求解器"支状喷淋倒推法：第N轮"提示驱动
+        self._engine_round_msg = None
+        self.monitor_calculation_progress()
+
+    def _on_tianzheng_finished(self, success, results, message, solver=None):
+        """支状喷淋倒推法计算完成回调"""
+        self.is_calculating = False
+        self.calculate_btn.config(state="normal")
+        self.export_btn.config(state="normal")
+        if success:
+            # 保留求解器的管件分析与当量分配数据，供明细对话框/表格/预览着色使用
+            self.equiv_analysis = solver.analysis if solver else None
+            self.equiv_l_current = dict(solver.l_current) if solver else {}
+            self.equiv_kinds = dict(solver.kinds) if solver else {}
+            self.equiv_coeff = float(solver.tz_ratio) if solver else 0.0
+            self._attach_pipe_equiv()
+            if hasattr(self, 'equiv_detail_btn'):
+                self.equiv_detail_btn.config(state="normal")
+            self.original_results = results.copy()
+            self.display_results(results)
+            self.status_label.config(text="计算完成")
+            self._save_results_to_project(results)
+            self.show_temp_message("计算成功")
+            logger.info(f"支状喷淋倒推法计算成功: {message}")
+        else:
+            self._clear_equiv_data()
+            self.status_label.config(text="计算失败")
+            messagebox.showerror("支状喷淋倒推法计算失败", message)
+            logger.error(f"支状喷淋倒推法计算失败: {message}")
+
+    def _on_equiv_length_finished(self, success, results, message, engine=None):
+        """当量长度法计算完成回调"""
+        self.is_calculating = False
+        self.calculate_btn.config(state="normal")
+        self.export_btn.config(state="normal")
+        if success:
+            # 保留引擎的管件分析与当量分配数据，供明细对话框/表格/预览着色使用
+            self.equiv_analysis = engine.analysis if engine else None
+            self.equiv_l_current = dict(engine.l_current) if engine else {}
+            self.equiv_kinds = dict(getattr(engine, 'kinds', {}) or {}) if engine else {}
+            self.equiv_coeff = float(getattr(engine, 'coeff', 0.0)) if engine else 0.0
+            self._attach_pipe_equiv()
+            if hasattr(self, 'equiv_detail_btn'):
+                self.equiv_detail_btn.config(state="normal")
+            self.original_results = results.copy()
+            self.display_results(results)
+            self.status_label.config(text="计算完成")
+            self._save_results_to_project(results)
+            self.show_temp_message("计算成功")
+            logger.info(f"当量长度法计算成功: {message}")
+        else:
+            # 先读取是否已转换过（防止转换后仍失败时再次弹转换对话框），再清数据
+            already_standardized = getattr(self, '_equiv_standardized', False)
+            self._clear_equiv_data()
+            self.status_label.config(text="计算失败")
+            # 失败信息中包含缺失数据/画图错误详情（含节点、管道编号）
+            # 画图错误时提供"转为标准管件计算"选项（仅当量长度法，且未转换过，避免循环弹窗）
+            if "画图错误" in (message or "") and not already_standardized:
+                self._show_error_standardize_dialog(message, engine)
+            else:
+                messagebox.showerror("当量长度法计算失败", message)
+                logger.error(f"当量长度法计算失败: {message}")
+
+    def _show_error_standardize_dialog(self, message: str, engine):
+        """画图错误警示对话框：取消（原确定，作用=取消计算）/ 转为标准管件计算"""
+        import tkinter as tk
+        from tkinter import ttk, scrolledtext
+        dialog = tk.Toplevel(self)
+        dialog.title("当量长度法计算失败")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(True, True)
+        dialog.minsize(600, 400)
+        # 相对主窗口居中
+        self.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 680) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 460) // 2
+        dialog.geometry(f"680x460+{max(x, 0)}+{max(y, 0)}")
+        dialog.grab_set()
+
+        # 顶部：标题提示
+        top = ttk.Frame(dialog, padding=(12, 10, 12, 0))
+        top.pack(fill="x")
+        ttk.Label(top, text="管网存在画图错误或不严谨，无法按当量长度法计算：",
+                  foreground="red").pack(anchor="w")
+
+        # 中部：错误信息（可滚动，完整显示所有错误节点）
+        msg_frame = ttk.Frame(dialog, padding=12)
+        msg_frame.pack(fill="both", expand=True)
+        txt = scrolledtext.ScrolledText(
+            msg_frame, wrap="word", height=8,
+            font=("TkDefaultFont", 9), state="disabled")
+        txt.pack(fill="both", expand=True)
+        txt.configure(state="normal")
+        txt.insert("1.0", message)
+        txt.configure(state="disabled")
+
+        # 转换规则说明
+        tip = ("若选择「转为标准管件计算」：\n"
+               "连接2根管道的节点按最近角度转为45°或90°弯头；\n"
+               "连接3根管道的节点转为三通（最接近180°的两管按直通处理）；\n"
+               "连接4根管道的节点转为四通（对向两管两两算作直通）；\n"
+               "连接5根及以上管道的节点仍为错误，无法计算。")
+        ttk.Label(msg_frame, text=tip, foreground="gray",
+                  justify="left", wraplength=620).pack(anchor="w", pady=(8, 0))
+
+        # 底部：按钮（固定可见）
+        btn_frame = ttk.Frame(dialog, padding=(12, 0, 12, 12))
+        btn_frame.pack(side="bottom", fill="x")
+        ttk.Button(btn_frame, text="取消",
+                   command=lambda: self._close_dialog_cancel(dialog)).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_frame, text="转为标准管件计算",
+                   command=lambda: self._standardize_and_retry(dialog, engine)).pack(side="right")
+
+    def _close_dialog_cancel(self, dialog):
+        """取消按钮：关闭对话框，取消计算"""
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        dialog.destroy()
+        logger.info("当量长度法：用户选择取消计算（画图错误）")
+
+    def _standardize_and_retry(self, dialog, engine):
+        """转为标准管件计算：关闭对话框，以转换模式重新计算"""
+        try:
+            dialog.grab_release()
+        except Exception:
+            pass
+        dialog.destroy()
+        self._equiv_standardized = True   # 防止转换后仍失败时再次弹转换对话框
+        self.status_label.config(text="正在转为标准管件计算...")
+        # 复用引擎：传入第一次检测的分析结果（engine.analysis 已保存），
+        # 转换只针对第一次检测发现的错误节点，不重复分析整个管网
+        first_analysis = getattr(engine, 'analysis', None)
+        def thread_func():
+            success, results, message = engine.solve(
+                standardize_errors=True, analysis=first_analysis)
+            self.after(0, self._on_equiv_length_finished, success, results, message, engine)
+
+        self.is_calculating = True
+        self.calculate_btn.config(state="disabled")
+        self.export_btn.config(state="disabled")
+        self.calculation_thread = threading.Thread(target=thread_func, daemon=True)
+        self.calculation_thread.start()
+        self._engine_progress_msg = True
+        self._engine_round_msg = None
+        self.monitor_calculation_progress()
+
+    def _attach_pipe_equiv(self):
+        """把静态/动态当量汇总与来源明细挂到管道对象上，供预览着色与表格列展示使用"""
+        if not getattr(self, 'equiv_analysis', None):
+            return
+        from core.equiv_length_engine import gather_pipe_equiv, build_pipe_equiv_detail
+        if not self.cad_data_manager:
+            return
+        static, dynamic = gather_pipe_equiv(self.equiv_analysis, self.equiv_l_current)
+        detail = build_pipe_equiv_detail(self.equiv_analysis, self.equiv_l_current,
+                                         self.cad_data_manager, getattr(self, 'equiv_kinds', {}))
+        for pipe in self.cad_data_manager.pipes:
+            pipe.static_equiv = static.get(pipe.pipe_id, 0.0)
+            pipe.dynamic_equiv = dynamic.get(pipe.pipe_id, 0.0)
+            pipe.equiv_detail = detail.get(pipe.pipe_id, [])
+
+    def _clear_equiv_data(self):
+        """清空当量长度分配数据（非当量法计算 / 计算失败 / 重置时调用）"""
+        self.equiv_analysis = None
+        self.equiv_l_current = {}
+        self.equiv_kinds = {}
+        self._equiv_standardized = False
+        self.equiv_coeff = 0.0
+        if hasattr(self, 'equiv_detail_btn'):
+            self.equiv_detail_btn.config(state="disabled")
+        if self.cad_data_manager:
+            for pipe in self.cad_data_manager.pipes:
+                if hasattr(pipe, 'static_equiv'):
+                    del pipe.static_equiv
+                if hasattr(pipe, 'dynamic_equiv'):
+                    del pipe.dynamic_equiv
+                if hasattr(pipe, 'equiv_detail'):
+                    del pipe.equiv_detail
+
+    def show_equiv_detail_dialog(self):
+        """弹出当量长度分配明细对话框（非模态）"""
+        if not getattr(self, 'equiv_analysis', None):
+            messagebox.showwarning("无当量数据", "请先使用「当量长度法」完成一次计算")
+            return
+        try:
+            from gui.equiv_length_dialog import show_equiv_length_dialog
+            show_equiv_length_dialog(self, self.equiv_analysis, self.equiv_l_current,
+                                     self.cad_data_manager, self.equiv_kinds)
+        except Exception as e:
+            messagebox.showerror("打开失败", f"无法打开当量长度明细:\n{e}")
+            logger.error(f"打开当量长度明细失败: {e}")
+
     def _update_solver_progress(self, progress, status):
-        """更新进度（由求解器回调）"""
-        self.progress_bar["value"] = progress
-        self.status_label.config(text=status)
+        """更新进度文字（由求解器回调，显示计算步骤）"""
+        if progress is None:
+            # 引擎 _notify 的"第N轮平差"消息：作为常驻前缀保存
+            self._engine_round_msg = status
+        prefix = getattr(self, '_engine_round_msg', None)
+        if prefix and progress is not None:
+            self.status_label.config(text=f"{prefix}｜{status}")
+        else:
+            self.status_label.config(text=prefix if prefix else status)
 
     def _on_pressure_driven_finished(self, success, results, message):
         self.is_calculating = False
         self.calculate_btn.config(state="normal")
         self.export_btn.config(state="normal")
         if success:
+            self._clear_equiv_data()   # 非当量长度法：清除上次当量分配数据
             self.original_results = results.copy()
             self.display_results(results)
-            self.progress_bar["value"] = 100
             self.status_label.config(text="计算完成")
             self._save_results_to_project(results)
             self.show_temp_message("计算成功")
             logger.info(f"压力驱动计算成功: {message}")
 
         else:
-            self.progress_bar["value"] = 0
             self.status_label.config(text="计算失败")
             messagebox.showerror("计算失败", message)
             logger.error(f"压力驱动计算失败: {message}")
@@ -893,8 +1404,8 @@ class CalculationPage(ttk.Frame):
         self.is_calculating = False
         self.calculate_btn.config(state="normal")
         self.export_btn.config(state="normal")
-        self.progress_bar["value"] = 100
         self.status_label.config(text="计算完成")
+        self._clear_equiv_data()   # 非当量长度法：清除上次当量分配数据
         self.original_results = results.copy()
         if self.cad_data_manager and hasattr(self.cad_data_manager, 'nodes'):
             for node_result in results.get("node_results", []):
@@ -958,16 +1469,29 @@ class CalculationPage(ttk.Frame):
                 pipe_copy = {
                     "管道ID": pipe["pipe_id"],
                     "起点": pipe["node1"],
+                    "起点压力(m)": pipe["node1_pressure"] if pipe["node1_pressure"] is not None else "",
                     "终点": pipe["node2"],
+                    "终点压力(m)": pipe["node2_pressure"] if pipe["node2_pressure"] is not None else "",
                     "公称管径": pipe["nominal_diameter"],
                     "内径(mm)": pipe["inner_diameter"],
                     "管长(m)": pipe["length"],
+                    "计算长度(m)": pipe["calc_length"],
                     "管材": pipe["material"],
                     "流量(L/s)": pipe.get("raw_flow", 0.0),          # 原始流量，带符号
                     "流速(m/s)": pipe["velocity"],
                     "单位水损(m/m)": pipe["sort_unit_headloss"],
                     "水损(m)": pipe["sort_loss"],
-                    "状态": pipe["status"]
+                    "静态当量(m)": pipe["static_equiv"] if pipe["static_equiv"] is not None else "",
+                    "45弯头(m)": pipe["eq_45elbow"] if pipe["eq_45elbow"] is not None else "",
+                    "90弯头(m)": pipe["eq_90elbow"] if pipe["eq_90elbow"] is not None else "",
+                    "异径(m)": pipe["eq_reducer"] if pipe["eq_reducer"] is not None else "",
+                    "蝶阀(m)": pipe["eq_valve"] if pipe["eq_valve"] is not None else "",
+                    "动态当量(m)": pipe["dynamic_equiv"] if pipe["dynamic_equiv"] is not None else "",
+                    "三通直通(m)": pipe["eq_tees"] if pipe["eq_tees"] is not None else "",
+                    "三通侧通(m)": pipe["eq_teeside"] if pipe["eq_teeside"] is not None else "",
+                    "四通直通(m)": pipe["eq_cross_s"] if pipe["eq_cross_s"] is not None else "",
+                    "四通侧通(m)": pipe["eq_cross_side"] if pipe["eq_cross_side"] is not None else "",
+                    "四通混合(m)": pipe["eq_cross_mix"] if pipe["eq_cross_mix"] is not None else ""
                 }
                 pipe_data_for_save.append(pipe_copy)
             save_data["管道结果"] = convert_to_serializable(pipe_data_for_save)
@@ -1003,20 +1527,19 @@ class CalculationPage(ttk.Frame):
     def on_calculation_error(self, error_msg: str):
         self.is_calculating = False
         self.calculate_btn.config(state="normal")
-        self.progress_bar["value"] = 0
         self.status_label.config(text="计算失败")
         messagebox.showerror("计算失败", error_msg)
         logger.error(f"计算失败: {error_msg}")
 
-    def display_results(self, results: dict):
+    def display_results(self, results: dict, skip_paths: bool = False):
         self.original_results = results.copy()
         node_results = results.get("node_results", [])
         self.update_nodes_table(node_results)
         pipe_results = results.get("pipe_results", [])
         self.update_pipes_table(pipe_results)
-        self.find_and_display_all_paths(results)
+        if not skip_paths:
+            self.find_and_display_all_paths(results)
         self.status_label.config(text="计算完成")
-        self.progress_bar["value"] = 100
 
         pipe_dict = {}
         # ===== 修改：传递所有管道类型的计算结果（P_, R_, B_, L_） =====
@@ -1040,7 +1563,7 @@ class CalculationPage(ttk.Frame):
         node_flow_dict = {}
         for node_res in results.get("node_results", []):
             node_id = node_res["node_id"]
-            if node_id.startswith(("D_", "VD_", "RESERVOIR")):
+            if node_id.upper().startswith(("D_", "VD_", "RESERVOIR")):
                 continue
             # 跳过检修节点：所有连接管道都已关闭
             if self.cad_data_manager and hasattr(self.cad_data_manager, 'node_by_id'):
@@ -1069,7 +1592,7 @@ class CalculationPage(ttk.Frame):
             self.nodes_tree.delete(item)
 
         pipe_results = self.original_results.get("pipe_results", [])
-        real_pipes = [p for p in pipe_results if p.get("pipe_id", "").startswith("P_")]
+        real_pipes = [p for p in pipe_results if self.cad_data_manager.id_type(p.get("pipe_id", "")) == "P"]
         outflow = {}
         inflow = {}
         for pipe in real_pipes:
@@ -1083,6 +1606,21 @@ class CalculationPage(ttk.Frame):
             elif flow < 0:
                 outflow[n2] = outflow.get(n2, 0.0) + abs_flow
                 inflow[n1] = inflow.get(n1, 0.0) + abs_flow
+        # 全部管道（含 VP_D 虚拟管道、B_ 支管）的进出流量：仅用于 A 模式（虚拟节点）用水点流量计算。
+        # 普通节点与供水点仍使用上面的 P_ 管道统计，显示不受影响。
+        all_outflow = {}
+        all_inflow = {}
+        for pipe in pipe_results:
+            n1 = pipe.get("node1", "")
+            n2 = pipe.get("node2", "")
+            flow = pipe.get("flow_lps", 0.0)
+            abs_flow = abs(flow)
+            if flow > 0:
+                all_outflow[n1] = all_outflow.get(n1, 0.0) + abs_flow
+                all_inflow[n2] = all_inflow.get(n2, 0.0) + abs_flow
+            elif flow < 0:
+                all_outflow[n2] = all_outflow.get(n2, 0.0) + abs_flow
+                all_inflow[n1] = all_inflow.get(n1, 0.0) + abs_flow
 
         node_type_map = {}
         if self.cad_data_manager and hasattr(self.cad_data_manager, 'nodes'):
@@ -1106,7 +1644,7 @@ class CalculationPage(ttk.Frame):
         display_nodes = []
         for node in node_results:
             node_id = node["node_id"]
-            if node_id == "RESERVOIR" or node_id.startswith("D_"):
+            if node_id.upper() == "RESERVOIR" or node_id.upper().startswith(("D_", "VD_")):
                 continue
             node_type = node_type_map.get(node_id, "普通节点")
             if "用水点" in node_type and node_id not in selected_demand_node_ids:
@@ -1127,8 +1665,13 @@ class CalculationPage(ttk.Frame):
             # 从节点结果中获取流量（压力驱动计算的结果）
             # 注意：节点结果中 demand_lps 是用水点的需求，供水点无需求
             if "用水点" in node_type:
-                # 用水点：直接使用计算结果中的需求
-                node_flow = node.get("demand_lps", 0.0)
+                # 用水点：B/C 模式 demand_lps 非0，需求即流量（原行为不变）；
+                # A模式（虚拟节点）自身 demand=0，取连接管道（含 VP_D/B_）较大方向流量
+                demand_lps = node.get("demand_lps", 0.0)
+                if demand_lps > 0:
+                    node_flow = demand_lps
+                else:
+                    node_flow = max(all_outflow.get(node_id, 0.0), all_inflow.get(node_id, 0.0))
             elif "供水点" in node_type:
                 # 供水点：流量为流出该节点的管道流量之和
                 node_flow = outflow.get(node_id, 0.0)
@@ -1155,6 +1698,9 @@ class CalculationPage(ttk.Frame):
                 "sort_group": 0 if "供水点" in node_type else (1 if "用水点" in node_type else 2)
             })
 
+        # 保存节点ID -> 结果（raw_flow L/s, raw_pressure m）映射，供供水点和用水点页面按节点ID直接显示
+        self._node_result_map = {n["node_id"]: n for n in display_nodes}
+
         if not display_nodes:
             return
 
@@ -1178,15 +1724,21 @@ class CalculationPage(ttk.Frame):
                 display_nodes[group_start:group_start + len(group_nodes)] = group_nodes
                 group_start += len(group_nodes)
 
-        min_raw_pressure = min(n["raw_pressure"] for n in display_nodes)
+        # 最低压力：优先标红用水点中压力最低的行（最不利用水点），无用水点时兜底全局最低
+        water_nodes = [n for n in display_nodes if "用水点" in n["node_type"]]
+        if water_nodes:
+            min_raw_pressure = min(n["raw_pressure"] for n in water_nodes)
+        else:
+            min_raw_pressure = min(n["raw_pressure"] for n in display_nodes)
 
         row_number = 0
         for node in display_nodes:
             # 根据复选框决定是否跳过流量为零的节点
+            # （用水点节点始终显示：A模式虚拟节点下需求在D_虚拟节点上，实际用水点节点自身demand为0）
             if not self.show_zero_flow_var.get():
                 # 判断流量是否为零（用水点节点用 demand_lps，普通节点用 node_flow）
                 flow_abs = abs(node.get("raw_flow", 0.0)) if "raw_flow" in node else 0.0
-                if flow_abs < 0.001:
+                if flow_abs < 0.001 and "用水点" not in node["node_type"]:
                     continue
             item_id = self.nodes_tree.insert("", "end", values=(
                 node["node_id"],
@@ -1226,7 +1778,8 @@ class CalculationPage(ttk.Frame):
         pipe_info = {}
         for pipe in pipe_results:
             pipe_id = pipe.get("pipe_id", "")
-            if pipe_id.startswith("VP_") or pipe_id.startswith("VD_") or pipe_id == "RESERVOIR":
+            pid_upper = pipe_id.upper()
+            if (pid_upper.startswith(("VP_", "VD_")) or pid_upper == "RESERVOIR"):
                 continue
             n1 = pipe.get("node1", "")
             n2 = pipe.get("node2", "")
@@ -1251,9 +1804,9 @@ class CalculationPage(ttk.Frame):
             logger.info(f"供水点 {supply} 在图中: {supply in directed_graph}")
         for demand in demand_nodes[:5]:
             logger.info(f"用水点 {demand} 在图中: {demand in directed_graph}")
-        # 打印前10条管道的流量信息
+        # 打印前10条管道的流量信息（调试用）
         for pipe in pipe_results[:10]:
-            logger.info(f"管道 {pipe['pipe_id']}: {pipe['node1']} -> {pipe['node2']}, flow={pipe['flow_lps']:.3f}")
+            logger.debug(f"管道 {pipe['pipe_id']}: {pipe['node1']} -> {pipe['node2']}, flow={pipe['flow_lps']:.3f}")
         
         # 获取所有供水点节点
         supply_nodes = []
@@ -1262,12 +1815,14 @@ class CalculationPage(ttk.Frame):
                 supply_nodes.extend(supply.node_ids)
         supply_nodes = list(set(supply_nodes))
         
-        # 获取所有被勾选的用水点节点
+        # 获取所有被勾选的用水点节点（跳过状态为"关"的用水点）
         demand_nodes = []
         if self.cad_data_manager and hasattr(self.cad_data_manager, 'demand_groups'):
             for group in self.cad_data_manager.demand_groups.values():
                 if group.is_selected:
                     for demand_node in group.demand_nodes:
+                        if demand_node.status == "关":
+                            continue
                         if demand_node.node_id not in demand_nodes:
                             demand_nodes.append(demand_node.node_id)
         if not demand_nodes:
@@ -1322,7 +1877,7 @@ class CalculationPage(ttk.Frame):
                             logger.debug(f"路径无效: 管道缺失 {n1}→{n2}")
                             break
                         unit_loss = pipe.get("headloss_m", 0.0)
-                        pipe_length = pipe.get("length", 0.0)
+                        pipe_length = pipe.get("calc_length", 0.0) or pipe.get("length", 0.0)
                         friction_loss_pipe = unit_loss * pipe_length
                         total_friction_loss += abs(friction_loss_pipe)
                         total_length += pipe_length
@@ -1343,7 +1898,7 @@ class CalculationPage(ttk.Frame):
                         pipe = pipe_info.get((n1, n2))
                         if pipe:
                             unit_loss = pipe.get("headloss_m", 0.0)
-                            pipe_length = pipe.get("length", 0.0)
+                            pipe_length = pipe.get("calc_length", 0.0) or pipe.get("length", 0.0)
                             pipe_friction = unit_loss * pipe_length
                             accumulated_loss += pipe_friction
                             # 节点处总水损 = 累计沿程水损 + 累计局部水损（按比例）
@@ -1418,9 +1973,7 @@ class CalculationPage(ttk.Frame):
                 return
             downstream_nodes = graph.get(current, [])
             for next_node in downstream_nodes:
-                if (next_node.startswith("RESERVOIR") or 
-                    next_node.startswith("VD_") or 
-                    next_node.startswith("D_")):
+                if (next_node.upper().startswith(("RESERVOIR", "VD_", "D_"))):
                     continue
                 if next_node not in visited:
                     visited.add(next_node)
@@ -1428,9 +1981,7 @@ class CalculationPage(ttk.Frame):
                     dfs(next_node, visited, path)
                     path.pop()
                     visited.remove(next_node)
-        if (start.startswith("RESERVOIR") or 
-            start.startswith("VD_") or 
-            start.startswith("D_")):
+        if (start.upper().startswith(("RESERVOIR", "VD_", "D_"))):
             return paths
         visited = {start}
         dfs(start, visited, [start])
@@ -1457,6 +2008,9 @@ class CalculationPage(ttk.Frame):
             self.pipes_tree.heading("flow", text=f"流量({demand_unit})")
             self.pipes_tree.heading("loss", text=f"水损({pressure_unit})")
             self.pipes_tree.heading("unit_headloss", text=f"单位水损({pressure_unit}/m)")
+            self.pipes_tree.heading("node1_pressure", text=f"起点压力({pressure_unit})")
+            self.pipes_tree.heading("node2_pressure", text=f"终点压力({pressure_unit})")
+            self.pipes_tree.heading("calc_length", text="计算长度(m)")
         if hasattr(self, 'paths_tree'):
             self.paths_tree.heading("total_loss", text=f"总水损({pressure_unit})")
 
@@ -1468,8 +2022,8 @@ class CalculationPage(ttk.Frame):
             return
         default_name = os.path.basename(self.current_project_dir) + "_results"
         file_path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON文件", "*.json"), ("Excel文件", "*.xlsx"), ("所有文件", "*.*")],
+            defaultextension=".xlsx",
+            filetypes=[("Excel文件", "*.xlsx"), ("JSON文件", "*.json"), ("所有文件", "*.*")],
             initialfile=default_name
         )
         if not file_path:
@@ -1494,7 +2048,9 @@ class CalculationPage(ttk.Frame):
             "路径结果": [],
             "计算设置": {
                 "流量单位": "m³/h" if self.show_flow_in_m3h else "L/s",
-                "压力单位": "MPa" if self.show_pressure_in_mpa else "m"
+                "压力单位": "MPa" if self.show_pressure_in_mpa else "m",
+                "计算方法": "当量长度法" if getattr(self, 'equiv_analysis', None) else "压力驱动/局部水损系数法",
+                "当量系数": self.equiv_coeff if getattr(self, 'equiv_analysis', None) else ""
             }
         }
         for item in self.nodes_tree.get_children():
@@ -1508,20 +2064,33 @@ class CalculationPage(ttk.Frame):
                 })
         for item in self.pipes_tree.get_children():
             values = self.pipes_tree.item(item, "values")
-            if values and len(values) >= 12:
+            if values and len(values) >= 15:
                 export_data["管道结果"].append({
                     "管道ID": values[0],
                     "起点": values[1],
-                    "终点": values[2],
-                    "公称管径": values[3],
-                    "内径(mm)": values[4],
-                    "管长(m)": values[5],
-                    "管材": values[6],
-                    "流量": values[7],
-                    "流速(m/s)": values[8],
-                    "单位水损(m/m)": values[9],
-                    "水损(m)": values[10],
-                    "状态": values[11]
+                    "起点压力": values[2],
+                    "终点": values[3],
+                    "终点压力": values[4],
+                    "公称管径": values[5],
+                    "内径(mm)": values[6],
+                    "管长(m)": values[7],
+                    "计算长度(m)": values[8],
+                    "管材": values[9],
+                    "流量": values[10],
+                    "流速(m/s)": values[11],
+                    "单位水损(m/m)": values[12],
+                    "水损(m)": values[13],
+                    "静态当量(m)": values[14],
+                    "45弯头(m)": values[15] if len(values) >= 16 else "",
+                    "90弯头(m)": values[16] if len(values) >= 17 else "",
+                    "异径(m)": values[17] if len(values) >= 18 else "",
+                    "蝶阀(m)": values[18] if len(values) >= 19 else "",
+                    "动态当量(m)": values[19] if len(values) >= 20 else "",
+                    "三通直通(m)": values[20] if len(values) >= 21 else "",
+                    "三通侧通(m)": values[21] if len(values) >= 22 else "",
+                    "四通直通(m)": values[22] if len(values) >= 23 else "",
+                    "四通侧通(m)": values[23] if len(values) >= 24 else "",
+                    "四通混合(m)": values[24] if len(values) >= 25 else ""
                 })
         for item in self.paths_tree.get_children():
             values = self.paths_tree.item(item, "values")
@@ -1531,7 +2100,99 @@ class CalculationPage(ttk.Frame):
                     "总水损(m)": values[1],
                     "节点路径": values[2]
                 })
+        # 当量长度法：附加分配明细与管道汇总两个区块
+        equiv_detail, equiv_summary = self._build_equiv_export_blocks()
+        if equiv_detail is not None:
+            export_data["当量长度分配"] = equiv_detail
+            export_data["管道当量汇总"] = equiv_summary
+
+        # ===== 增加：管道/节点/阀门/供水点/用水点页面内容 =====
+        # 管道与节点忽略无效项（is_active=False）
+        if self.cad_data_manager is not None:
+            export_data["管道数据"] = [
+                {
+                    "管道ID": p.pipe_id,
+                    "起点": p.start_node_id,
+                    "终点": p.end_node_id,
+                    "管径": p.nominal_diameter,
+                    "内径(mm)": p.inner_diameter,
+                    "管长(m)": p.length,
+                    "状态": p.status,
+                    "类型": p.pipe_type,
+                    "管材": p.material,
+                }
+                for p in self.cad_data_manager.pipes if p.is_active
+            ]
+            export_data["节点数据"] = [
+                {
+                    "节点ID": n.node_id,
+                    "状态": n.status,
+                    "X坐标": n.x,
+                    "Y坐标": n.y,
+                    "Z坐标": n.z,
+                    "节点类型": n.node_type,
+                    "连接管道": "、".join(n.connected_pipes or []),
+                }
+                for n in self.cad_data_manager.nodes if n.is_active
+            ]
+            export_data["阀门数据"] = [
+                {
+                    "阀门ID": v.valve_id,
+                    "所在管道ID": v.pipe_id if v.pipe_id else "未匹配",
+                    "状态": v.status,
+                    "X坐标": v.x,
+                    "Y坐标": v.y,
+                    "Z坐标": v.z,
+                }
+                for v in self.cad_data_manager.valves
+            ]
+            # 供水点压力优先取计算结果（C模式后 supply_nodes[0].pressure 保持输入值0，
+            # 计算结果中的供水点节点压力仍在 node_results 中，导出保留计算值）
+            _supply_pressure_map = {}
+            if getattr(self, 'original_results', None):
+                for _nr in self.original_results.get("node_results", []):
+                    _supply_pressure_map[_nr["node_id"]] = _nr.get("pressure_m", 0.0)
+            export_data["供水点数据"] = [
+                {
+                    "组ID": s.group_id,
+                    "节点列表": "、".join(s.node_ids),
+                    "压力": (_supply_pressure_map.get(s.node_ids[0], s.pressure)
+                             if s.node_ids else s.pressure),
+                }
+                for s in self.cad_data_manager.supply_nodes
+            ]
+            demand_rows = []
+            for gid, group in self.cad_data_manager.demand_groups.items():
+                base_info = {
+                    "组ID": gid,
+                    "参与计算": "是" if group.is_selected else "否",
+                    "总流量": group.total_flow,
+                    "最低水压": group.min_pressure,
+                }
+                if not group.demand_nodes:
+                    demand_rows.append({**base_info, "节点ID": "", "状态": "",
+                                        "流量": "", "压力": ""})
+                for node in group.demand_nodes:
+                    demand_rows.append({**base_info, "节点ID": node.node_id,
+                                        "状态": node.status, "流量": node.flow,
+                                        "压力": node.pressure})
+            export_data["用水点数据"] = demand_rows
         return export_data
+
+    def _build_equiv_export_blocks(self):
+        """构造当量长度分配明细与管道汇总（无当量数据时返回 (None, None)）"""
+        if not getattr(self, 'equiv_analysis', None):
+            return None, None
+        from core.equiv_length_engine import (
+            collect_equiv_detail_rows, collect_equiv_summary_rows,
+        )
+        detail = collect_equiv_detail_rows(
+            self.equiv_analysis, self.equiv_l_current, self.cad_data_manager,
+            getattr(self, 'equiv_kinds', {}))
+        summary = collect_equiv_summary_rows(
+            self.cad_data_manager, self.equiv_analysis, self.equiv_l_current,
+            float(getattr(self, 'equiv_coeff', 0.0) or 0.0))
+        return detail, summary
 
     def export_to_excel(self, file_path: str, data: dict):
         try:
@@ -1546,6 +2207,21 @@ class CalculationPage(ttk.Frame):
                 if data["路径结果"]:
                     df_paths = pd.DataFrame(data["路径结果"])
                     df_paths.to_excel(writer, sheet_name='路径结果', index=False)
+                if data.get("当量长度分配"):
+                    pd.DataFrame(data["当量长度分配"]).to_excel(
+                        writer, sheet_name='当量长度分配', index=False)
+                if data.get("管道当量汇总"):
+                    pd.DataFrame(data["管道当量汇总"]).to_excel(
+                        writer, sheet_name='管道当量汇总', index=False)
+                # 管道/节点/阀门/供水点/用水点页面数据
+                for key, sheet_name in (("管道数据", "管道数据"),
+                                        ("节点数据", "节点数据"),
+                                        ("阀门数据", "阀门数据"),
+                                        ("供水点数据", "供水点数据"),
+                                        ("用水点数据", "用水点数据")):
+                    if data.get(key):
+                        pd.DataFrame(data[key]).to_excel(
+                            writer, sheet_name=sheet_name, index=False)
                 df_settings = pd.DataFrame([data["计算设置"]])
                 df_settings.to_excel(writer, sheet_name='计算设置', index=False)
         except ImportError:
@@ -1613,6 +2289,28 @@ class CalculationPage(ttk.Frame):
         if preview:
             preview.jump_to_pipe(values[0], to_global=False)
 
+    def jump_to_node_spliced(self):
+        selection = self.nodes_tree.selection()
+        if not selection:
+            return
+        values = self.nodes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_spliced_view(entity_type="node", entity_id=values[0])
+
+    def jump_to_pipe_spliced(self):
+        selection = self.pipes_tree.selection()
+        if not selection:
+            return
+        values = self.pipes_tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_spliced_view(entity_type="pipe", entity_id=values[0])
+
     def show_temp_message(self, message: str, duration: int = 2000):
         root = self.winfo_toplevel()
         if hasattr(root, 'show_temp_message'):
@@ -1629,13 +2327,24 @@ class CalculationPage(ttk.Frame):
                 for tree in [self.paths_tree, self.nodes_tree, self.pipes_tree]:
                     for item in tree.get_children():
                         tree.delete(item)
+                # 旧CAD的计算结果与路径对当前数据无效：一并清除，
+                # 并清空预览页路径列表，避免"路径表空而预览残留旧路径高亮"（区域模式读取新CAD时尤为明显）
+                self.all_paths_for_preview = []
+                self.node_total_loss = {}
+                self.original_results = None
+                root = self.winfo_toplevel()
+                main_app = getattr(root, 'main_app', None)
+                if main_app and hasattr(main_app, 'pages'):
+                    preview_page = main_app.pages.get("管网预览")
+                    if preview_page:
+                        preview_page.set_path_list([])
         if self.cad_data_manager.is_loaded:
             self.calculate_btn.config(state="normal")
         self.update_table_headers()
         self.status_label.config(text="就绪")
-        # 如果已有计算结果，重新显示
+        # 如果已有计算结果，重新显示（刷新场景跳过路径重算，避免导入后多次重复计算）
         if hasattr(self, 'original_results') and self.original_results:
-            self.display_results(self.original_results)
+            self.display_results(self.original_results, skip_paths=True)
             
         
     def correct_all_pipe_diameters(self):
@@ -1668,11 +2377,11 @@ class CalculationPage(ttk.Frame):
         for pipe_res in pipe_results:
             pipe_id = pipe_res.get("pipe_id", "")
             # 跳过消火栓支管（始终DN65）
-            if pipe_id.startswith("B_"):
+            if self.cad_data_manager.id_type(pipe_id) == "B":
                 continue
             # 只处理P_、SP_、R_、L_开头管道
-            if not (pipe_id.startswith("P_") or pipe_id.startswith("SP_") or
-                    pipe_id.startswith("R_") or pipe_id.startswith("L_")):
+            if not (self.cad_data_manager.id_type(pipe_id) == "P" or self.cad_data_manager.id_type(pipe_id) == "SP" or
+                    self.cad_data_manager.id_type(pipe_id) == "R" or self.cad_data_manager.id_type(pipe_id) == "L"):
                 continue
             velocity = pipe_res.get("velocity_mps", 0.0)
             if (high and velocity > max_v) or (not high and velocity < min_v):
@@ -1693,7 +2402,7 @@ class CalculationPage(ttk.Frame):
                         except: pass
                     if dn_num == 65:
                         continue  # 所有DN65跳过
-                    if pipe_id.startswith("R_") or pipe_id.startswith("L_"):
+                    if self.cad_data_manager.id_type(pipe_id) == "R" or self.cad_data_manager.id_type(pipe_id) == "L":
                         if dn_num < 100:
                             continue  # R_/L_只处理DN100+
                         if not high:
@@ -1725,6 +2434,11 @@ class CalculationPage(ttk.Frame):
         self.pipe_display_data = []
         self.all_paths_for_preview = []
         self.node_total_loss = {}
+        # 初始化/清空当量长度分配数据（按钮可能尚未创建，_clear_equiv_data 内有保护）
+        self.equiv_analysis = None
+        self.equiv_l_current = {}
+        self.equiv_coeff = 0.0
+        self._clear_equiv_data()
         # 清空表格
         for tree in [self.paths_tree, self.nodes_tree, self.pipes_tree]:
             for item in tree.get_children():
@@ -1732,7 +2446,6 @@ class CalculationPage(ttk.Frame):
         # 重置按钮状态
         self.calculate_btn.config(state="disabled" if not self.cad_data_manager.is_loaded else "normal")
         self.export_btn.config(state="disabled")
-        self.progress_bar["value"] = 0
         self.status_label.config(text="就绪")
 
     def get_state_for_export(self) -> dict:

@@ -11,7 +11,8 @@ import math
 import logging
 from typing import List, Dict, Tuple, Optional, Set
 from collections import defaultdict, deque
-from cad_data_manager import HydrantData, ValveData, DemandGroupData, DemandNodeData, PipeData, NodeData, SupplyNodeData
+from cad_data_manager import FloorData, HydrantData, ValveData, DemandGroupData, DemandNodeData, PipeData, NodeData, SupplyNodeData, ConnectionPointData
+from gui.building_preview_manager import BuildingPreviewManager
 logger = logging.getLogger(__name__)
 try:
     from pyautocad import Autocad, APoint, aDouble
@@ -167,11 +168,12 @@ class LayerColorDialog:
             self.last_target = None
 
     def refresh_table(self):
-        """刷新表格数据，并更新背景色"""
+        """刷新表格数据，并更新背景色（只显示当前楼栋的楼层）"""
         self.tree.delete(*self.tree.get_children())
-        # 获取楼层分配信息（按标高升序排列）
-        sorted_floors = sorted(self.preview.cad_data_manager.floors, key=lambda f: f.elevation)
-        num_floors = len(sorted_floors)
+        # 获取当前楼栋的楼层分配信息（按标高升序排列）
+        bid = self.preview._current_building_id or ""
+        building_floors = [f for f in self.preview.cad_data_manager.floors if f.building_id == bid]
+        sorted_floors = sorted(building_floors, key=lambda f: f.elevation)
         num_colors = len(self.preview.layer_color_list)
         # 构建楼层到颜色索引的映射
         floor_to_color_idx = {}
@@ -389,6 +391,9 @@ class PreviewPage(ttk.Frame):
         self.compass_center_x = 60                # 罗盘圆心 X（画布坐标）
         self.compass_center_y = 60                # 罗盘圆心 Y
 
+        # ===== 按楼栋独立的视角方向（Batch 2） =====
+        self._building_view_angles: Dict[str, dict] = {}  # {building_id: {angle, elevation, elevation_var, nav_angle}}
+
         # 显示选项
         self.show_nominal = tk.BooleanVar(value=True)
         self.show_length = tk.BooleanVar(value=False)
@@ -398,9 +403,11 @@ class PreviewPage(ttk.Frame):
         self.show_arrow = tk.BooleanVar(value=False)
         self.show_node_ids = tk.BooleanVar(value=False)
         self.real_time = tk.BooleanVar(value=True)
-        self._skip_z_recalc = False   # 用户手动修改标高时跳过自动计算
         self.show_pipe_id = tk.BooleanVar(value=False)
         self.show_elevation = tk.BooleanVar(value=False)  # 横管标高，缺省不勾选
+        self.show_connection_id_var = tk.BooleanVar(value=True)  # 连接点编号，缺省勾选
+        self.equiv_color_var = tk.BooleanVar(value=False)  # 当量长度热力着色，缺省不勾选
+        self._skip_z_recalc = False   # 导入/刷新时跳过Z重算，防止覆盖用户设置的标高
         
         # 显示前后遮挡（新增）
         self.show_occlusion_var = tk.BooleanVar(value=True)  # 缺省打开
@@ -428,11 +435,19 @@ class PreviewPage(ttk.Frame):
         # 消火栓支管向左展开（仅整体管网）
         self.hydrant_branch_flat_var = tk.BooleanVar(value=False)
 
+        # ===== 管道操作栏状态按楼栋独立存储 =====
+        self._building_hide_invalid: Dict[str, bool] = {}
+        self._building_show_occlusion: Dict[str, bool] = {}
+        self._building_velocity_check: Dict[str, bool] = {}
+        self._building_skip_dn_short_pipe: Dict[str, bool] = {}
+        self._building_hydrant_branch_flat: Dict[str, bool] = {}
+
         # 节点流量缓存（从 calculation_module 传入）
         self.node_flows: Dict[str, float] = {}
 
         # Alt 悬停信息框
         self.alt_pressed = False
+        self._last_mouse_alt = False     # 最近一次鼠标移动事件的 Alt 修饰键状态（不依赖键盘焦点）
         self._hover_tooltip_id = None
         self._hover_tooltip_win = None
         self._hover_info = None          # (info_type, lines)
@@ -450,6 +465,15 @@ class PreviewPage(ttk.Frame):
 
         # 投影坐标缓存（世界坐标，单位毫米）
         self.projected_coords: Dict[str, Tuple[float, float]] = {}
+        self._global_projected_coords: Dict[str, Tuple[float, float]] = {}
+        self._global_projected_depth: Dict[str, float] = {}
+        self._global_cache_key = None
+
+        # 拼接管网视图状态
+        self.is_spliced = False
+        self._spliced_canvas = None
+        self._spliced_base_bid = ""
+        self._spliced_target_bid = ""
 
         # 连通性缓存
         self.reachable_pipes: Set[str] = set()
@@ -460,6 +484,12 @@ class PreviewPage(ttk.Frame):
         self.bind("<KeyRelease-Alt_L>", self._on_alt_release)
         self.bind("<KeyRelease-Alt_R>", self._on_alt_release)
 
+        # 建筑预览管理器（必须在 create_widgets 前初始化）
+        self._single_building = None
+        self._building_managers = {}
+        self._current_building_id = None
+        self.building_notebook = None
+
         # 创建界面
         self.create_widgets()
         self.update_projection()
@@ -467,7 +497,8 @@ class PreviewPage(ttk.Frame):
         self.auto_center()
         self.redraw()
         
-        # ===== 分层颜色相关属性 =====
+        # ===== 分层颜色相关属性（按楼栋独立） =====
+        self._building_layer_colors_enabled: Dict[str, bool] = {}  # {building_id: enabled}
         self.layer_colors_enabled = tk.BooleanVar(value=False)  # 是否启用分层颜色，缺省不勾选
         self.layer_color_list = []      # 颜色列表，每个元素: {"name": str, "r": int, "g": int, "b": int, "hex": str}
         self.floor_color_map = {}       # 楼层名 -> 颜色十六进制字符串 (如 "#FFB3B3")
@@ -481,17 +512,15 @@ class PreviewPage(ttk.Frame):
         self.selection_rect = None          # 框选矩形ID
         self.selection_start = None         # 框选起点（画布坐标）
         self.selection_mode = False         # 是否处于框选模式
+        self._calib_drag = None             # Shift拖动状态 (rect, cp, dir_vec)
         self.problem_pipes: Set[str] = set()  # 问题管道ID集合（由CADDataManager验证得到）
 
-        # 楼层相关
-        self.floor_notebook = None          # 楼层标签页控件
-        self.floor_canvases = {}            # 每个楼层的画布
-        self.current_floor_name = None      # 当前显示的楼层名
-        self._current_canvas = None         # 当前活动的画布对象
+        # 当前活动的画布对象（直接属性，在 building/floor 切换时与 manager 同步）
+        self._current_canvas = None
 
-        # 每个楼层的独立视图状态（用于切换时恢复）
-        self.floor_view_state: Dict[str, Tuple[float, float, float]] = {}
-        
+        # 投影质心缓存（project_point 在 global 模式下复用，视角变化时自动失效）
+        self._centroid_cache = None
+
         # 缓存分组映射，用于判断是否需要重建标签页
         self._cached_grouped_floors_map = {}        
 
@@ -502,6 +531,7 @@ class PreviewPage(ttk.Frame):
         self.undo_stack = []
         self.redo_stack = []
         self.max_undo = 40
+        self._pairing_dialog = None
 
         # 检修区管理
         self.maintenance_zones: List[MaintenanceZone] = []
@@ -509,13 +539,106 @@ class PreviewPage(ttk.Frame):
 
         # 楼层分离相关（仅内存，需求95）
         self.separation_values: Dict[str, float] = {}   # 楼层名 -> 分离值(米)
-        self._separation_applied = False                  # 是否已应用分离显示
+        self._separation_applied = False                  # 是否已应用分离显示（全局标记，仅用于UI反馈）
+        self._sep_active = False                          # 正在绘制分离模式的整体管网（draw_valve 据此修正插入点偏移）
+
+    def _is_separation_applied(self):
+        """检查当前楼栋是否有已应用的分离值（复合 key 兼容区域模式）"""
+        bid = self._current_building_id or ""
+        prefix = f"{bid}|"
+        return any(k.startswith(prefix) and v > 0 for k, v in self.separation_values.items())
 
         # 绑定全局ESC键
         # self.bind("<KeyPress-Escape>", self.on_escape)
 
         self.canvas.bind("<KeyPress-Escape>", self.on_escape)
         self.canvas.focus_set()  # 确保画布获得焦点
+
+    # ===== 建筑预览管理器 property 代理 =====
+
+    @property
+    def _active_building(self):
+        bm = getattr(self, '_single_building', None)
+        if bm is None:
+            return None
+        if (bool(self.cad_data_manager.building_order)
+                and hasattr(self, '_building_managers')
+                and self._current_building_id in self._building_managers):
+            return self._building_managers[self._current_building_id]
+        return bm
+
+    @property
+    def floor_notebook(self):
+        ab = self._active_building
+        return ab.floor_notebook if ab else None
+
+    @floor_notebook.setter
+    def floor_notebook(self, value):
+        ab = self._active_building
+        if ab:
+            ab.floor_notebook = value
+        else:
+            self.__dict__['floor_notebook'] = value
+
+    @property
+    def floor_canvases(self):
+        ab = self._active_building
+        if ab:
+            return ab.floor_canvases
+        return self.__dict__.get('floor_canvases', {})
+
+    @floor_canvases.setter
+    def floor_canvases(self, value):
+        ab = self._active_building
+        if ab:
+            ab.floor_canvases = value
+        else:
+            self.__dict__['floor_canvases'] = value
+
+    @property
+    def current_floor_name(self):
+        ab = self._active_building
+        if ab:
+            return ab.current_floor_name
+        return self.__dict__.get('current_floor_name')
+
+    @current_floor_name.setter
+    def current_floor_name(self, value):
+        ab = self._active_building
+        if ab:
+            ab.current_floor_name = value
+        else:
+            self.__dict__['current_floor_name'] = value
+
+    @property
+    def current_view_mode(self):
+        ab = self._active_building
+        if ab:
+            return ab.current_view_mode
+        return self.__dict__.get('current_view_mode', 'floor')
+
+    @current_view_mode.setter
+    def current_view_mode(self, value):
+        ab = self._active_building
+        if ab:
+            ab.current_view_mode = value
+        else:
+            self.__dict__['current_view_mode'] = value
+
+    @property
+    def floor_view_state(self):
+        ab = self._active_building
+        if ab:
+            return ab.floor_view_state
+        return self.__dict__.get('floor_view_state', {})
+
+    @floor_view_state.setter
+    def floor_view_state(self, value):
+        ab = self._active_building
+        if ab:
+            ab.floor_view_state = value
+        else:
+            self.__dict__['floor_view_state'] = value
 
     def load_floor_colors(self):
         """从 floor_pipes_colors.json 加载颜色配置，文件不存在则使用默认颜色"""
@@ -577,23 +700,24 @@ class PreviewPage(ttk.Frame):
             logger.error(f"保存 floor_pipes_colors.json 失败: {e}")
 
     def update_floor_color_map(self):
-        """根据当前颜色列表和楼层列表，按标高从低到高分配颜色（循环使用）"""
+        """根据当前颜色列表和楼层列表，按楼栋+标高从低到高分配颜色（循环使用）"""
+        self.floor_color_map.clear()
         if not self.cad_data_manager.floors:
-            self.floor_color_map.clear()
+            self._build_pipe_floor_map()
             return
-        # 按标高从低到高排序楼层
-        sorted_floors = sorted(self.cad_data_manager.floors, key=lambda f: f.elevation)
-        num_floors = len(sorted_floors)
+        # 按楼栋分组分配颜色
+        bids = set(f.building_id or "" for f in self.cad_data_manager.floors)
         num_colors = len(self.layer_color_list)
-        for idx, floor in enumerate(sorted_floors):
-            if num_colors == 0:
-                # 没有颜色，直接清空映射（后续会走原有颜色逻辑）
-                color_hex = None
-            else:
-                color_idx = idx % num_colors
-                color_hex = self.layer_color_list[color_idx]["hex"]
-            self.floor_color_map[floor.name] = color_hex
-        # 重新构建管道->楼层映射（因为楼层可能变化）
+        for bid in bids:
+            bfloors = [f for f in self.cad_data_manager.floors if (f.building_id or "") == bid]
+            sorted_f = sorted(bfloors, key=lambda f: f.elevation)
+            bmap = {}
+            for idx, f in enumerate(sorted_f):
+                if num_colors == 0:
+                    bmap[f.name] = None
+                else:
+                    bmap[f.name] = self.layer_color_list[idx % num_colors]["hex"]
+            self.floor_color_map[bid] = bmap
         self._build_pipe_floor_map()
 
     def show_layer_color_dialog(self):
@@ -635,6 +759,13 @@ class PreviewPage(ttk.Frame):
         if not self.cad_data_manager.floors:
             return
     
+        # 获取当前楼栋的楼层列表
+        bid = self._current_building_id or ""
+        building_floors = [f for f in self.cad_data_manager.floors if f.building_id == bid]
+        if not building_floors:
+            return
+        bmap = self.floor_color_map.get(bid, {})
+    
         # 获取画布尺寸
         self.canvas.update_idletasks()
         canvas_width = self.canvas.winfo_width()
@@ -644,7 +775,7 @@ class PreviewPage(ttk.Frame):
             return
     
         # 楼层按标高从低到高排序（最低楼层在底部）
-        sorted_floors = sorted(self.cad_data_manager.floors, key=lambda f: f.elevation)
+        sorted_floors = sorted(building_floors, key=lambda f: f.elevation)
     
         # 紧凑行高
         line_height = 14
@@ -653,7 +784,7 @@ class PreviewPage(ttk.Frame):
         start_y = canvas_height - 10
     
         for idx, floor in enumerate(sorted_floors):
-            color_hex = self.floor_color_map.get(floor.name, "#FFFFFF")
+            color_hex = bmap.get(floor.name, "#FFFFFF")
             text = f"{floor.name}  FL {floor.elevation:.2f}"
     
             # 绘制文字（左下角对齐，背景透明）
@@ -687,6 +818,65 @@ class PreviewPage(ttk.Frame):
             )
             self.legend_items.append(line_id)
 
+    def draw_connection_points(self):
+        """在画布上绘制所有连接点（仅区域模式）"""
+        if not self.cad_data_manager.building_order:
+            return
+        if not self.cad_data_manager.connection_points:
+            return
+        # 过滤当前楼栋
+        bprefix = self._get_building_prefix()
+        if not bprefix:
+            return
+        canvas = self._current_canvas
+        if not canvas or not canvas.winfo_exists():
+            return
+        cp_size = max(4, int(5 * self.scale))
+        show_id = self.show_connection_id_var.get()
+        for cp in self.cad_data_manager.connection_points:
+            if not cp.point_id.startswith(bprefix):
+                continue
+            # 楼层模式仅显示本楼层的连接点（兼容旧数据：floor_name 为空时不过滤）
+            if self.current_view_mode == "floor" and cp.floor_name and cp.floor_name != self.current_floor_name:
+                continue
+            if cp.calib_dx or cp.calib_dy:
+                px, py = self.project_point(
+                    cp.x + cp.calib_dx, cp.y + cp.calib_dy, cp.z)
+                pos = (px, py)
+            else:
+                pos = self.projected_coords.get(cp.node_id)
+                if not pos:
+                    px, py = self.project_point(cp.x, cp.y, cp.z)
+                    pos = (px, py)
+            cpos = self.world_to_canvas(*pos)
+            x, y = cpos
+            if cp.paired_with:
+                fill_color = "#32CD32"
+                outline_color = "#006400"
+                label_text = f"{cp.point_id}&{cp.paired_with}"
+                label_color = "#32CD32"
+            else:
+                fill_color = "#FFD700"
+                outline_color = "#B8860B"
+                label_text = cp.point_id
+                label_color = "#FFD700"
+            cp_tags = ("connection_point",)
+            if cp.paired_with:
+                rect = self.cad_data_manager.get_calibration_rect_for_cp(cp.point_id)
+                if rect:
+                    cp_tags = ("connection_point", f"calib_cp_{cp.point_id}")
+            canvas.create_oval(
+                x - cp_size, y - cp_size, x + cp_size, y + cp_size,
+                fill=fill_color, outline=outline_color, width=1,
+                tags=cp_tags
+            )
+            if show_id:
+                canvas.create_text(
+                    x + cp_size + 3, y, text=label_text,
+                    fill=label_color, font=("Arial", 16, "bold"), anchor="w",
+                    tags="connection_point"
+                )
+
     def _build_pipe_floor_map(self):
         """为所有管道建立管道ID到楼层名的映射"""
         self.pipe_floor_map.clear()
@@ -700,29 +890,76 @@ class PreviewPage(ttk.Frame):
         import json
         import os
 
-        # 即使没有楼层数据也允许手动添加
+        is_region = bool(self.cad_data_manager.building_order)
+
         if not self.cad_data_manager.floors:
             if not messagebox.askyesno("提示", "当前没有楼层数据，是否继续手动创建楼层？"):
                 return
 
         dialog = tk.Toplevel(self)
         dialog.title("楼层与管网标高表")
-        dialog.geometry("720x500")
+        dialog.geometry("720x580")
         dialog.transient(self)
-        # 不调用 grab_set()，保持画布可拖拽和缩放（需求98）
         self.center_dialog(dialog)
-        
-        # 顶部输入框
+        dialog.protocol("WM_DELETE_WINDOW", lambda: cancel())
+
+        # ===== 每建筑独立状态（含偏移量，存实例属性跨对话持久化） =====
+        if not hasattr(self, '_dialog_offset_values'):
+            self._dialog_offset_values = {}
+        _building_offset_values = self._dialog_offset_values
+        _initial_offsets = dict(self._dialog_offset_values)
+        _tab_states: dict[str, dict] = {}
+        saved_offset_default = "0.8"
+        current_tab_bid: list[str] = [""]
+
+        # ===== 区域模式：单体标签栏 =====
+        if is_region:
+            building_ids = self.cad_data_manager.building_order
+            tab_notebook = ttk.Notebook(dialog)
+            tab_notebook.pack(fill="x", padx=10, pady=(5, 0))
+            for bid in building_ids:
+                frame = ttk.Frame(tab_notebook)
+                tab_notebook.add(frame, text=bid)
+                _tab_states[bid] = {"manual_overrides": set(), "tree_data": None}
+                _building_offset_values.setdefault(bid, saved_offset_default)
+            current_tab_bid[0] = building_ids[0]
+        else:
+            bid = self._current_building_id or ""
+            current_tab_bid[0] = bid
+            key = bid if bid else "__single__"
+            _tab_states[key] = {"manual_overrides": set(), "tree_data": None}
+            _building_offset_values.setdefault(key, saved_offset_default)
+
+        # ===== 动态获取辅助函数 =====
+        def get_current_bid():
+            return current_tab_bid[0]
+
+        def get_target_floors():
+            cbid = get_current_bid()
+            if is_region and cbid:
+                return [f for f in self.cad_data_manager.floors if f.building_id == cbid]
+            return self.cad_data_manager.floors
+
+        def get_tab_key():
+            cbid = get_current_bid()
+            if is_region and cbid:
+                return cbid
+            return cbid if cbid else "__single__"
+
+        def get_manual_overrides():
+            return _tab_states[get_tab_key()]["manual_overrides"]
+
+        # ===== 顶部偏移量输入框（单一代理 StringVar + trace） =====
         top_frame = ttk.Frame(dialog)
         top_frame.pack(fill="x", padx=10, pady=5)
         ttk.Label(top_frame, text="管道与上层楼面标高差 (m):").pack(side="left", padx=(0, 5))
-        # 从全局设置读取上次保存的偏移量，如果没有则使用默认值0.8
-        saved_offset = self.config_manager.get_global_setting("pipe_z_offset_default", "0.8")
-        offset_var = tk.StringVar(value=saved_offset)
-        offset_entry = ttk.Entry(top_frame, textvariable=offset_var, width=8)
+        dialog_offset_var = tk.StringVar(value=_building_offset_values[get_tab_key()])
+        offset_entry = ttk.Entry(top_frame, textvariable=dialog_offset_var, width=8)
         offset_entry.pack(side="left")
+        dialog_offset_var.trace('w', lambda *args: recalc_pipe_z())
+        ttk.Button(top_frame, text="重置管网标高", command=lambda: reset_pipe_z()).pack(side="left", padx=5)
 
-        # 表格
+        # ===== 表格 =====
         columns = ("楼层名", "楼面标高(m)", "管网标高(m)", "楼层分离值(m)")
         tree = ttk.Treeview(dialog, columns=columns, show="headings", height=15)
         tree.heading("楼层名", text="楼层名")
@@ -734,22 +971,31 @@ class PreviewPage(ttk.Frame):
         tree.column("管网标高(m)", width=100)
         tree.column("楼层分离值(m)", width=110)
         tree.pack(fill="both", expand=True, padx=10, pady=5)
-        # 记录用户手动修改过的行（管网标高被直接编辑）
-        manual_overrides = set()
-        
-        # 先定义插入和删除函数
+
+        # ===== 插入 / 删除行 =====
         def insert_row(above=True):
+            existing = set()
+            for item in tree.get_children():
+                v = tree.item(item, "values")
+                if v:
+                    existing.add(v[0])
+            idx = 1
+            new_name = "新楼层"
+            while new_name in existing:
+                idx += 1
+                new_name = f"新楼层{idx}"
             selected = tree.selection()
+            default_pipe_z = "-1.00" if get_current_bid() == "ZT" else "0.00"
             if not selected:
-                tree.insert("", "end", values=("新楼层", "0.00", "0.00"))
+                tree.insert("", "end", values=(new_name, "", default_pipe_z))
                 return
             item = selected[0]
             if above:
-                tree.insert(tree.parent(item), tree.index(item), values=("新楼层", "0.00", "0.00"))
+                tree.insert(tree.parent(item), tree.index(item), values=(new_name, "", default_pipe_z))
             else:
-                tree.insert(tree.parent(item), tree.index(item) + 1, values=("新楼层", "0.00", "0.00"))
+                tree.insert(tree.parent(item), tree.index(item) + 1, values=(new_name, "", default_pipe_z))
             recalc_pipe_z()
-            
+
         def delete_row():
             selected = tree.selection()
             if not selected:
@@ -757,13 +1003,13 @@ class PreviewPage(ttk.Frame):
             item = selected[0]
             values = tree.item(item, "values")
             name = values[0]
-            floor_obj = self.cad_data_manager.floor_by_name.get(name)
+            floor_obj = next((f for f in get_target_floors() if f.name == name), None)
             if floor_obj and len(floor_obj.pipes) > 0:
                 messagebox.showerror("无法删除", f"楼层 {name} 包含横管，不能删除")
                 return
-            # 从手动覆盖集合中移除
-            if item in manual_overrides:
-                manual_overrides.remove(item)            
+            name = values[0]
+            if name in get_manual_overrides():
+                get_manual_overrides().remove(name)
             tree.delete(item)
             recalc_pipe_z()
 
@@ -782,12 +1028,11 @@ class PreviewPage(ttk.Frame):
 
         tree.bind("<Button-3>", show_tree_menu)
 
-        # 双击编辑
+        # ===== 双击编辑 =====
         def on_tree_double_click(event):
             item = tree.selection()[0]
             column = tree.identify_column(event.x)
             col_index = int(column.replace('#', '')) - 1
-            # 禁止编辑楼层名列
             if col_index == 0:
                 return
             if col_index < 0 or col_index > 3:
@@ -805,15 +1050,13 @@ class PreviewPage(ttk.Frame):
                 values[col_index] = new_value
                 tree.item(item, values=values)
                 entry.destroy()
-                # 如果编辑的是管网标高列（col_index == 2），标记为手动覆盖
                 if col_index == 2:
-                    manual_overrides.add(item)
-                # 第4列（索引3）：楼层分离值，仅允许正整数（需求104）
+                    get_manual_overrides().add(tree.item(item, "values")[0])
                 if col_index == 3:
-                    # 最低楼层强制为0（需求111）
+                    tf = get_target_floors()
                     row_name = tree.item(item, "values")[0]
-                    is_lowest = self.cad_data_manager.floors and \
-                        row_name == min(self.cad_data_manager.floors, key=lambda f: f.elevation).name
+                    is_lowest = tf and \
+                        row_name == min(tf, key=lambda f: f.elevation).name
                     if is_lowest:
                         new_value = "0"
                         values[3] = "0"
@@ -823,7 +1066,7 @@ class PreviewPage(ttk.Frame):
                             v = float(new_value)
                             if v < 0:
                                 raise ValueError
-                            new_value = str(int(v))  # 截断小数
+                            new_value = str(int(v))
                             values[3] = new_value
                             tree.item(item, values=values)
                         except (ValueError, OverflowError):
@@ -831,7 +1074,6 @@ class PreviewPage(ttk.Frame):
                             new_value = str(old_vals[3]) if len(old_vals) > 3 else "0"
                             values[3] = new_value
                             tree.item(item, values=values)
-                recalc_pipe_z()                
                 recalc_pipe_z()
 
             entry.bind("<Return>", save_edit)
@@ -839,29 +1081,109 @@ class PreviewPage(ttk.Frame):
 
         tree.bind("<Double-1>", on_tree_double_click)
 
-        # 加载数据（直接使用内存中的 pipe_z_offset）
-        for floor in self.cad_data_manager.floors:
-            sep_val = int(self.separation_values.get(floor.name, 0))
-            tree.insert("", "end", values=(
-                floor.name,
-                f"{floor.elevation:.2f}",
-                f"{floor.pipe_z_offset:.2f}",
-                str(sep_val)
-            ))
+        # ===== 加载当前建筑楼层数据到表格 =====
+        def load_tree_for_building(cbid):
+            for item in tree.get_children():
+                tree.delete(item)
+            # 如果有保存的 tree 数据（未赋值的编辑），从中恢复，避免切换标签丢失
+            saved = _tab_states.get(get_tab_key(), {}).get("tree_data")
+            if saved is not None:
+                for name, vals in saved.items():
+                    tree.insert("", "end", values=tuple(vals))
+                return
+            tf = [f for f in self.cad_data_manager.floors if f.building_id == cbid] if (is_region and cbid) else self.cad_data_manager.floors
+            for floor in tf:
+                sep_val = int(self.separation_values.get(f"{cbid}|{floor.name}", 0))
+                elev_disp = "" if (cbid == "ZT" and floor.name == "室外管网" and floor.elevation == 0.0) else f"{floor.elevation:.2f}"
+                item = tree.insert("", "end", values=(
+                    floor.name,
+                    elev_disp,
+                    f"{floor.pipe_z_offset:.2f}",
+                    str(sep_val)
+                ))
+                if floor.pipe_z_offset_set:
+                    get_manual_overrides().add(floor.name)
 
-        # 底部按钮区域
+        load_tree_for_building(get_current_bid())
+
+        # ===== 标签切换 =====
+        if is_region:
+            def on_tab_changed(event):
+                # 保存当前标签的 tree 状态
+                old_key = get_tab_key()
+                saved = {}
+                for item in tree.get_children():
+                    vals = tree.item(item, "values")
+                    if vals:
+                        saved[vals[0]] = vals
+                _tab_states[old_key]["tree_data"] = saved
+                _building_offset_values[old_key] = dialog_offset_var.get()
+                sel = tab_notebook.select()
+                new_bid = tab_notebook.tab(sel, "text")
+                current_tab_bid[0] = new_bid
+                load_tree_for_building(new_bid)
+                dialog_offset_var.set(_building_offset_values[get_tab_key()])
+
+            tab_notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
+        # ===== 底部按钮区域 =====
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill="x", padx=10, pady=10)
 
-        # ---- 应用分离按钮回调（需求97） ----
+        # ===== 重算管网标高 =====
+        def recalc_pipe_z():
+            try:
+                default_offset = float(dialog_offset_var.get())
+            except ValueError:
+                default_offset = 0.8
+            rows = []
+            for item in tree.get_children():
+                values = tree.item(item, "values")
+                if len(values) < 3:
+                    continue
+                name = values[0]
+                if not values[1] or values[1].strip() == "":
+                    continue
+                try:
+                    elev = float(values[1])
+                except:
+                    continue
+                rows.append({"item_id": item, "name": name, "elevation": elev})
+            if not rows:
+                return
+            rows.sort(key=lambda x: x["elevation"])
+            for idx, row in enumerate(rows):
+                if idx == len(rows) - 1:
+                    pipe_z = row["elevation"] + 3.0
+                else:
+                    next_elev = rows[idx + 1]["elevation"]
+                    pipe_z = next_elev - default_offset
+                row["pipe_z"] = pipe_z
+            for row in rows:
+                if row["name"] in get_manual_overrides():
+                    continue
+                tree.set(row["item_id"], column="管网标高(m)", value=f"{row['pipe_z']:.2f}")
+
+        # ===== 重置管网标高 =====
+        def reset_pipe_z():
+            get_manual_overrides().clear()
+            recalc_pipe_z()
+
+        def cancel():
+            self._dialog_offset_values.clear()
+            self._dialog_offset_values.update(_initial_offsets)
+            dialog.destroy()
+
+        # ===== 应用分离 =====
         def apply_separation():
-            """收集表格第4列数据到 self.separation_values 并触发重绘"""
-            # 找出最低楼层（其分离值强制为0，需求111）
+            cbid = get_current_bid()
+            tf = get_target_floors()
             lowest_name = min(
-                (f.name for f in self.cad_data_manager.floors),
-                key=lambda n: next(f.elevation for f in self.cad_data_manager.floors if f.name == n),
+                (f.name for f in tf),
+                key=lambda n: next(f.elevation for f in tf if f.name == n),
                 default=None
             )
+            prefix = f"{cbid}|"
             new_sep = {}
             for item in tree.get_children():
                 values = tree.item(item, "values")
@@ -873,129 +1195,128 @@ class PreviewPage(ttk.Frame):
                 except (ValueError, OverflowError):
                     v = 0
                 if name == lowest_name:
-                    v = 0  # 最低楼层强制为0
-                    # 同步表格显示
+                    v = 0
                     vals = list(values)
                     vals[3] = "0"
                     tree.item(item, values=vals)
                 if v > 0:
                     new_sep[name] = float(v)
-            self.separation_values = new_sep
-            self._separation_applied = bool(new_sep)
+            self.separation_values = {k: v for k, v in self.separation_values.items() if not k.startswith(prefix)}
+            for name, v in new_sep.items():
+                self.separation_values[f"{prefix}{name}"] = v
+            self._separation_applied = any(k.startswith(prefix) and v > 0 for k, v in self.separation_values.items())
             self._sep_cache_key = None
             self.redraw()
 
+        # ===== 清除分离 =====
         def clear_separation():
-            """清空所有分离值"""
             for item in tree.get_children():
                 values = list(tree.item(item, "values"))
                 if len(values) >= 4:
                     values[3] = "0"
                     tree.item(item, values=values)
-            self.separation_values.clear()
-            self._separation_applied = False
+            prefix = f"{get_current_bid()}|"
+            self.separation_values = {k: v for k, v in self.separation_values.items() if not k.startswith(prefix)}
+            self._separation_applied = any(k.startswith(prefix) and v > 0 for k, v in self.separation_values.items())
             self._sep_cache_key = None
             self.update_projection()
             if self.show_occlusion_var.get():
                 self.build_occlusion_cache()
             self.redraw()
 
-        def recalc_pipe_z():
-            try:
-                default_offset = float(offset_var.get())
-            except ValueError:
-                default_offset = 0.8
-        
-            # 保存用户修改的偏移量到全局设置
-            self.config_manager.update_global_setting("pipe_z_offset_default", str(default_offset))
-            
-            # 获取当前所有行的楼层名和楼面标高
-            rows = []
-            for item in tree.get_children():
-                values = tree.item(item, "values")
-                if len(values) != 3:
-                    continue
-                name = values[0]
-                try:
-                    elev = float(values[1])
-                except:
-                    continue
-                rows.append({"item_id": item, "name": name, "elevation": elev})
-            
-            if not rows:
-                return
-            
-            # 按楼面标高从低到高排序
-            rows.sort(key=lambda x: x["elevation"])
-            
-            # 重新计算每个楼层的管网标高
-            for idx, row in enumerate(rows):
-                if idx == len(rows) - 1:
-                    # 顶层：管网标高 = 楼面标高 + 3.0（用户可后续手动修改）
-                    pipe_z = row["elevation"] + 3.0
-                else:
-                    # 非顶层：管网标高 = 下一层楼面标高 - 默认偏移量
-                    next_elev = rows[idx + 1]["elevation"]
-                    pipe_z = next_elev - default_offset
-                row["pipe_z"] = pipe_z
-            
-            # 更新表格显示（直接修改现有行的值，而不是删除重建，避免丢失焦点）
-            for row in rows:
-                # 如果该行的管网标高已被用户手动修改，则跳过自动计算的值
-                if row["item_id"] in manual_overrides:
-                    continue
-                tree.set(row["item_id"], column="管网标高(m)", value=f"{row['pipe_z']:.2f}")
-
-        offset_var.trace('w', lambda *args: recalc_pipe_z())
-
-        def cancel():
-            dialog.destroy()
-
+        # ===== 赋值 =====
         def assign():
-            # 设置标志，阻止 refresh_data 中的自动重新计算
-            self._skip_z_recalc = True
+            _building_offset_values[get_tab_key()] = dialog_offset_var.get()
+            cbid = get_current_bid()
+            tf = get_target_floors()
 
-            # 收集新数据
             new_data = []
             for item in tree.get_children():
                 values = tree.item(item, "values")
-                if len(values) != 3:
+                if len(values) < 3:
                     continue
                 name = values[0]
                 try:
-                    elev = float(values[1])
-                    pipe_z = float(values[2])
+                    pipe_z = float(values[2]) if len(values) > 2 else 0.0
                 except:
                     continue
-                new_data.append({"name": name, "elevation": elev, "pipe_z": pipe_z})
+                elev_str = values[1].strip() if len(values) > 1 else ""
+                if elev_str:
+                    try:
+                        elev = float(elev_str)
+                    except:
+                        continue
+                else:
+                    elev = None
+                new_data.append({"name": name, "elevation": elev, "pipe_z": pipe_z, "is_manual": name in get_manual_overrides()})
 
             drawing_unit = self.config_manager.get_live_config().get("drawing_unit", "毫米")
             if drawing_unit == "毫米":
                 to_mm = 1000.0
             elif drawing_unit == "厘米":
                 to_mm = 10.0
-            else:  # 米
+            else:
                 to_mm = 1.0
             unit_factor = self.cad_data_manager.unit_factors.get(drawing_unit, 0.001)
 
-            # 1. 更新楼层对象的标高和管网标高
-            for floor in self.cad_data_manager.floors:
+            # 1. 更新现有楼层
+            for floor in tf:
                 for nd in new_data:
                     if nd["name"] == floor.name:
-                        floor.elevation = nd["elevation"]
+                        if nd["elevation"] is not None:
+                            floor.elevation = nd["elevation"]
                         floor.pipe_z_offset = nd["pipe_z"]
+                        floor.pipe_z_offset_set = nd["is_manual"]
                         break
 
-            # 2. 更新所有节点的 Z 坐标
+            # 1b. 新增楼层
+            new_floors_created = False
+            first_new_pipe_z = 0.0
+            existing_names = {f.name for f in tf}
+            for nd in new_data:
+                if nd["name"] not in existing_names:
+                    if not new_floors_created:
+                        new_floors_created = True
+                        first_new_pipe_z = nd["pipe_z"]
+                    new_floor = FloorData(
+                        name=nd["name"],
+                        elevation=nd["elevation"] if nd["elevation"] is not None else 0.0,
+                        pipe_z_offset=nd["pipe_z"],
+                        pipe_z_offset_set=nd["is_manual"],
+                        building_id=cbid,
+                        align_point=(0, 0, 0),
+                        rect_min=(0, 0),
+                        rect_max=(0, 0),
+                        layer="",
+                    )
+                    self.cad_data_manager.floors.append(new_floor)
+                    key = self.cad_data_manager._make_floor_key(nd["name"], cbid)
+                    self.cad_data_manager.floor_by_name[key] = new_floor
+                    existing_names.add(nd["name"])
+
+            # 2. 更新节点 Z
+            floors_for_update = self.cad_data_manager.floors
+            if cbid:
+                floors_for_update = [f for f in floors_for_update if f.building_id == cbid]
+            updated_node_ids = set()
             for node in self.cad_data_manager.nodes:
-                for floor in self.cad_data_manager.floors:
+                for floor in floors_for_update:
                     if node in floor.nodes:
-                        new_z_m = floor.pipe_z_offset
-                        node.z = new_z_m * to_mm
+                        node.z = floor.pipe_z_offset * to_mm
                         node.cad_key = f"{node.x:.6f},{node.y:.6f},{node.z:.6f}"
+                        updated_node_ids.add(node.node_id)
                         break
 
-            # 3. 重新计算所有管道的长度
+            if new_floors_created:
+                new_z_m = first_new_pipe_z * to_mm
+                for node in self.cad_data_manager.nodes:
+                    if node.node_id not in updated_node_ids:
+                        if cbid and not node.node_id.startswith(cbid + "_"):
+                            continue
+                        node.z = new_z_m
+                        node.cad_key = f"{node.x:.6f},{node.y:.6f},{node.z:.6f}"
+
+            # 3. 重算管道长度
             for pipe in self.cad_data_manager.pipes:
                 start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
                 end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
@@ -1008,7 +1329,7 @@ class PreviewPage(ttk.Frame):
                     pipe.raw_length = math.hypot(dx, dy, dz)
                     pipe.length = pipe.raw_length * unit_factor
 
-            # 4. 更新阀门Z坐标（根据所在管道的新端点Z）
+            # 4. 更新阀门 Z
             for valve in self.cad_data_manager.valves:
                 if valve.pipe_id and valve.pipe_id in self.cad_data_manager.pipe_by_id:
                     pipe = self.cad_data_manager.pipe_by_id[valve.pipe_id]
@@ -1022,18 +1343,16 @@ class PreviewPage(ttk.Frame):
             # 5. 重建节点索引
             self.cad_data_manager.node_by_id = {node.node_id: node for node in self.cad_data_manager.nodes}
 
-            # 6. 刷新预览画布和左下角文字
+            # 6. 刷新
             self.update_projection()
             self.redraw()
             self._draw_floor_info_text()
 
-            # 7. 只刷新节点页面，避免触发 refresh_all_pages 导致重新计算
             root = self.winfo_toplevel()
             if hasattr(root, 'main_app') and '节点' in root.main_app.pages:
                 root.main_app.pages['节点'].refresh_data()
-            # 赋值后清除手动覆盖标记，因为模型已更新
-            manual_overrides.clear()
-            
+            get_manual_overrides().clear()
+            _tab_states[get_tab_key()]["tree_data"] = None
             dialog.destroy()
 
         ttk.Button(btn_frame, text="取消", command=cancel).pack(side="right", padx=5)
@@ -1101,7 +1420,7 @@ class PreviewPage(ttk.Frame):
         for pipe in cad.pipes:
             if not pipe.is_active:
                 continue
-            if pipe.pipe_id.startswith("SP_"):
+            if self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
                 continue
             a, b = pipe.start_node_id, pipe.end_node_id
             adjacency[a].append(b)
@@ -1283,7 +1602,7 @@ class PreviewPage(ttk.Frame):
                                   key=lambda x: depth[x[1]], reverse=True)
 
             sp_pipes = [p for p in cad.pipes
-                        if p.pipe_id.startswith("SP_") and p.is_active]
+                        if self.cad_data_manager.id_type(p.pipe_id) == "SP" and p.is_active]
 
             changed = True
             while changed:
@@ -1456,7 +1775,49 @@ class PreviewPage(ttk.Frame):
                 return i != current_idx
         return False
 
+    def _switch_to_building_tab(self, building_id):
+        """切换到指定楼栋的二级标签（区域模式），返回是否实际切换。"""
+        if not self.building_notebook.winfo_ismapped():
+            # 从数据页面跳转时预览页可能刚被选中，强制刷新布局后重试
+            try:
+                self.update()
+            except Exception:
+                pass
+            if not self.building_notebook.winfo_ismapped():
+                return False
+        for tab_id in self.building_notebook.tabs():
+            if self.building_notebook.tab(tab_id, "text") == building_id:
+                old = self._current_building_id
+                self.building_notebook.select(tab_id)
+                if old != building_id:
+                    self._on_building_changed()
+                return True
+        return False
+
+    def _ensure_building_active(self, entity_id):
+        """区域模式：确保预览处于指定实体所属楼栋（拼接视图下先退出拼接切到单体）。
+        返回是否发生了切换。"""
+        cad = self.cad_data_manager
+        if not cad.building_order:
+            return False
+        bid = cad.get_building_by_entity(entity_id)
+        if not bid:
+            return False
+        if bid == self._current_building_id and not self.is_spliced:
+            return False
+        # 刷新布局确保 building_notebook 可见后再切换
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass
+        if not self.building_notebook.winfo_ismapped():
+            # 从数据页面跳转时预览页可能刚被选中，强制刷新一次
+            self.update()
+        return self._switch_to_building_tab(bid)
+
     def jump_to_pipe(self, pipe_id, to_global=False):
+        if bool(self.cad_data_manager.building_order):
+            self._ensure_building_active(pipe_id)
         self._pending_jump = ('pipe', pipe_id, None)
         if to_global:
             switched = self._switch_to_floor_tab("整体管网")
@@ -1468,10 +1829,12 @@ class PreviewPage(ttk.Frame):
 
     def jump_to_node(self, node_id, to_global=False):
         cad = self.cad_data_manager
+        if bool(self.cad_data_manager.building_order):
+            self._ensure_building_active(node_id)
         longest_pipe_id = None
         longest_len = -1
         for pipe in cad.pipes:
-            if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+            if not pipe.is_active or self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
                 continue
             if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
                 if pipe.length > longest_len:
@@ -1483,7 +1846,7 @@ class PreviewPage(ttk.Frame):
         else:
             switched = False
             for pipe in cad.pipes:
-                if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+                if not pipe.is_active or self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
                     continue
                 if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
                     floor_name = self.pipe_floor_map.get(pipe.pipe_id)
@@ -1498,6 +1861,8 @@ class PreviewPage(ttk.Frame):
         valve = cad.valve_by_id.get(valve_id)
         if not valve or not valve.pipe_id:
             return
+        if bool(self.cad_data_manager.building_order):
+            self._ensure_building_active(valve_id)
         self._pending_jump = ('valve', valve_id, None)
         if to_global:
             switched = self._switch_to_floor_tab("整体管网")
@@ -1506,6 +1871,53 @@ class PreviewPage(ttk.Frame):
             switched = self._switch_to_floor_tab(floor_name) if floor_name else False
         if not switched:
             self._execute_jump_zoom()
+
+    def jump_to_spliced_view(self, entity_type=None, entity_id=None):
+        """切换到「拼接管网」预览画布（区域模式且有拼接时），可选定位到指定实体。
+
+        :param entity_type: 'pipe' / 'node' / 'valve' / None
+        :param entity_id: 实体ID（与 entity_type 配合，切换后放大定位）
+        """
+        cad = self.cad_data_manager
+        if not cad.building_order:
+            self.show_temp_message("非区域管网模式，无拼接管网视图", 2000)
+            return
+        has_spliced = any(
+            bd.get("is_spliced") for bd in cad.building_data.values()
+        )
+        if not has_spliced:
+            self.show_temp_message("当前没有已拼接的管网", 2000)
+            return
+        nb = getattr(self, 'building_notebook', None)
+        if not nb or not nb.tabs():
+            return
+        for tab_id in nb.tabs():
+            if nb.tab(tab_id, "text") == "拼接管网":
+                old = self._current_building_id
+                nb.select(tab_id)
+                if old != "__SPLICED__":
+                    self._on_building_changed()
+                # 定位到指定实体（管道/节点/阀门），与楼层/整体预览跳转行为一致
+                if entity_type == "pipe" and entity_id:
+                    self._pending_jump = ('pipe', entity_id, None)
+                    self._execute_jump_zoom()
+                elif entity_type == "node" and entity_id:
+                    longest_pipe_id = None
+                    longest_len = -1
+                    for pipe in cad.pipes:
+                        if not pipe.is_active or self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
+                            continue
+                        if pipe.start_node_id == entity_id or pipe.end_node_id == entity_id:
+                            if pipe.length > longest_len:
+                                longest_len = pipe.length
+                                longest_pipe_id = pipe.pipe_id
+                    self._pending_jump = ('node', entity_id, longest_pipe_id)
+                    self._execute_jump_zoom()
+                elif entity_type == "valve" and entity_id:
+                    self._pending_jump = ('valve', entity_id, None)
+                    self._execute_jump_zoom()
+                return
+        self.show_temp_message("未找到拼接管网标签页", 2000)
 
     def _jump_zoom_pipe(self, pipe_id):
         self.update_projection()
@@ -1567,7 +1979,7 @@ class PreviewPage(ttk.Frame):
                 cad = self.cad_data_manager
                 longest_len = -1
                 for pipe in cad.pipes:
-                    if not pipe.is_active or pipe.pipe_id.startswith("SP_"):
+                    if not pipe.is_active or self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
                         continue
                     if pipe.start_node_id == node_id or pipe.end_node_id == node_id:
                         if pipe.length > longest_len:
@@ -1576,9 +1988,11 @@ class PreviewPage(ttk.Frame):
             self._jump_zoom_node(node_id, longest_pipe_id)
         elif etype == 'valve':
             self._jump_zoom_valve(info[1])
-        self.floor_view_state[self.current_floor_name] = (
-            self.scale, self.translate_x, self.translate_y
-        )
+        # 拼接视图没有独立楼层视图状态，跳过保存（避免污染单体楼层状态）
+        if not self.is_spliced and self.current_floor_name:
+            self.floor_view_state[self.current_floor_name] = (
+                self.scale, self.translate_x, self.translate_y
+            )
 
     def center_dialog(self, dialog):
         """将对话框居中于父窗口"""
@@ -1612,14 +2026,24 @@ class PreviewPage(ttk.Frame):
         left_frame = ttk.Frame(self.paned)
         self.paned.add(left_frame, weight=4)
 
-        # 创建楼层标签页控件
-        self.floor_notebook = ttk.Notebook(left_frame)
-        logger.info(f"floor_notebook created: {self.floor_notebook}")
-        self.floor_notebook.pack(fill="both", expand=True)
+        # 创建单体模式（默认）的建筑管理器
+        self._single_building = BuildingPreviewManager(self, building_id=None)
+        self._single_building.build(left_frame)
+        self._single_building._current_canvas = None
+        self._single_building.current_floor_name = None
+        self._single_building.floor_view_state = {}
+        self._single_building.floor_canvases = {}
         
-        # 创建一个临时画布（用于兼容老代码）
-        self.canvas = tk.Canvas(left_frame, bg="black", highlightthickness=0)
-        self.canvas.pack_forget()
+        # 创建外层楼栋标签页控件（初始隐藏，区域模式才启用）
+        self.building_notebook = ttk.Notebook(left_frame)
+        self.building_notebook.pack_forget()
+        self._building_managers = {}
+        self._current_building_id = None
+        
+        # 创建一个临时画布（用于兼容老代码，仅绑事件用）
+        self._temp_canvas = tk.Canvas(left_frame, bg="black", highlightthickness=0)
+        self.canvas = self._temp_canvas
+        self._temp_canvas.pack_forget()
         self._current_canvas = None
 
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
@@ -1636,7 +2060,7 @@ class PreviewPage(ttk.Frame):
         self.canvas.bind("<Configure>", self._on_canvas_configure, add="+")
         self.canvas.focus_set()
 
-        right_frame = ttk.Frame(self.paned, width=100)
+        right_frame = ttk.Frame(self.paned, width=200)
         self.paned.add(right_frame, weight=0)
         self.create_control_panel(right_frame)
         
@@ -1645,123 +2069,615 @@ class PreviewPage(ttk.Frame):
         logger.info("create_widgets completed successfully")
 
     def rebuild_floor_tabs(self):
-        """根据 CADDataManager 中的楼层数据重建标签页，并保持当前选中项和视图状态"""
-        if self.floor_notebook is None:
+        """根据 CADDataManager 中的楼层数据重建标签页，并保持当前选中项和视图状态。
+        
+        区域模式下委托给 _rebuild_building_tabs 创建多级标签。
+        非区域模式执行原有单体标签逻辑。
+        """
+        # 区域模式分支
+        if (bool(self.cad_data_manager.building_order)
+                and self.cad_data_manager.building_order):
+            self._rebuild_building_tabs()
+            return
+
+        # 非区域模式：确保 building_notebook 隐藏，_single_building 显示
+        # 先无条件隐藏临时画布（防御 widget 已销毁导致 winfo_ismapped 抛异常）
+        try:
+            if hasattr(self, '_temp_canvas') and self._temp_canvas:
+                self._temp_canvas.pack_forget()
+        except Exception:
+            pass
+        # 确保单体模式楼层标签显示
+        try:
+            if self._single_building and self._single_building.floor_notebook:
+                self._single_building.floor_notebook.pack(fill="both", expand=True)
+        except Exception:
+            pass
+        # 隐藏区域模式楼栋标签（如存在）
+        try:
+            if hasattr(self, 'building_notebook') and self.building_notebook:
+                self.building_notebook.pack_forget()
+        except Exception:
+            pass
+        
+        # ---- 以下为原有单体标签逻辑 ----
+        if self._active_building is None or self._active_building.floor_notebook is None:
             logger.error("floor_notebook is None, cannot rebuild tabs")
             return
-    
-        # 保存当前选中的标签页名称和视图状态
-        selected_name = None
-        if self.floor_notebook.tabs():
-            sel_tab = self.floor_notebook.select()
-            if sel_tab:
-                selected_name = self.floor_notebook.tab(sel_tab, "text")
-        # if selected_name and self.current_floor_name and selected_name != self.current_floor_name:
-        #     selected_name = self.current_floor_name
-    
-        # 保存所有楼层的视图状态（已由 _on_floor_changed 保存，这里不做重复）
-    
-        # 清空当前画布引用
-        if self._current_canvas is not None:
-            self._current_canvas = None
-        if self.canvas is not None:
-            self.canvas = None
-    
-        # 解绑事件防止中间状态被错误保存
-        self.floor_notebook.unbind("<<NotebookTabChanged>>")
 
-        # 清空现有标签页（使用 forget 确保 tab 记录也被移除）
-        for tab_id in self.floor_notebook.tabs():
-            self.floor_notebook.forget(tab_id)
-        for child in self.floor_notebook.winfo_children():
+        self._build_floor_tabs_body(
+            self._active_building.floor_notebook,
+            self._active_building.floor_canvases,
+            self._active_building.floor_view_state,
+        )
+
+        self._on_floor_changed()
+
+    def _build_floor_tabs_for(self, mgr):
+        """为指定建筑管理器创建楼层标签页（区域模式内调用）。"""
+        self._build_floor_tabs_body(
+            mgr.floor_notebook, mgr.floor_canvases,
+            mgr.floor_view_state,
+            bid=mgr.building_id
+        )
+        mgr.current_floor_name = self.__dict__.get('current_floor_name')
+        mgr.current_view_mode = self.__dict__.get('current_view_mode', 'floor')
+
+    def _build_floor_tabs_body(self, fn, fc, fvs=None, bid=""):
+
+        selected_name = None
+        if fn.tabs():
+            sel_tab = fn.select()
+            if sel_tab:
+                selected_name = fn.tab(sel_tab, "text")
+
+        fn.unbind("<<NotebookTabChanged>>")
+
+        for tab_id in fn.tabs():
+            fn.forget(tab_id)
+        for child in fn.winfo_children():
             child.destroy()
-        self.floor_canvases.clear()
-    
-        if not self.cad_data_manager.floors:
-            frame = ttk.Frame(self.floor_notebook)
+        fc.clear()
+
+        floors = self.cad_data_manager.floors
+        if bid:
+            floors = [f for f in floors if f.building_id == bid]
+
+        if not floors:
+            frame = ttk.Frame(fn)
             canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
             canvas.pack(fill="both", expand=True)
             canvas.bind("<Configure>", lambda e: self.redraw())
-            self.floor_notebook.add(frame, text="单层")
-            self.floor_canvases["单层"] = canvas
-            self._current_canvas = canvas
-            self.canvas = canvas
-            self.current_floor_name = "单层"
-            self._bind_canvas_events(canvas)
-    
-        # 获取分组映射
-        grouped = getattr(self.cad_data_manager, 'grouped_floors_map', {})
-        grouped_floors = set()
-        for group_name, actuals in grouped.items():
-            grouped_floors.update(actuals)
+            fn.add(frame, text="单层")
+            fc["单层"] = canvas
+            if fvs is not None:
+                fvs.clear()
+        else:
+            grouped = getattr(self.cad_data_manager, 'grouped_floors_map', {})
+            if bid:
+                floor_names = {f.name for f in floors}
+                prefix = bid + "|"
+                grouped = {
+                    k: v for k, v in grouped.items()
+                    if (k.startswith(prefix) or "|" not in k)
+                    and all(n in floor_names for n in v)
+                }
 
-        # 构建显示项目列表：(显示名称, 实际楼层名列表, 排序标高)
-        display_items = []
-        # 普通楼层（不在任何分组中）
-        for floor in self.cad_data_manager.floors:
-            if floor.name not in grouped_floors:
-                display_items.append((floor.name, [floor.name], floor.elevation))
-        # 分组
-        for group_name, actual_names in grouped.items():
-            first_floor = self.cad_data_manager.floor_by_name.get(actual_names[0])
-            sort_elev = first_floor.elevation if first_floor else 0
-            display_items.append((group_name, actual_names, sort_elev))
+            grouped_floors = set()
+            for group_name, actuals in grouped.items():
+                grouped_floors.update(actuals)
 
-        # 按标高排序
-        display_items.sort(key=lambda x: x[2])
+            display_items = []
+            for floor in floors:
+                if floor.name not in grouped_floors:
+                    display_items.append((floor.name, [floor.name], floor.elevation))
+            for group_name, actual_names in grouped.items():
+                display_name = group_name.split("|", 1)[-1]
+                first_floor = self.cad_data_manager.lookup_floor(actual_names[0], bid)
+                sort_elev = first_floor.elevation if first_floor else 0
+                display_items.append((display_name, actual_names, sort_elev))
 
-        # 创建标签页
-        for disp_name, actual_names, _ in display_items:
-            frame = ttk.Frame(self.floor_notebook)
-            canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
-            canvas.pack(fill="both", expand=True)
-            self.floor_notebook.add(frame, text=disp_name)
-            self.floor_canvases[disp_name] = canvas
-            # 存储该标签页对应的实际楼层列表
-            canvas.actual_floors = actual_names
-            canvas.current_display_floor = actual_names[0]  # 默认显示第一个
+            display_items.sort(key=lambda x: x[2])
 
-        # 创建整体管网标签页（最后面）
-        self._create_global_tab()
-    
-        # 恢复选中的标签页
+            for disp_name, actual_names, _ in display_items:
+                frame = ttk.Frame(fn)
+                canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
+                canvas.pack(fill="both", expand=True)
+                fn.add(frame, text=disp_name)
+                fc[disp_name] = canvas
+                canvas.actual_floors = actual_names
+                canvas.current_display_floor = actual_names[0]
+
+        # 整体管网标签页
+        gframe = ttk.Frame(fn)
+        gcanvas = tk.Canvas(gframe, bg="black", highlightthickness=0)
+        gcanvas.pack(fill="both", expand=True)
+        fn.add(gframe, text="整体管网")
+        fc["整体管网"] = gcanvas
+        self._bind_canvas_events(gcanvas)
+
+        fn.bind("<<NotebookTabChanged>>", self._on_floor_changed)
+
         target_name = selected_name
-        if target_name and target_name in self.floor_canvases:
-            for tab_id in self.floor_notebook.tabs():
-                if self.floor_notebook.tab(tab_id, "text") == target_name:
-                    self.floor_notebook.select(tab_id)
+        if target_name and target_name in fc:
+            for tab_id in fn.tabs():
+                if fn.tab(tab_id, "text") == target_name:
+                    fn.select(tab_id)
                     break
         else:
-            if self.floor_notebook.tabs():
-                self.floor_notebook.select(0)
-    
-        self._on_floor_changed()  # 手动调用一次以设置当前画布
-        self.floor_notebook.bind("<<NotebookTabChanged>>", self._on_floor_changed)
-        """
-        if self.floor_notebook.tabs():
-            first_tab_text = self.floor_notebook.tab(0, "text")
-            self.current_floor_name = first_tab_text
-            logger.info(f"强制设置当前楼层为: {self.current_floor_name}")
-        """
+            if fn.tabs():
+                fn.select(0)
+
+
+    def _rebuild_building_tabs(self):
+        """区域模式：创建外层楼栋标签，每个楼栋内含独立的楼层标签组。"""
+        building_ids = self.cad_data_manager.building_order
+        # 隐藏临时画布
+        if hasattr(self, '_temp_canvas') and self._temp_canvas:
+            if self._temp_canvas.winfo_ismapped():
+                self._temp_canvas.pack_forget()
+        # 确保单体模式隐藏：销毁残留 tabs 子控件，再 pack_forget 隐藏（防止旧 tabs 占用布局空间）
+        if self._single_building and self._single_building.floor_notebook:
+            for child in self._single_building.floor_notebook.winfo_children():
+                child.destroy()
+            self._single_building.floor_notebook.pack_forget()
+        self.building_notebook.pack(fill="both", expand=True)
         
-    def _create_global_tab(self):
-        """创建整体管网标签页"""
-        frame = ttk.Frame(self.floor_notebook)
-        canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
-        canvas.pack(fill="both", expand=True)
-        self.floor_notebook.add(frame, text="整体管网")
-        self.floor_canvases["整体管网"] = canvas
-        self._bind_canvas_events(canvas)
+        self.building_notebook.unbind("<<NotebookTabChanged>>")
+        for tab_id in self.building_notebook.tabs():
+            self.building_notebook.forget(tab_id)
+        
+        building_ids = self.cad_data_manager.building_order
+        # 保存各楼栋的楼层视图状态和视图模式
+        saved_states = {}
+        for bid, mgr in self._building_managers.items():
+            saved_states[bid] = {
+                "floor_view_state": dict(mgr.floor_view_state),
+                "current_view_mode": mgr.current_view_mode,
+                "current_floor_name": mgr.current_floor_name,
+            }
+        self._building_managers.clear()
+        
+        for bid in building_ids:
+            frame = ttk.Frame(self.building_notebook)
+            self.building_notebook.add(frame, text=bid)
+            mgr = BuildingPreviewManager(self, building_id=bid)
+            mgr.build(frame)
+            # 恢复之前保存的视图状态和模式
+            if bid in saved_states:
+                st = saved_states[bid]
+                mgr.floor_view_state.update(st.get("floor_view_state", {}))
+                if st.get("current_view_mode"):
+                    mgr.current_view_mode = st["current_view_mode"]
+                if st.get("current_floor_name"):
+                    mgr.current_floor_name = st["current_floor_name"]
+            self._building_managers[bid] = mgr
+            # 为该建筑创建楼层标签
+            self._build_floor_tabs_for(mgr)
+            # （注意：不在循环内恢复楼层标签选中状态，因为 mgr.floor_notebook.select()
+            #  会触发 <<NotebookTabChanged>> → _on_floor_changed → Bug B 切换
+            #  _current_building_id，污染最终画布引用。楼层标签选中状态由
+            #  building_notebook.select(0) 后的自然流程处理。）
+        
+        self.building_notebook.bind("<<NotebookTabChanged>>", self._on_building_changed)
+        self.building_notebook.bind("<Button-3>", self._on_building_tab_right_click)
+
+        was_spliced = self.is_spliced or self._current_building_id == "__SPLICED__"
+
+        if building_ids:
+            self._current_building_id = building_ids[0]
+            self.building_notebook.select(0)
+
+        self._update_spliced_tab()
+
+        if was_spliced:
+            for tab_id in self.building_notebook.tabs():
+                if self.building_notebook.tab(tab_id, "text") == "拼接管网":
+                    self.building_notebook.select(tab_id)
+                    break
+
+    def _update_spliced_tab(self):
+        """在 building_notebook 中创建或更新「拼接管网」预览标签页"""
+        nb = getattr(self, 'building_notebook', None)
+        if not nb or not self.cad_data_manager.building_order:
+            return
+        cad = self.cad_data_manager
+        has_spliced = any(
+            bd.get("is_spliced") for bd in cad.building_data.values()
+        )
+        # 清除旧的拼接标签
+        for tab_id in nb.tabs():
+            if nb.tab(tab_id, "text") == "拼接管网":
+                nb.forget(tab_id)
+                break
+        if has_spliced:
+            frame = ttk.Frame(nb)
+            canvas = tk.Canvas(frame, bg="black", highlightthickness=0)
+            canvas.pack(fill="both", expand=True)
+            canvas.bind("<Configure>", lambda e: self.redraw())
+            nb.add(frame, text="拼接管网")
+            self._spliced_canvas = canvas
+            # 重建画布后必须重新绑定交互事件（含 <Motion>/Alt 悬停），
+            # 否则刷新重建后 Alt+悬停/右键/滚轮等全部失效
+            self._bind_canvas_events(canvas)
+            # 若当前正处于拼接视图（如刷新时停留在拼接标签），同步画布引用并恢复视图
+            if self.is_spliced or self._current_building_id == "__SPLICED__":
+                self._current_canvas = canvas
+                self.canvas = canvas
+                self.current_view_mode = "global"
+                self.update_projection()
+                self.redraw()
+
+    def _on_spliced_view_selected(self):
+        """切换到「拼接管网」预览视图：等轴测，显示两栋楼叠加，标高表按钮变灰"""
+        cad = self.cad_data_manager
+        base_bid = target_bid = None
+        for bid, bd in cad.building_data.items():
+            if bd.get("is_spliced"):
+                target_bid = bid
+                base_bid = bd.get("base_building_id", "")
+        if not base_bid or not target_bid:
+            return
+
+        # 保存当前楼栋视图状态
+        cur = self._active_building
+        if cur is not None and cur.building_id:
+            old_bid = cur.building_id or ""
+            self._building_view_angles[old_bid] = {
+                "angle": self.global_view_angle,
+                "elevation": self.global_view_elevation,
+                "elevation_var": self.global_view_elevation_var.get(),
+                "nav_angle": getattr(self, 'nav_angle', self.global_view_angle),
+            }
+            self._building_layer_colors_enabled[old_bid] = self.layer_colors_enabled.get()
+            self._building_hide_invalid[old_bid] = self.hide_invalid_var.get()
+            self._building_show_occlusion[old_bid] = self.show_occlusion_var.get()
+            self._building_velocity_check[old_bid] = self.velocity_check_var.get()
+            self._building_skip_dn_short_pipe[old_bid] = self.skip_dn_short_pipe.get()
+            self._building_hydrant_branch_flat[old_bid] = self.hydrant_branch_flat_var.get()
+            if cur._current_canvas and cur.current_floor_name:
+                cur.save_current_state()
+
+        # 解绑旧画布
+        if self._current_canvas is not None:
+            try:
+                self._unbind_canvas_events(self._current_canvas)
+            except Exception:
+                pass
+
+        self._current_building_id = "__SPLICED__"
+        self.is_spliced = True
+        self._spliced_base_bid = base_bid
+        self._spliced_target_bid = target_bid
+
+        # 切换到拼接画布
+        self._current_canvas = self._spliced_canvas
+        self.canvas = self._current_canvas
+        if self._current_canvas:
+            self._bind_canvas_events(self._current_canvas)
+
+        self.current_view_mode = "global"
+        if hasattr(self, 'compass_frame'):
+            self.compass_frame.pack(fill="x", padx=5, pady=5)
+        self.height_btn.config(state="disabled")
+        self._calib_drag = None
+
+        # 恢复拼接视图的视角和控件状态
+        has_spliced_state = "__SPLICED__" in self._building_view_angles
+        if has_spliced_state:
+            saved = self._building_view_angles["__SPLICED__"]
+            self.global_view_angle = saved["angle"]
+            self.global_view_elevation = saved["elevation"]
+            self.global_view_elevation_var.set(saved["elevation_var"])
+            self.nav_angle = saved["nav_angle"]
+            self.scale = saved.get("scale", 1.0)
+            self.translate_x = saved.get("translate_x", 0.0)
+            self.translate_y = saved.get("translate_y", 0.0)
+        else:
+            self.global_view_angle = 45.0
+            self.global_view_elevation = 54.736
+            self.global_view_elevation_var.set("35.264")
+            self.nav_angle = 45.0
+        if "__SPLICED__" in self._building_layer_colors_enabled:
+            self.layer_colors_enabled.set(self._building_layer_colors_enabled["__SPLICED__"])
+        else:
+            self.layer_colors_enabled.set(False)
+        if "__SPLICED__" in self._building_hide_invalid:
+            self.hide_invalid_var.set(self._building_hide_invalid["__SPLICED__"])
+        else:
+            self.hide_invalid_var.set(False)
+        if "__SPLICED__" in self._building_show_occlusion:
+            self.show_occlusion_var.set(self._building_show_occlusion["__SPLICED__"])
+        else:
+            self.show_occlusion_var.set(True)
+        if "__SPLICED__" in self._building_velocity_check:
+            self.velocity_check_var.set(self._building_velocity_check["__SPLICED__"])
+        else:
+            self.velocity_check_var.set(False)
+        if "__SPLICED__" in self._building_skip_dn_short_pipe:
+            self.skip_dn_short_pipe.set(self._building_skip_dn_short_pipe["__SPLICED__"])
+        else:
+            self.skip_dn_short_pipe.set(True)
+        if "__SPLICED__" in self._building_hydrant_branch_flat:
+            self.hydrant_branch_flat_var.set(self._building_hydrant_branch_flat["__SPLICED__"])
+        else:
+            self.hydrant_branch_flat_var.set(True)
+
+        # 清投影缓存，按两栋楼前缀重算
+        self._global_cache_key = None
+        self._global_projected_coords.clear()
+        self.update_projection()
+        if not has_spliced_state:
+            self.auto_center()
+        self.redraw()
+        self._update_hydrant_flat_state()
+        if hasattr(self, 'layer_color_btn') and self.layer_color_btn:
+            self.layer_color_btn.config(state="disabled")
+
+    def _on_building_tab_right_click(self, event):
+        """楼栋标签右键菜单：删除单体"""
+        nb = self.building_notebook
+        if not nb or not nb.tabs():
+            return
+        try:
+            idx = nb.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        bids = self.cad_data_manager.building_order
+        if not bids or idx < 0 or idx >= len(bids):
+            return
+        bid = bids[idx]
+        menu = tk.Menu(self, tearoff=0)
+        # 基准菜单：项目已有基准单体（ZT 读入即带 is_base）时不允许手动设置，
+        # 非基准单体只能通过拼接管网获取基准属性
+        bd = self.cad_data_manager.building_data.get(bid, {})
+        has_base = any(
+            other_bd.get("is_base")
+            for other_bd in self.cad_data_manager.building_data.values()
+        )
+        if not bd.get("is_base") and not has_base:
+            menu.add_command(label="作为基准管网",
+                command=lambda b=bid: self._set_as_base(b))
+            menu.add_separator()
+        elif bd.get("is_base") and bid != "ZT":
+            # 仅手动设置的基准可取消；ZT 的基准属性为读入固有，不可取消
+            has_dependents = any(
+                other_bd.get("base_building_id") == bid
+                for other_bd in self.cad_data_manager.building_data.values()
+            )
+            if not has_dependents:
+                menu.add_command(label="取消基准管网",
+                    command=lambda b=bid: self._cancel_base(b))
+                menu.add_separator()
+        menu.add_command(label="删除单体", command=lambda: self._on_delete_building(bid))
+        menu.tk_popup(event.x_root, event.y_root)
+        menu.grab_release()
+
+    def _set_as_base(self, bid):
+        """设置指定楼栋为基准管网。"""
+        self.cad_data_manager.building_data[bid]["is_base"] = True
+        self.show_temp_message(f"已将 {bid} 设为基准管网", 2000)
+
+    def _cancel_base(self, bid):
+        """取消指定楼栋的基准管网属性。"""
+        self.cad_data_manager.building_data[bid].pop("is_base", None)
+        self.show_temp_message(f"已取消 {bid} 的基准管网", 2000)
+
+    def _on_delete_building(self, building_id: str):
+        """级联删除指定楼栋，记录undo，刷新UI。"""
+        from tkinter import messagebox
+        if not messagebox.askyesno("删除单体", f"确定要删除楼栋「{building_id}」及其所有数据吗？\n\n此操作不可撤销。"):
+            return
+        snapshot = self.cad_data_manager.delete_building(building_id)
+        self._record_change('delete_building', snapshot)
+        # 删除最后一个单体时完全清空（等同取消区域管网）
+        if not self.cad_data_manager.building_order:
+            root = self.winfo_toplevel()
+            main_app = getattr(root, 'main_app', None)
+            if main_app and hasattr(main_app, 'pages'):
+                for pname in ("管道", "节点", "阀门"):
+                    p = main_app.pages.get(pname)
+                    if p and hasattr(p, 'reset_state'):
+                        p.reset_state()
+            self.reset_state()
+            return
+        # 通知其他页面刷新
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if main_app and hasattr(main_app, 'pages'):
+            for pname in ("管道", "节点", "阀门"):
+                p = main_app.pages.get(pname)
+                if p and hasattr(p, 'refresh_data'):
+                    p.refresh_data()
+        # 重建预览界面
+        self.rebuild_floor_tabs()
+        self.update_projection()
+        self.redraw()
+        self.occlusion_cache_valid = False
+
+    def _on_building_changed(self, event=None):
+        """楼栋标签切换时：保存旧楼栋视图状态，恢复新楼栋楼层标签。"""
+        logger.info(f"Debug _on_building_changed entered: event={'<event>' if event else 'None'}, "
+                    f"_current_building_id={self._current_building_id}, canvas={self.canvas}, "
+                    f"_current_canvas={self._current_canvas}")
+        if not self.building_notebook or not self.building_notebook.tabs():
+            return
+        tab_id = self.building_notebook.select()
+        if not tab_id:
+            return
+        tab_text = self.building_notebook.tab(tab_id, "text")
+        # 幂等守卫：select() 触发事件后调用方又手动调用一次，重复执行会污染视图状态。
+        # 仅对单体楼栋切换短路（保存/恢复有副作用）；拼接视图不短路——
+        # 数据刷新重建拼接画布后 is_spliced 仍为 True，必须重新执行
+        # _on_spliced_view_selected 以重绑画布与事件，否则 Alt+悬停/右键全部失效。
+        if tab_text == self._current_building_id and not self.is_spliced:
+            return
+        # 拼接管网视图特殊处理
+        if tab_text == "拼接管网":
+            self._on_spliced_view_selected()
+            return
+        # 离开拼接视图时保存状态
+        if self.is_spliced:
+            self._building_view_angles["__SPLICED__"] = {
+                "angle": self.global_view_angle,
+                "elevation": self.global_view_elevation,
+                "elevation_var": self.global_view_elevation_var.get(),
+                "nav_angle": getattr(self, 'nav_angle', self.global_view_angle),
+                "scale": self.scale,
+                "translate_x": self.translate_x,
+                "translate_y": self.translate_y,
+            }
+            self._building_layer_colors_enabled["__SPLICED__"] = self.layer_colors_enabled.get()
+            self._building_hide_invalid["__SPLICED__"] = self.hide_invalid_var.get()
+            self._building_show_occlusion["__SPLICED__"] = self.show_occlusion_var.get()
+            self._building_velocity_check["__SPLICED__"] = self.velocity_check_var.get()
+            self._building_skip_dn_short_pipe["__SPLICED__"] = self.skip_dn_short_pipe.get()
+            self._building_hydrant_branch_flat["__SPLICED__"] = self.hydrant_branch_flat_var.get()
+        self.is_spliced = False
+        # 启用分层颜色按钮（拼接视图被禁用）
+        if hasattr(self, 'layer_color_btn') and self.layer_color_btn:
+            self.layer_color_btn.config(state="normal")
+        if not tab_text or tab_text not in self._building_managers:
+            return
+        
+        # 切换楼栋时关闭分层颜色对话框
+        if self.color_dialog is not None and tk.Toplevel.winfo_exists(self.color_dialog.dialog):
+            self._on_color_dialog_close()
+        
+        # ===== Batch 2：保存当前楼栋的视角方向和分层颜色开关 =====
+        cur = self._active_building
+        if cur is not None:
+            old_bid = cur.building_id or ""
+            self._building_view_angles[old_bid] = {
+                "angle": self.global_view_angle,
+                "elevation": self.global_view_elevation,
+                "elevation_var": self.global_view_elevation_var.get(),
+                "nav_angle": getattr(self, 'nav_angle', self.global_view_angle),
+            }
+            self._building_layer_colors_enabled[old_bid] = self.layer_colors_enabled.get()
+            # ===== 保存管道操作栏状态 =====
+            self._building_hide_invalid[old_bid] = self.hide_invalid_var.get()
+            self._building_show_occlusion[old_bid] = self.show_occlusion_var.get()
+            self._building_velocity_check[old_bid] = self.velocity_check_var.get()
+            self._building_skip_dn_short_pipe[old_bid] = self.skip_dn_short_pipe.get()
+            self._building_hydrant_branch_flat[old_bid] = self.hydrant_branch_flat_var.get()
+        
+        # 保存当前楼栋楼层视图状态
+        if cur is not None and cur._current_canvas and cur.current_floor_name:
+            cur.save_current_state()
+        
+        # 切换楼栋ID
+        self._current_building_id = tab_text
+        
+        # ===== Batch 2：恢复新楼栋的视角方向和分层颜色开关 =====
+        new_bid = tab_text
+        if new_bid in self._building_view_angles:
+            saved = self._building_view_angles[new_bid]
+            self.global_view_angle = saved["angle"]
+            self.global_view_elevation = saved["elevation"]
+            self.global_view_elevation_var.set(saved["elevation_var"])
+            self.nav_angle = saved["nav_angle"]
+        else:
+            self.global_view_angle = 45.0
+            self.global_view_elevation = 54.736
+            self.global_view_elevation_var.set("35.264")
+            self.nav_angle = 45.0
+        if new_bid in self._building_layer_colors_enabled:
+            self.layer_colors_enabled.set(self._building_layer_colors_enabled[new_bid])
+        else:
+            self.layer_colors_enabled.set(False)
+        # ===== 恢复管道操作栏状态 =====
+        if new_bid in self._building_hide_invalid:
+            self.hide_invalid_var.set(self._building_hide_invalid[new_bid])
+        else:
+            self.hide_invalid_var.set(False)
+        if new_bid in self._building_show_occlusion:
+            self.show_occlusion_var.set(self._building_show_occlusion[new_bid])
+        else:
+            self.show_occlusion_var.set(True)
+        if new_bid in self._building_velocity_check:
+            self.velocity_check_var.set(self._building_velocity_check[new_bid])
+        else:
+            self.velocity_check_var.set(False)
+        if new_bid in self._building_skip_dn_short_pipe:
+            self.skip_dn_short_pipe.set(self._building_skip_dn_short_pipe[new_bid])
+        else:
+            self.skip_dn_short_pipe.set(True)
+        if new_bid in self._building_hydrant_branch_flat:
+            self.hydrant_branch_flat_var.set(self._building_hydrant_branch_flat[new_bid])
+        else:
+            self.hydrant_branch_flat_var.set(False)
+        
+        # 先解绑旧画布防止泄漏
+        if self._current_canvas is not None:
+            try:
+                self._unbind_canvas_events(self._current_canvas)
+            except Exception:
+                pass
+        # 清空引用强制 _on_floor_changed 重新绑定新画布
+        self._current_canvas = None
+        self.canvas = None
+        
+        # 校准拖拽状态复位
+        self._calib_drag = None
+
+        # 触发楼层标签切换（_on_floor_changed 通过 property 路由到新楼栋）
+        self._on_floor_changed()
+
+    def _get_building_prefix(self):
+        """获取当前楼栋ID前缀。非区域模式返回空字符串，区域模式返回 'building_id_'。
+        拼接视图返回所有已拼接单体及其基准的前缀元组，利用 str.startswith(tuple) 兼容所有调用方。"""
+        if self.is_spliced:
+            prefixes = set()
+            for bid, bd in self.cad_data_manager.building_data.items():
+                if bd.get("is_spliced"):
+                    prefixes.add(bid + "_")
+                    base_bid = bd.get("base_building_id")
+                    if base_bid:
+                        prefixes.add(base_bid + "_")
+            if prefixes:
+                return tuple(prefixes)
+        ab = self._active_building
+        bid = ab.building_id if ab else None
+        return bid + "_" if bid else ""
 
     def _on_floor_changed(self, event=None):
         """楼层切换时更新当前画布引用并重绘，恢复该楼层视图状态"""
+        # （Bug B）检测来源楼栋，确保操作对应楼栋的楼层标签
+        switched_building = False
+        if event and event.widget:
+            src_widget = event.widget
+            src_bid = None
+            if self._single_building and self._single_building.floor_notebook is src_widget:
+                src_bid = None
+            else:
+                for bid, mgr in self._building_managers.items():
+                    if mgr.floor_notebook is src_widget:
+                        src_bid = bid
+                        break
+            if src_bid is not None and src_bid != self._current_building_id:
+                # 延迟事件守卫：事件来源楼栋与 building_notebook 当前显示不一致时跳过
+                nb = getattr(self, 'building_notebook', None)
+                if nb and nb.tabs():
+                    cur = nb.select()
+                    if cur:
+                        cur_bid = nb.tab(cur, "text")
+                        if cur_bid and cur_bid != src_bid:
+                            return
+                if (self._current_building_id is not None
+                    and self._current_building_id in self._building_managers):
+                    self._building_managers[self._current_building_id].save_current_state()
+                self._current_building_id = src_bid
+                switched_building = True
+
         tab_id = self.floor_notebook.select()
         if not tab_id:
             return
         tab_text = self.floor_notebook.tab(tab_id, "text")
 
-        # 仅当切换到不同标签页时才保存上一个楼层的视图状态
-        if (self._current_canvas is not None and self.current_floor_name is not None
+        # 仅当在同一建筑内切换楼层时才保存上一个楼层的视图状态
+        if (not switched_building and self._current_canvas is not None
+            and self.current_floor_name is not None
             and self.current_floor_name != tab_text):
             self.floor_view_state[self.current_floor_name] = (
                 self.scale, self.translate_x, self.translate_y
@@ -1775,18 +2691,24 @@ class PreviewPage(ttk.Frame):
                 break
         if new_canvas is None:
             return
-    
-        # 解绑旧画布事件
+        
+        # 解绑旧画布事件（如果不同）
         if self._current_canvas is not None and self._current_canvas != new_canvas:
             try:
                 self._unbind_canvas_events(self._current_canvas)
             except Exception as e:
                 logger.debug(f"解绑旧画布事件时出错（可忽略）: {e}")
-        if self._current_canvas != new_canvas:
-            self._bind_canvas_events(new_canvas)
+        # 始终重新绑定当前画布的事件（确保首次访问时绑定有效）
+        try:
+            self._unbind_canvas_events(new_canvas)
+        except Exception:
+            pass
+        self._bind_canvas_events(new_canvas)
     
         self._current_canvas = new_canvas
         self.canvas = new_canvas
+        if self._active_building:
+            self._active_building._current_canvas = new_canvas
         self.current_floor_name = tab_text
 
         # 对于分组标签页，设置实际显示的第一个楼层
@@ -1805,6 +2727,8 @@ class PreviewPage(ttk.Frame):
         else:
             self.compass_frame.pack_forget()
         self._update_hydrant_flat_state()
+        # 离开拼接视图后恢复标高表按钮
+        self.height_btn.config(state="normal")
     
         logger.info(f"切换到楼层: {self.current_floor_name}")
     
@@ -1827,6 +2751,8 @@ class PreviewPage(ttk.Frame):
         # 执行待处理的跳转缩放
         if self._pending_jump:
             self._execute_jump_zoom()
+        # 校准拖拽状态复位
+        self._calib_drag = None
 
     def _filter_projected_to_current_floor(self):
         """过滤 projected_coords 只保留当前楼层节点，使 auto_center 以该楼层范围居中。"""
@@ -1836,8 +2762,11 @@ class PreviewPage(ttk.Frame):
             display_floor = canvas.current_display_floor
         if display_floor == "单层":
             return
-        floor = self.cad_data_manager.floor_by_name.get(display_floor)
-        if not floor:
+        floor = self.cad_data_manager.lookup_floor(display_floor, self._current_building_id)
+        if not floor or not floor.pipes:
+            # 楼层存在但无管道（如屋顶对齐框内无管道）：清空投影，
+            # 使画面真正空白、auto_center 不受其他楼层节点干扰
+            self.projected_coords.clear()
             return
         keep_ids = set()
         for pipe in floor.pipes:
@@ -1868,6 +2797,9 @@ class PreviewPage(ttk.Frame):
         canvas.bind("<KeyPress-Alt_R>", self._on_alt_press)
         canvas.bind("<KeyRelease-Alt_L>", self._on_alt_release)
         canvas.bind("<KeyRelease-Alt_R>", self._on_alt_release)
+        canvas.bind("<Shift-Button-1>", self._on_calib_shift_click)
+        canvas.bind("<Shift-B1-Motion>", self._on_calib_shift_drag)
+        canvas.bind("<Shift-ButtonRelease-1>", self._on_calib_shift_release)
         canvas.focus_set()
 
     def _unbind_canvas_events(self, canvas):
@@ -1887,6 +2819,9 @@ class PreviewPage(ttk.Frame):
             canvas.unbind("<Control-Z>")
             canvas.unbind("<Motion>")
             canvas.unbind("<Leave>")
+            canvas.unbind("<Shift-Button-1>")
+            canvas.unbind("<Shift-B1-Motion>")
+            canvas.unbind("<Shift-ButtonRelease-1>")
         except tk.TclError:
             # 窗口已销毁，忽略
             pass
@@ -1925,8 +2860,11 @@ class PreviewPage(ttk.Frame):
                         command=self.redraw).pack(anchor="w")
         ttk.Checkbutton(left_col, text="横管标高",
                         variable=self.show_elevation,
-                        command=self.redraw).pack(anchor="w")        
-        
+                        command=self.redraw).pack(anchor="w")
+        self.connection_id_check = ttk.Checkbutton(left_col, text="连接点编号",
+                        variable=self.show_connection_id_var,
+                        command=self.redraw)
+        self.connection_id_check.pack(anchor="w")
         # 右侧列
         self.flow_check = ttk.Checkbutton(right_col, text="管道流量",
                                            variable=self.show_flow,
@@ -2023,19 +2961,23 @@ class PreviewPage(ttk.Frame):
         self.velocity_check_cb.pack(side="left", padx=2)
         self.hydrant_flat_cb = ttk.Checkbutton(check_row2, text="消火栓支管向左展开",
                                                 variable=self.hydrant_branch_flat_var,
-                                                command=self.redraw)
+                                                command=self._on_hydrant_flat_toggle)
         self.hydrant_flat_cb.pack(side="left", padx=2)
 
-        # 短管跳过DN标注（第三行）
+        # 短管跳过标注（第三行）
         skip_dn_row = ttk.Frame(pipe_op_frame)
         skip_dn_row.pack(fill="x", pady=2)
-        ttk.Checkbutton(skip_dn_row, text="短管跳过DN",
+        ttk.Checkbutton(skip_dn_row, text="短管跳过",
                         variable=self.skip_dn_short_pipe,
                         command=self.redraw).pack(side="left", padx=2)
         self.skip_dn_min_entry = ttk.Entry(skip_dn_row, width=5)
         self.skip_dn_min_entry.insert(0, f"{self.skip_dn_min_length:.1f}")
         self.skip_dn_min_entry.pack(side="left", padx=2)
         ttk.Label(skip_dn_row, text="m").pack(side="left")
+        self.equiv_color_cb = ttk.Checkbutton(skip_dn_row, text="当量长度着色",
+                                               variable=self.equiv_color_var,
+                                               command=self.redraw)
+        self.equiv_color_cb.pack(side="left", padx=2)
 
         # CAD反写按钮
         self.cad_export_btn = ttk.Button(pipe_op_frame, text="反写整体管网到CAD",
@@ -2071,7 +3013,8 @@ class PreviewPage(ttk.Frame):
         self.elevation_entry.pack(side="left", padx=2)
         ttk.Button(elevation_frame, text="复原", command=self.reset_elevation, width=6).pack(side="left", padx=2)
         # 新增：分层颜色按钮
-        ttk.Button(elevation_frame, text="分层颜色", command=self.show_layer_color_dialog, width=8).pack(side="left", padx=5)
+        self.layer_color_btn = ttk.Button(elevation_frame, text="分层颜色", command=self.show_layer_color_dialog, width=8)
+        self.layer_color_btn.pack(side="left", padx=5)
 
         # 绑定焦点离开事件，实时更新
         self.elevation_entry.bind("<FocusOut>", self.on_elevation_changed)
@@ -2080,9 +3023,11 @@ class PreviewPage(ttk.Frame):
         # 初始隐藏，切到整体管网时才显示
         self.compass_frame.pack_forget()
 
-        note = ttk.Label(parent, text="左键点击管道/阀门选择\n右键弹出菜单",
-                         justify="left", foreground="gray")
-        note.pack(side="bottom", pady=10)
+        # 未配对连接点统计
+        self.unpaired_label = ttk.Label(parent, text="", foreground="red", font=("Arial", 9, "bold"))
+        self.unpaired_label.pack(side="bottom", pady=2)
+        self._update_unpaired_count()
+
         # 初始化无效管相关控件和消火栓支管展开复选框的状态
         self.update_invalid_controls_state()
         self._update_hydrant_flat_state()
@@ -2095,7 +3040,9 @@ class PreviewPage(ttk.Frame):
         state = "normal" if is_indoor else "disabled"
         self.mark_invalid_btn.config(state=state)
         self.delete_invalid_btn.config(state=state)
-        self.hide_invalid_cb.config(state=state)
+        # 隐藏无效管为显示功能：室内消火栓与喷淋均可用
+        hide_state = "normal" if system_type in ("indoor_hydrant", "sprinkler") else "disabled"
+        self.hide_invalid_cb.config(state=hide_state)
 
         # 喷淋按钮可见性
         if system_type == "sprinkler":
@@ -2135,7 +3082,17 @@ class PreviewPage(ttk.Frame):
     # ----------------------------------------------------------------------
     def project_point(self, x_mm: float, y_mm: float, z_mm: float) -> Tuple[float, float]:
         if self.current_view_mode == "global":
-            cx, cy, cz = self.compute_network_centroid()
+            # 质心缓存：同一视角+楼栋前缀下质心不变，避免每次调用 O(n) 遍历节点
+            # （悬停查找/阀门绘制在拼接视图下会大量调用 project_point）
+            prefix_key = self._get_building_prefix()
+            cache_key = (round(self.global_view_angle, 2), round(self.global_view_elevation, 2),
+                         prefix_key, self._current_building_id)
+            cached = getattr(self, '_centroid_cache', None)
+            if cached is None or cached[0] != cache_key:
+                cx, cy, cz = self.compute_network_centroid(prefix_key)
+                self._centroid_cache = (cache_key, cx, cy, cz)
+            else:
+                _, cx, cy, cz = cached
             tx = x_mm - cx
             ty = y_mm - cy
             tz = z_mm - cz
@@ -2197,16 +3154,51 @@ class PreviewPage(ttk.Frame):
         return depth
 
     def update_projection(self):
-        """为所有节点计算投影坐标和深度（世界坐标，毫米）"""
+        """为所有节点计算投影坐标和深度（世界坐标，毫米），区域模式按楼栋过滤"""
+        prefix = self._get_building_prefix()
         self.projected_coords.clear()
         self.projected_depth.clear()
         for node in self.cad_data_manager.nodes:
+            if prefix and not node.node_id.startswith(prefix):
+                continue
             px, py = self.project_point(node.x, node.y, node.z)
             depth = self.compute_depth(node.x, node.y, node.z)
             self.projected_coords[node.node_id] = (px, py)
             self.projected_depth[node.node_id] = depth
         # 投影更新后，遮挡缓存失效
         self.occlusion_cache_valid = False
+
+    def _refresh_global_projection_delta(self, added_nodes, removed_node_ids):
+        """数据增删后增量维护整体画布投影缓存。
+
+        用缓存构建时记录的质心与当前视角把新增节点投影进 _global_projected_coords、
+        移除删除节点——不重算全部投影，质心不变，管网视觉位置纹丝不动，
+        且与 project_point 的质心缓存保持一致（避免视觉错位）。
+        缓存尚未构建（未进入整体画布）时置 cache_key=None 由下次绘制重建。
+        """
+        if not self._global_projected_coords or self._global_cache_key is None:
+            self._global_cache_key = None
+            return
+        cx, cy, cz = getattr(self, '_global_centroid', (0.0, 0.0, 0.0))
+        az = math.radians(self.global_view_angle)
+        el = math.radians(self.global_view_elevation)
+        ca, sa, ce, se = math.cos(az), math.sin(az), math.cos(el), math.sin(el)
+        bprefix = self._get_building_prefix()
+        for node in added_nodes:
+            if bprefix and not node.node_id.startswith(bprefix):
+                continue
+            tx, ty, tz = node.x - cx, node.y - cy, node.z - cz
+            x1 = tx * ca + ty * sa
+            y1 = -tx * sa + ty * ca
+            self._global_projected_coords[node.node_id] = (x1, -(y1 * ce + tz * se))
+            self._global_projected_depth[node.node_id] = (node.x * sa - node.y * ca) * se + node.z * ce
+        for nid in removed_node_ids:
+            self._global_projected_coords.pop(nid, None)
+            self._global_projected_depth.pop(nid, None)
+
+    def _on_hydrant_flat_toggle(self):
+        self.occlusion_cache_valid = False   # 强制重建遮挡缓存
+        self.redraw()
 
     def build_occlusion_cache(self):
         """构建遮挡关系缓存：检测二维相交，比较三维深度，记录后方管线的断开参数"""
@@ -2221,18 +3213,40 @@ class PreviewPage(ttk.Frame):
         if n < 2:
             self.occlusion_cache_valid = True
             return
-        
-        # 预先提取所有管线的投影坐标和端点深度
+
+        use_offset = (self.hydrant_branch_flat_var.get() and self.current_view_mode == "global")
+        offset_val = 600.0
+
+        # 预先提取所有管线的投影坐标和端点深度（考虑偏移）
         pipe_proj = {}
         pipe_depth = {}
         for pipe in pipes:
+            start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+            end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
+            if not start_node or not end_node:
+                continue
+            # 获取投影坐标（基于节点原始坐标）
             start_w = self.projected_coords.get(pipe.start_node_id)
             end_w = self.projected_coords.get(pipe.end_node_id)
+            if not start_w or not end_w:
+                continue
             d_s = self.projected_depth.get(pipe.start_node_id)
             d_e = self.projected_depth.get(pipe.end_node_id)
-            if start_w and end_w and d_s is not None and d_e is not None:
-                pipe_proj[pipe.pipe_id] = (start_w, end_w)
-                pipe_depth[pipe.pipe_id] = (d_s, d_e)
+            if d_s is None or d_e is None:
+                continue
+        
+            # --- 对 B_ 管道应用视觉偏移（修改终点位置） ---
+            if use_offset and self.cad_data_manager.id_type(pipe.pipe_id) == "B":
+                # 终点（消火栓端）向左平移 600 单位（在 XY 平面）
+                # 注意：这里需要将终点坐标改为起点左侧 600 单位
+                start_w = self.projected_coords.get(pipe.start_node_id)
+                if start_w:
+                    end_w = (start_w[0] - offset_val, start_w[1])
+                    # 深度不变（因为 Z 未变），但为了计算相交，我们只需要修改投影坐标
+            # --- 偏移结束 ---
+        
+            pipe_proj[pipe.pipe_id] = (start_w, end_w)
+            pipe_depth[pipe.pipe_id] = (d_s, d_e)
         
         # 遍历所有管线对，检测相交与遮挡
         for i in range(n):
@@ -2338,6 +3352,8 @@ class PreviewPage(ttk.Frame):
 
     def auto_center(self):
         """根据所有节点投影自动设置缩放和平移，使管网适应画布"""
+        if not self.canvas:
+            return
         if not self.projected_coords:
             return
         xs = [wx for wx, wy in self.projected_coords.values()]
@@ -2369,12 +3385,15 @@ class PreviewPage(ttk.Frame):
         self.translate_x = canvas_width/2 - center_x * self.scale
         self.translate_y = canvas_height/2 - center_y * self.scale
 
-    def compute_network_centroid(self):
+    def compute_network_centroid(self, building_prefix=None):
         """
-        计算所有节点的三维质心（毫米），作为等轴测旋转中心。
+        计算节点的三维质心（毫米），作为等轴测旋转中心。
+        building_prefix 不为空时仅计算该楼栋节点的质心。
         若无节点，返回原点 (0,0,0)。
         """
         nodes = self.cad_data_manager.nodes
+        if building_prefix:
+            nodes = [n for n in nodes if n.node_id.startswith(building_prefix)]
         if not nodes:
             return 0.0, 0.0, 0.0
         total = len(nodes)
@@ -2500,18 +3519,24 @@ class PreviewPage(ttk.Frame):
             display_floor_name = canvas.current_display_floor
                     
         if display_floor_name != "单层":
-            floor = self.cad_data_manager.floor_by_name.get(display_floor_name)
-            if floor:
+            floor = self.cad_data_manager.lookup_floor(display_floor_name, self._current_building_id)
+            if floor and floor.pipes:
                 pipes_to_draw = floor.pipes
                 nodes_to_draw = floor.nodes
             else:
-                # 降级：绘制全部
-                pipes_to_draw = self.cad_data_manager.pipes
-                nodes_to_draw = self.cad_data_manager.nodes
-                logger.warning(f"未找到楼层 {current_tab_name}，使用全部管道")
+                # 楼层存在但无管道（如屋顶对齐框内无管道）：画布保持空白，
+                # 不降级绘制全部楼层管道（避免"空楼层显示所有管道"的误导）
+                pipes_to_draw = []
+                nodes_to_draw = []
         else:
             pipes_to_draw = self.cad_data_manager.pipes
             nodes_to_draw = self.cad_data_manager.nodes
+        
+        # 区域模式：按楼栋前缀过滤
+        bprefix = self._get_building_prefix()
+        if bprefix:
+            pipes_to_draw = [p for p in pipes_to_draw if p.pipe_id.startswith(bprefix)]
+            nodes_to_draw = [n for n in nodes_to_draw if n.node_id.startswith(bprefix)]
         
         # ----- 必须投影该楼层所有管道端点，否则阀门、消火栓等可能绘制失败 -----
         need_proj_ids = set()
@@ -2536,6 +3561,8 @@ class PreviewPage(ttk.Frame):
         
         # 绘制阀门（只绘制当前楼层的）
         for valve in self.cad_data_manager.valves:
+            if bprefix and not valve.valve_id.startswith(bprefix):
+                continue
             if valve.floor_name == display_floor_name or (display_floor_name == "单层" and not valve.floor_name):
                 self.draw_valve(valve)
         
@@ -2550,42 +3577,57 @@ class PreviewPage(ttk.Frame):
         
         # 绘制消火栓（只绘制当前楼层的，基于坐标，不依赖节点）
         if display_floor_name != "整体管网":
-            floor = self.cad_data_manager.floor_by_name.get(display_floor_name) if display_floor_name != "单层" else None
+            floor = self.cad_data_manager.lookup_floor(display_floor_name, self._current_building_id) if display_floor_name != "单层" else None
             if floor:
                 for hydrant in floor.hydrants:
-                    self.draw_hydrant_by_coords(hydrant)   # 使用新函数
+                    if bprefix and not hydrant.hydrant_id.startswith(bprefix):
+                        continue
+                    self.draw_hydrant_by_coords(hydrant)
             elif display_floor_name == "单层":
                 for hydrant in self.cad_data_manager.hydrants:
-                    if not hasattr(hydrant, 'hydrant_id'):   # 或 isinstance(hydrant, HydrantData)
-                        # logger.warning(f"跳过非消火栓对象: {type(hydrant)}")
+                    if not hasattr(hydrant, 'hydrant_id'):
+                        continue
+                    if bprefix and not hydrant.hydrant_id.startswith(bprefix):
                         continue
                     self.draw_hydrant(hydrant)
         # 整体管网模式已在 _draw_global_network 中绘制所有消火栓（调用 draw_hydrant，依赖节点）
         
         # 绘制立管（只绘制当前楼层的）
         for riser in self.cad_data_manager.risers:
+            if bprefix and not riser.riser_id.startswith(bprefix):
+                continue
             if riser.floor_name == display_floor_name or (display_floor_name == "单层" and not riser.floor_name):
                 self.draw_riser(riser)
+
+        # 绘制连接点（仅区域模式）
+        self.draw_connection_points()
+
+        # 绘制校准矩形框（仅区域模式楼层平面）
+        if self.cad_data_manager.building_order and self.current_view_mode == "floor":
+            self.draw_calibration_rects()
 
         # 绘制左下角固定文字（通过独立方法处理）
         self._draw_floor_info_text()
 
     def _draw_global_network(self):
         """绘制整体管网（所有楼层元素 + 罗盘）"""
-        if self._separation_applied:
+        if self._is_separation_applied():
             self._draw_global_network_separated()
             return
+        bprefix = self._get_building_prefix()
         canvas = self._current_canvas
         if not canvas or not canvas.winfo_exists():
             return
         canvas.delete("all")
 
         # ----- 投影缓存：视角变化时重算，缩放/平移零计算开销 -----
-        cache_key = (round(self.global_view_angle, 2), round(self.global_view_elevation, 2))
+        cache_key = (round(self.global_view_angle, 2), round(self.global_view_elevation, 2), self._current_building_id)
         cache_miss = getattr(self, '_global_cache_key', None) != cache_key
 
         if cache_miss:
-            _cx, _cy, _cz = self.compute_network_centroid()
+            _cx, _cy, _cz = self.compute_network_centroid(bprefix)
+            # 记录投影质心：数据增删后增量维护缓存时沿用（避免重算导致的管网整体位移）
+            self._global_centroid = (_cx, _cy, _cz)
             _az = math.radians(self.global_view_angle)
             _el = math.radians(self.global_view_elevation)
             _ca, _sa = math.cos(_az), math.sin(_az)
@@ -2603,6 +3645,8 @@ class PreviewPage(ttk.Frame):
             _proj = {}
             _depth = {}
             for node in self.cad_data_manager.nodes:
+                if bprefix and not node.node_id.startswith(bprefix):
+                    continue
                 _proj[node.node_id] = _fast_proj(node.x, node.y, node.z)
                 _depth[node.node_id] = _fast_depth(node.x, node.y, node.z)
 
@@ -2611,8 +3655,12 @@ class PreviewPage(ttk.Frame):
             self._global_cache_key = cache_key
             self.occlusion_cache_valid = False
 
-        self.projected_coords = self._global_projected_coords
-        self.projected_depth = self._global_projected_depth
+        if bprefix:
+            self.projected_coords = {k: v for k, v in self._global_projected_coords.items() if k.startswith(bprefix)}
+            self.projected_depth = {k: v for k, v in self._global_projected_depth.items() if k.startswith(bprefix)}
+        else:
+            self.projected_coords = self._global_projected_coords
+            self.projected_depth = self._global_projected_depth
 
         # 消火栓支管向左展开（复选框控制）
         if self.hydrant_branch_flat_var.get():
@@ -2631,16 +3679,22 @@ class PreviewPage(ttk.Frame):
         # 构建从 R_ 管道ID到立管对象的映射（用于重复立管高亮）
         self.riser_by_pipe_id = {}
         for riser in self.cad_data_manager.risers:
+            if bprefix and not riser.riser_id.startswith(bprefix):
+                continue
             self.riser_by_pipe_id[riser.riser_id] = riser  
 
         # 绘制管道
         for pipe in self.cad_data_manager.pipes:
+            if bprefix and not pipe.pipe_id.startswith(bprefix):
+                continue
             if self.hide_invalid_var.get() and not pipe.is_active:
                 continue
             self.draw_pipe(pipe)
 
         # 绘制阀门
         for valve in self.cad_data_manager.valves:
+            if bprefix and not valve.valve_id.startswith(bprefix):
+                continue
             self.draw_valve(valve)
 
         # 绘制供水点和用水点
@@ -2650,16 +3704,22 @@ class PreviewPage(ttk.Frame):
         # 节点编号（可选）
         if self.show_node_ids.get() or self.show_node_pressure.get():
             for node in self.cad_data_manager.nodes:
+                if bprefix and not node.node_id.startswith(bprefix):
+                    continue
                 self.draw_node(node)
 
         # 消火栓
         for hydrant in self.cad_data_manager.hydrants:
             if not hasattr(hydrant, 'hydrant_id'):
                 continue
+            if bprefix and not hydrant.hydrant_id.startswith(bprefix):
+                continue
             self.draw_hydrant(hydrant)
 
         # 绘制颜色图例表（如果启用分层颜色）
-        self.draw_color_legend()    
+        self.draw_color_legend()
+        # 绘制连接点（仅区域模式）
+        self.draw_connection_points()
         # 清理消火栓支管视觉偏移
         self._hydrant_visual_offsets = None
 
@@ -2667,7 +3727,7 @@ class PreviewPage(ttk.Frame):
         """构建 B_ 消火栓支管末端节点的视觉偏移映射 {end_node_id: start_node_id}"""
         self._hydrant_visual_offsets = {}
         for pipe in self.cad_data_manager.pipes:
-            if pipe.pipe_id.startswith('B_') and getattr(pipe, 'is_hydrant_branch', False):
+            if self.cad_data_manager.id_type(pipe.pipe_id) == "B" and getattr(pipe, 'is_hydrant_branch', False):
                 self._hydrant_visual_offsets[pipe.end_node_id] = pipe.start_node_id
 
     # ======================================================================
@@ -2688,9 +3748,14 @@ class PreviewPage(ttk.Frame):
         pipe_to_floor = dict(self.pipe_floor_map)
 
         # 2. Z-based node→floor（用于 primary_sep_coords 和兜底）
+        bid = self._current_building_id or ""
+        if bid:
+            _floors = [f for f in self.cad_data_manager.floors if f.building_id == bid]
+        else:
+            _floors = self.cad_data_manager.floors
         node_to_floors = {}
         for node in self.cad_data_manager.nodes:
-            for floor in self.cad_data_manager.floors:
+            for floor in _floors:
                 if abs(node.z - floor.pipe_z_offset * to_mm) < 0.1:
                     if node.node_id not in node_to_floors:
                         node_to_floors[node.node_id] = set()
@@ -2700,15 +3765,18 @@ class PreviewPage(ttk.Frame):
             if node.node_id in node_to_floors:
                 continue
             best_f, best_d = None, float('inf')
-            for f_obj in self.cad_data_manager.floors:
+            for f_obj in _floors:
                 d = abs(node.z - f_obj.pipe_z_offset * to_mm)
                 if d < best_d:
                     best_d, best_f = d, f_obj.name
             if best_d < 3000.0:
                 node_to_floors[node.node_id] = {best_f}
 
-        # 3. Z-based兜底：仅对 XY 映射中缺失的管道
-        floor_elev = {f.name: f.elevation for f in self.cad_data_manager.floors}
+        # 3. Z-based兜底：仅对 XY 映射中缺失的管道（按当前楼栋过滤）
+        if bid:
+            floor_elev = {f.name: f.elevation for f in self.cad_data_manager.floors if f.building_id == bid}
+        else:
+            floor_elev = {f.name: f.elevation for f in self.cad_data_manager.floors}
         for pipe in self.cad_data_manager.pipes:
             if pipe.pipe_id in pipe_to_floor:
                 continue
@@ -2721,14 +3789,15 @@ class PreviewPage(ttk.Frame):
                 pipe_to_floor[pipe.pipe_id] = next(iter(all_floors))
             else:
                 sorted_f = sorted(all_floors, key=lambda fn: floor_elev.get(fn, 0))
-                if pipe.pipe_id.startswith('L_'):
+                if self.cad_data_manager.id_type(pipe.pipe_id) == "L":
                     pipe_to_floor[pipe.pipe_id] = sorted_f[0]
-                elif pipe.pipe_id.startswith('R_'):
+                elif self.cad_data_manager.id_type(pipe.pipe_id) == "R":
                     pipe_to_floor[pipe.pipe_id] = sorted_f[-1]
                 else:
                     pipe_to_floor[pipe.pipe_id] = sorted_f[0]
 
         # 4. 管道拓扑补齐：若节点未匹配到楼层，从其连接的管道继承楼层
+        bprefix = self._get_building_prefix()
         for pipe in self.cad_data_manager.pipes:
             pipe_floor = pipe_to_floor.get(pipe.pipe_id)
             if not pipe_floor:
@@ -2738,9 +3807,9 @@ class PreviewPage(ttk.Frame):
                     node_to_floors[nid] = set()
                 node_to_floors[nid].add(pipe_floor)
 
-        # 5. 楼层标高升序
+        # 5. 楼层标高升序（按当前楼栋过滤）
         sorted_pairs = sorted(
-            [(f.name, f.elevation) for f in self.cad_data_manager.floors],
+            [(f.name, f.elevation) for f in _floors],
             key=lambda x: x[1]
         )
         floor_elev_order = [name for name, _ in sorted_pairs]
@@ -2750,7 +3819,7 @@ class PreviewPage(ttk.Frame):
         running_sum = 0.0
         for idx, floor_name in enumerate(floor_elev_order):
             if idx > 0:
-                running_sum += self.separation_values.get(floor_name, 0.0)
+                running_sum += self.separation_values.get(f"{bid}|{floor_name}", 0.0)
             cumulative_offsets_mm[floor_name] = running_sum * to_mm
 
         return pipe_to_floor, node_to_floors, cumulative_offsets_mm, floor_elev_order
@@ -2762,6 +3831,7 @@ class PreviewPage(ttk.Frame):
             return
         canvas.delete("all")
 
+        bprefix = self._get_building_prefix()
         pipe_to_floor, node_to_floors, cumulative_offsets_mm, floor_elev_order = \
             self._build_separation_transforms()
         node_by_id = self.cad_data_manager.node_by_id
@@ -2769,19 +3839,23 @@ class PreviewPage(ttk.Frame):
 
         self.riser_by_pipe_id = {}
         for riser in self.cad_data_manager.risers:
+            if bprefix and not riser.riser_id.startswith(bprefix):
+                continue
             self.riser_by_pipe_id[riser.riser_id] = riser
 
-        # --- 缓存：分离值或视角改变才重算世界坐标 ---
+        # --- 缓存：分离值/视角/楼栋改变才重算世界坐标 ---
         sep_fp = tuple(sorted(self.separation_values.items()))
-        cache_key = (sep_fp,
+        cache_key = (bprefix,
+                     sep_fp,
                      round(self.global_view_angle, 2),
                      round(self.global_view_elevation, 2))
         cache_miss = getattr(self, '_sep_cache_key', None) != cache_key
 
         _orig_proj = self.project_point
         _orig_depth = self.compute_depth
+        self._sep_active = True
         try:
-            _cx, _cy, _cz = self.compute_network_centroid()
+            _cx, _cy, _cz = self.compute_network_centroid(bprefix)
             _az = math.radians(self.global_view_angle)
             _el = math.radians(self.global_view_elevation)
             _ca, _sa = math.cos(_az), math.sin(_az)
@@ -2813,6 +3887,8 @@ class PreviewPage(ttk.Frame):
                 pipe_endpoints = {}
                 pipe_depth_data = {}
                 for pipe in self.cad_data_manager.pipes:
+                    if bprefix and not pipe.pipe_id.startswith(bprefix):
+                        continue
                     if self.hide_invalid_var.get() and not pipe.is_active:
                         continue
                     pipe_floor = pipe_to_floor.get(pipe.pipe_id)
@@ -2830,6 +3906,8 @@ class PreviewPage(ttk.Frame):
 
                 primary_sep_coords = {}
                 for node in self.cad_data_manager.nodes:
+                    if bprefix and not node.node_id.startswith(bprefix):
+                        continue
                     floors = node_to_floors.get(node.node_id, set())
                     best_off = max((cumulative_offsets_mm.get(fn, 0.0) for fn in floors), default=0.0)
                     primary_sep_coords[node.node_id] = cached_proj(node, best_off)
@@ -2859,6 +3937,8 @@ class PreviewPage(ttk.Frame):
                 self._hydrant_visual_offsets = None
 
             for pipe in self.cad_data_manager.pipes:
+                if bprefix and not pipe.pipe_id.startswith(bprefix):
+                    continue
                 if self.hide_invalid_var.get() and not pipe.is_active:
                     continue
                 pe = pipe_endpoints.get(pipe.pipe_id)
@@ -2878,6 +3958,8 @@ class PreviewPage(ttk.Frame):
                         self.projected_coords[pipe.end_node_id] = old_e
 
             for valve in self.cad_data_manager.valves:
+                if bprefix and not valve.valve_id.startswith(bprefix):
+                    continue
                 floor_name = valve.floor_name
                 offset = cumulative_offsets_mm.get(floor_name, 0.0) if floor_name else 0.0
                 saved_coords = {}
@@ -2957,6 +4039,7 @@ class PreviewPage(ttk.Frame):
                         self.projected_coords[hydrant.node_id] = old_val
 
             self.draw_color_legend()
+            self.draw_connection_points()
 
             self._draw_separation_dashed_lines(cumulative_offsets_mm, floor_elev_order,
                                                pipe_to_floor, node_connected_floors,
@@ -2965,13 +4048,17 @@ class PreviewPage(ttk.Frame):
         finally:
             self.project_point = _orig_proj
             self.compute_depth = _orig_depth
+            self._sep_active = False
             self._hydrant_visual_offsets = None
 
     def _draw_separation_dashed_lines(self, cumulative_offsets_mm, floor_elev_order,
                                        pipe_to_floor, node_connected_floors,
                                        pipe_endpoints, pipe_by_id):
         """分离虚线：用 Phase1 已算好的管道端点坐标直接画线，零重算"""
-        sorted_floors = sorted(self.cad_data_manager.floors, key=lambda f: f.elevation)
+        bid = self._current_building_id
+        sorted_floors = sorted(
+            (f for f in self.cad_data_manager.floors if not bid or f.building_id == bid),
+            key=lambda f: f.elevation)
         # 建 (pipe_id, node_id) → (px, py) 查表
         pipe_node_proj = {}
         for pid, ((sx, sy), (ex, ey)) in pipe_endpoints.items():
@@ -2995,10 +4082,11 @@ class PreviewPage(ttk.Frame):
                 l_pid = r_pid = None
                 for pid in cps:
                     fn = pipe_to_floor.get(pid)
-                    if fn == lo.name and pid.startswith('L_'):
-                        l_pid = pid
-                    if fn == hi.name and pid.startswith('R_'):
-                        r_pid = pid
+                    if fn and self.cad_data_manager.id_type(pid) in ("L", "R"):
+                        if fn == lo.name:
+                            l_pid = pid
+                        if fn == hi.name:
+                            r_pid = pid
                 if not (l_pid and r_pid):
                     continue
                 lp = pipe_node_proj.get((l_pid, node.node_id))
@@ -3164,14 +4252,51 @@ class PreviewPage(ttk.Frame):
         canvas.create_text(cx, cy - r - 12, text="N", fill="black",
                         font=("Arial", 8, "bold"), tags="compass")
 
+    def _calc_equiv_pipe_color(self, pipe, base_color):
+        """当量长度热力着色：当量总和越高颜色越热。
+
+        开关启用时所有挂载了当量数据的管道一律按 静态+动态 当量总和分档显示
+        （无当量=最冷色，当量越高越红）；未挂载当量数据（未计算）时原样返回 base_color。
+        """
+        if not self.equiv_color_var.get():
+            return base_color
+        static_eq = getattr(pipe, 'static_equiv', None)
+        dynamic_eq = getattr(pipe, 'dynamic_equiv', None)
+        if static_eq is None and dynamic_eq is None:
+            return base_color   # 无当量数据（未计算）
+        total = (static_eq or 0.0) + (dynamic_eq or 0.0)
+        if total <= 0.0:
+            return "#E8E8E8"    # 无当量：最冷色（浅灰白）
+        if total < 0.5:
+            return "#FFF3B0"
+        if total < 1.0:
+            return "#FFD54F"
+        if total < 2.0:
+            return "#FFB300"
+        if total < 4.0:
+            return "#F57C00"
+        return "#D84315"
+
     def draw_pipe(self, pipe):
         start_w = self.projected_coords.get(pipe.start_node_id)
         end_w = self.projected_coords.get(pipe.end_node_id)
         if not start_w or not end_w:
+            # 连接管跨楼栋：终点可能不在当前 projected_coords 中，用 project_point 回退
+            if pipe.pipe_type == "连接管":
+                cad = self.cad_data_manager
+                if start_w is None:
+                    sn = cad.node_by_id.get(pipe.start_node_id)
+                    if sn:
+                        start_w = self.project_point(sn.x, sn.y, sn.z)
+                if end_w is None:
+                    en = cad.node_by_id.get(pipe.end_node_id)
+                    if en:
+                        end_w = self.project_point(en.x, en.y, en.z)
+        if not start_w or not end_w:
             return
 
         # B_消火栓支管视觉覆盖：从中间节点向左 0.3m（300mm）
-        if getattr(self, '_hydrant_visual_offsets', None) and pipe.pipe_id.startswith('B_'):
+        if getattr(self, '_hydrant_visual_offsets', None) and self.cad_data_manager.id_type(pipe.pipe_id) == "B":
             mid_id = self._hydrant_visual_offsets.get(pipe.end_node_id)
             if mid_id:
                 mid_pos = self.projected_coords.get(mid_id)
@@ -3209,7 +4334,7 @@ class PreviewPage(ttk.Frame):
         line_width = max(3, int(5 * self.scale))  # 固定像素宽度
 
         # 整体管网模式下，对 R_ 开头的竖向管道进行重复立管高亮（基于 CAD 立管编号）
-        if not (self.velocity_check_var.get() and self.calculation_available) and self.current_view_mode == "global" and self.show_riser_warning.get() and not self.hide_invalid_var.get() and pipe.pipe_id.startswith("R_"):
+        if not (self.velocity_check_var.get() and self.calculation_available) and self.current_view_mode == "global" and self.show_riser_warning.get() and not self.hide_invalid_var.get() and self.cad_data_manager.id_type(pipe.pipe_id) == "R":
             # 获取映射字典（已在 _draw_global_network 中构建）
             if hasattr(self, 'riser_by_pipe_id'):
                 # 尝试用当前 pipe_id 查找，如果找不到且管道有 original_riser_id 属性，则用 original_riser_id 查找
@@ -3227,15 +4352,21 @@ class PreviewPage(ttk.Frame):
                             line_width = max(3, int(5 * self.scale)) * 1.5  # 加粗为1.5倍
 
         # 分层颜色覆盖（优先级低于立管重复、问题管道、无效管道、高亮路径）
-        if not (self.velocity_check_var.get() and self.calculation_available) and self.layer_colors_enabled.get() and not pipe.pipe_id.startswith('B_'):
+        if not (self.velocity_check_var.get() and self.calculation_available) and self.layer_colors_enabled.get() and self.cad_data_manager.id_type(pipe.pipe_id) != "B":
             floor_name = self.pipe_floor_map.get(pipe.pipe_id)
-            if floor_name and floor_name in self.floor_color_map:
-                layer_color = self.floor_color_map[floor_name]
-                # 仅当当前颜色不是更高优先级颜色时才覆盖
-                # 更高优先级颜色: 高亮路径红色、问题管道红色、无效管道紫色、立管重复黄色
-                high_priority = (color == self.COLOR_PIPE_HIGHLIGHT or color == "red" or color == "purple" or color == "yellow")
-                if not high_priority:
-                    color = layer_color
+            if floor_name:
+                bid = self._current_building_id or ""
+                bmap = self.floor_color_map.get(bid, {})
+                if floor_name in bmap:
+                    layer_color = bmap[floor_name]
+                    # 仅当当前颜色不是更高优先级颜色时才覆盖
+                    # 更高优先级颜色: 高亮路径红色、问题管道红色、无效管道紫色、立管重复黄色
+                    high_priority = (color == self.COLOR_PIPE_HIGHLIGHT or color == "red" or color == "purple" or color == "yellow")
+                    if not high_priority:
+                        color = layer_color
+
+        # 当量长度热力着色（开关启用且管道有当量数据时覆盖颜色）
+        color = self._calc_equiv_pipe_color(pipe, color)
 
         # 虚线样式：选中的管道使用虚线；环路高亮覆盖（最高优先级）
         if hasattr(self, 'loop_highlight_pipe_ids') and pipe.pipe_id in self.loop_highlight_pipe_ids:
@@ -3246,8 +4377,7 @@ class PreviewPage(ttk.Frame):
 
         # 检查是否需要断开绘制（整体管网模式且开启遮挡显示，B_管豁免）
         breaks_data = self.occlusion_breaks.get(pipe.pipe_id, [])
-        if breaks_data and self.current_view_mode == "global" and self.show_occlusion_var.get() \
-           and not (getattr(self, '_hydrant_visual_offsets', None) and pipe.pipe_id.startswith('B_')):
+        if breaks_data and self.current_view_mode == "global" and self.show_occlusion_var.get():
             # 如果隐藏了无效管，则过滤掉遮挡源是无效管的断点
             if self.hide_invalid_var.get():
                 breaks_t = [t for t, occluder_id in breaks_data if self._is_pipe_active(occluder_id)]
@@ -3295,7 +4425,7 @@ class PreviewPage(ttk.Frame):
 
         # 获取立管编号（仅对竖向管道且勾选了立管编号）
         riser_display_id = None
-        if self.show_riser_id.get() and pipe.pipe_id.startswith("R_"):
+        if self.show_riser_id.get() and self.cad_data_manager.id_type(pipe.pipe_id) == "R":
             # 直接从管道对象获取立管编号（已在 CADDataManager 中赋值）
             if hasattr(pipe, 'riser_number') and pipe.riser_number:
                 riser_display_id = pipe.riser_number
@@ -3306,7 +4436,7 @@ class PreviewPage(ttk.Frame):
                         riser_display_id = riser.note_number
                         break
 
-        if pipe.pipe_id.startswith("R_") and self.show_riser_id.get() and riser_display_id is None:
+        if self.cad_data_manager.id_type(pipe.pipe_id) == "R" and self.show_riser_id.get() and riser_display_id is None:
             print(f"未匹配到立管编号: pipe_id={pipe.pipe_id}")
 
         # 管道文字
@@ -3319,8 +4449,8 @@ class PreviewPage(ttk.Frame):
             text_parts.append(riser_display_id)
 
         # B_ 开头的消火栓支管不显示公称管径和管长
-        if not pipe.pipe_id.startswith('B_'):
-            if self.show_nominal.get() and not pipe.pipe_id.startswith('L_'):
+        if self.cad_data_manager.id_type(pipe.pipe_id) != "B":
+            if self.show_nominal.get() and self.cad_data_manager.id_type(pipe.pipe_id) != "L":
                 skip_dn = False
                 if self.skip_dn_short_pipe.get():
                     try:
@@ -3337,8 +4467,17 @@ class PreviewPage(ttk.Frame):
             
         if self.show_elevation.get():
             # 只对横管显示标高（R_、L_、B_开头的立管/连接管/支管不显示）
-            if not pipe.pipe_id.startswith(('R_', 'L_', 'B_')):
-                if pipe.length > 2.0:
+            if self.cad_data_manager.id_type(pipe.pipe_id) not in ("R", "L", "B"):
+                # 阈值取自「短管跳过」复选框的数值；未勾选时不管多长都显示
+                skip_elev = False
+                if self.skip_dn_short_pipe.get():
+                    try:
+                        threshold = float(self.skip_dn_min_entry.get())
+                    except ValueError:
+                        threshold = self.skip_dn_min_length
+                    if pipe.length < threshold:
+                        skip_elev = True
+                if not skip_elev:
                     pipe_elev = None
                     if self.cad_data_manager.floors:
                         for floor in self.cad_data_manager.floors:
@@ -3346,9 +4485,14 @@ class PreviewPage(ttk.Frame):
                                 pipe_elev = floor.pipe_z_offset
                                 break
                     if pipe_elev is not None:
-                        text_parts.append(f"FL{pipe_elev:.2f}")            
+                        text_parts.append(f"FL{pipe_elev:.2f}")
+                    else:
+                        # 降级：用管道起点节点 Z 值（mm）换算为米
+                        sn = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+                        if sn:
+                            text_parts.append(f"FL{sn.z / 1000.0:.2f}")            
             
-        if self.calculation_available and self.show_flow.get() and not pipe.pipe_id.startswith('L_'):
+        if self.calculation_available and self.show_flow.get() and self.cad_data_manager.id_type(pipe.pipe_id) != "L":
             flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0)
             flow_abs = abs(flow)
             if flow_abs > 0.001 or self.show_zero_flow_label_var.get():
@@ -3356,11 +4500,11 @@ class PreviewPage(ttk.Frame):
                 if flow_unit == 'm³/h':
                     flow_abs = flow_abs * 3.6
                 text_parts.append(f"{flow_abs:.2f}{flow_unit}")
-        if self.calculation_available and self.show_velocity.get() and not pipe.pipe_id.startswith('L_'):
+        if self.calculation_available and self.show_velocity.get() and self.cad_data_manager.id_type(pipe.pipe_id) != "L":
             vel = self.pipe_results.get(pipe.pipe_id, {}).get('velocity_mps', 0.0)
             if abs(vel) > 0.001 or self.show_zero_flow_label_var.get():
                 text_parts.append(f"{vel:.2f}m/s")
-        if self.calculation_available and self.show_loss.get() and not pipe.pipe_id.startswith('L_'):
+        if self.calculation_available and self.show_loss.get() and self.cad_data_manager.id_type(pipe.pipe_id) != "L":
             loss = self.pipe_results.get(pipe.pipe_id, {}).get('total_loss', 0)
             if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
                 pressure_unit = self.config_manager.get_live_config().get('pressure_unit', 'm')
@@ -3369,16 +4513,31 @@ class PreviewPage(ttk.Frame):
                 text_parts.append(f"{loss:.2f}{pressure_unit}")
 
         if text_parts:
-            display = "_".join(text_parts)
-            self.draw_pipe_text(pipe, sx, sy, ex, ey, display)
+            # 按奇偶索引分配到 A 侧和 B 侧
+            text_a_parts = []
+            text_b_parts = []
+            for idx, part in enumerate(text_parts):
+                if idx % 2 == 0:
+                    text_a_parts.append(part)
+                else:
+                    text_b_parts.append(part)
+            
+            # 绘制 A 侧（仅当有内容）
+            if text_a_parts:
+                display_a = "_".join(text_a_parts)
+                self.draw_pipe_text(pipe, sx, sy, ex, ey, display_a, side='A')
+            # 绘制 B 侧（仅当有内容）
+            if text_b_parts:
+                display_b = "_".join(text_b_parts)
+                self.draw_pipe_text(pipe, sx, sy, ex, ey, display_b, side='B')
 
         # 流向箭头
-        if self.show_arrow.get() and self.calculation_available and not pipe.pipe_id.startswith('L_'):
+        if self.show_arrow.get() and self.calculation_available and self.cad_data_manager.id_type(pipe.pipe_id) != "L":
             flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0)
             if abs(flow) > 0.001:
                 self.draw_arrow(pipe, sx, sy, ex, ey, flow)
 
-    def draw_pipe_text(self, pipe, sx, sy, ex, ey, text):
+    def draw_pipe_text(self, pipe, sx, sy, ex, ey, text, side='A'):
         mx = (sx + ex) / 2
         my = (sy + ey) / 2
         dx = ex - sx
@@ -3386,34 +4545,30 @@ class PreviewPage(ttk.Frame):
         length = math.hypot(dx, dy)
         if length == 0:
             return
-    
+
         text_size = max(self.TEXT_MIN_SIZE, min(self.TEXT_MAX_SIZE, int(10 * self.scale)))
-        offset = text_size * 1.0  # 偏移距离（像素）
-    
-        # 法线向量（垂直于线段）
+        # 增大偏移量，使文字离管道更远，减少与管线的重叠
+        offset = max(12, int(12 * self.scale))  # 原为 text_size * 1.0
+
         nx = -dy / length
         ny = dx / length
-    
-        # 计算角度：Tkinter的angle参数遵循数学坐标系（逆时针，Y轴向上），
-        # 而屏幕坐标系Y轴向下，因此需要将dy取反以正确转换坐标系。
-        angle = math.degrees(math.atan2(-dy, dx))
 
-        # 判断是否需要旋转180度避免文字倒置
-        # 当角度超过90度或小于-90度时，文字字符本身会倒立，
-        # 此时翻转180度可使字符正立，文字基线方向变为反向平行（仍在同一直线上）。
+        # 根据侧边取反法线方向
+        if side == 'B':
+            nx = -nx
+            ny = -ny
+
+        angle = math.degrees(math.atan2(-dy, dx))
         flip = (angle > 90 or angle < -90)
         if flip:
             angle += 180
-            # 偏移方向反向（使文字始终在管道同一侧，保持阅读方向一致）
             tx = mx - nx * offset
             ty = my - ny * offset
         else:
             tx = mx + nx * offset
             ty = my + ny * offset
-        
-        # 确保角度在 [0,360) 范围内
+
         angle = angle % 360
-    
         self.canvas.create_text(tx, ty, text=text, fill="white",
                                 angle=angle, font=("Arial", text_size),
                                 tags="pipe_text")
@@ -3484,7 +4639,9 @@ class PreviewPage(ttk.Frame):
                 text_parts.append(f"{pressure:.2f}")
         if text_parts:
             display_text = "_".join(text_parts)
-            self.canvas.create_text(cx + radius + 2, cy - radius - 2,
+            # 新偏移量：向右上方偏移，距离随缩放增大
+            text_offset = max(20, int(20 * self.scale))
+            self.canvas.create_text(cx + text_offset, cy - text_offset,
                                      text=display_text, fill="white",
                                      font=("Arial", max(10, int(10 * self.scale))),
                                      tags="node_text")
@@ -3492,9 +4649,9 @@ class PreviewPage(ttk.Frame):
     def on_units_changed(self):
         """单位改变时刷新显示，并重新计算节点Z坐标"""
         if self.cad_data_manager.floors:
-            # 重新获取配置，重新计算节点Z坐标
             config = self.config_manager.get_live_config()
-            self.cad_data_manager.assign_node_z_coordinates(config)
+            if not getattr(self, '_skip_z_recalc', False):
+                self.cad_data_manager.assign_node_z_coordinates(config)
         self.redraw()
 
     def draw_valve(self, valve):
@@ -3529,9 +4686,21 @@ class PreviewPage(ttk.Frame):
         perp_x = -uy       # 垂直向量（用于底边宽度）
         perp_y = ux
     
-        # 阀门插入点画布坐标
-        vx_w, vy_w = self.project_point(valve.x, valve.y, valve.z)
-        vx, vy = self.world_to_canvas(vx_w, vy_w)
+        # 阀门插入点画布坐标（从管道端点插值 Z，使阀门永远跟随管道）
+        start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+        end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
+        t = valve.distance_on_pipe
+        if start_node and end_node:
+            valve_z = start_node.z + t * (end_node.z - start_node.z)
+        else:
+            valve_z = valve.z
+        if self._sep_active:
+            # 分离模式：插入点由已带楼层分离偏移的管道端点投影线性插值（fast_proj 为线性变换，插值不变性成立）
+            vx = sx + t * (ex - sx)
+            vy = sy + t * (ey - sy)
+        else:
+            vx_w, vy_w = self.project_point(valve.x, valve.y, valve_z)
+            vx, vy = self.world_to_canvas(vx_w, vy_w)
     
         # 阀门尺寸（已放大1.5倍）
         base_height = 12 * self.scale
@@ -3658,8 +4827,9 @@ class PreviewPage(ttk.Frame):
                 cx, cy = self.world_to_canvas(*wpos)
 
                 # 查找 SP_ 管，获取方向
-                base_id = nid[:-2] if nid.endswith('_S') else nid
-                sp_pipe = self.cad_data_manager.pipe_by_id.get("SP_" + base_id)
+                raw_base = nid[:-2] if nid.endswith('_S') else nid
+                sp_pipe_id = self.cad_data_manager._prefix_id("SP_" + self.cad_data_manager._unprefix_id(raw_base))
+                sp_pipe = self.cad_data_manager.pipe_by_id.get(sp_pipe_id)
                 if sp_pipe:
                     start_w = self.projected_coords.get(sp_pipe.start_node_id)
                 else:
@@ -3802,7 +4972,7 @@ class PreviewPage(ttk.Frame):
             hydrant_offsets = {}
             if self.hydrant_branch_flat_var.get():
                 for pipe in self.cad_data_manager.pipes:
-                    if pipe.pipe_id.startswith('B_') and getattr(pipe, 'is_hydrant_branch', False):
+                    if self.cad_data_manager.id_type(pipe.pipe_id) == "B" and getattr(pipe, 'is_hydrant_branch', False):
                         hydrant_offsets[pipe.end_node_id] = pipe.start_node_id
 
             def cad_pos(node_id):
@@ -3828,46 +4998,57 @@ class PreviewPage(ttk.Frame):
                         ex, ey = self.project_point(en.x, en.y, en.z + off)
                         sep_cad_unflipped[p.pipe_id] = ((sx, sy), (ex, ey))
 
-            # --- 管道 ---
+            # --- 管道（合并段 + 阀门分裂 + 遮挡断线） ---
             occlusion_breaks = {}
             if self.show_occlusion_var.get():
                 if not self.occlusion_cache_valid:
                     self.build_occlusion_cache()
                 occlusion_breaks = self.occlusion_breaks
 
-            for pipe in self.cad_data_manager.pipes:
-                if self.hide_invalid_var.get() and not pipe.is_active:
-                    continue
-                if self._separation_applied:
-                    pp = sep_cad_unflipped.get(pipe.pipe_id)
-                    if not pp:
-                        continue
-                    p1 = APoint(pp[0][0], -pp[0][1], 0)
-                    p2 = APoint(pp[1][0], -pp[1][1], 0)
-                else:
-                    p1 = cad_pos(pipe.start_node_id)
-                    p2 = cad_pos(pipe.end_node_id)
-                    if not p1 or not p2:
-                        continue
+            segments, annot_segments = self._build_cad_pipe_segments(proj, sep_cad_unflipped,
+                                                     pipe_unflipped=sep_cad_unflipped if self._separation_applied else None)
 
-                # 消火栓支管偏移
-                if hydrant_offsets and pipe.pipe_id.startswith('B_'):
-                    mid_id = hydrant_offsets.get(pipe.end_node_id)
+            for seg in segments:
+                p1 = APoint(seg["start_proj"][0], -seg["start_proj"][1], 0)
+                p2 = APoint(seg["end_proj"][0], -seg["end_proj"][1], 0)
+
+                # 消火栓支管偏移（仅 B_ 单管段）
+                is_single_b = (len(seg["pipe_ids"]) == 1
+                               and self.cad_data_manager.id_type(seg["pipe_ids"][0]) == "B")
+                if hydrant_offsets and is_single_b:
+                    mid_id = hydrant_offsets.get(seg["pipe_objects"][0].end_node_id)
                     if mid_id:
                         mp = proj.get(mid_id)
                         if mp:
                             p2 = APoint(mp[0] - 600.0, -(mp[1]), 0)
 
-                # 遮挡断线
-                breaks_raw = occlusion_breaks.get(pipe.pipe_id, [])
-                if breaks_raw and self.show_occlusion_var.get() \
-                   and not (hydrant_offsets and pipe.pipe_id.startswith('B_')):
-                    if self.hide_invalid_var.get():
-                        breaks_t = [t for t, oid in breaks_raw if self._is_pipe_active(oid)]
-                    else:
-                        breaks_t = [t for t, _ in breaks_raw]
-                    if breaks_t:
-                        segs = self._calc_cad_break_segments(p1, p2, breaks_t, 100)
+                # 遮挡断线：聚合子管断点并重映射到合并段（含阀裂分子段偏移）
+                if self.show_occlusion_var.get() and not (hydrant_offsets and is_single_b):
+                    all_breaks_t = []
+                    pipe_entries = seg.get("_pipe_entries") or [(po, False) for po in seg["pipe_objects"]]
+                    total_raw = sum(po.raw_length for po in seg["pipe_objects"])
+                    seg_t_start = seg.get("_seg_t_start", 0.0)
+                    seg_t_end = seg.get("_seg_t_end", 1.0)
+                    seg_t_range = seg_t_end - seg_t_start
+                    cum_raw = 0.0
+                    for i, (pipe_obj, rev_flag) in enumerate(pipe_entries):
+                        breaks_raw = occlusion_breaks.get(pipe_obj.pipe_id, [])
+                        if breaks_raw:
+                            if self.hide_invalid_var.get():
+                                sub_breaks = [t for t, oid in breaks_raw if self._is_pipe_active(oid)]
+                            else:
+                                sub_breaks = [t for t, _ in breaks_raw]
+                            for t_sub in sub_breaks:
+                                if rev_flag:
+                                    t_sub = 1.0 - t_sub
+                                t_chain = (cum_raw + t_sub * pipe_obj.raw_length) / total_raw if total_raw > 0 else t_sub
+                                # 将全程 t→子段 t
+                                if seg_t_start <= t_chain <= seg_t_end:
+                                    t_seg = (t_chain - seg_t_start) / seg_t_range if seg_t_range > 0 else t_chain
+                                    all_breaks_t.append(t_seg)
+                        cum_raw += pipe_obj.raw_length
+                    if all_breaks_t:
+                        segs = self._calc_cad_break_segments(p1, p2, all_breaks_t, 100)
                         for s in segs:
                             self._cad_add_pipe(ms, s[0], s[1], pipe_layer_name)
                         continue
@@ -3900,8 +5081,9 @@ class PreviewPage(ttk.Frame):
             # --- 喷头 ---
             s_ids = getattr(self.cad_data_manager, 'sprinkler_s_node_ids', [])
             for nid in s_ids:
-                base_id = nid[:-2] if nid.endswith('_S') else nid
-                sp_pipe = self.cad_data_manager.pipe_by_id.get("SP_" + base_id)
+                raw_base = nid[:-2] if nid.endswith('_S') else nid
+                sp_pipe_id = self.cad_data_manager._prefix_id("SP_" + self.cad_data_manager._unprefix_id(raw_base))
+                sp_pipe = self.cad_data_manager.pipe_by_id.get(sp_pipe_id)
                 pos = cad_pos(nid)
                 if not pos:
                     continue
@@ -3963,7 +5145,7 @@ class PreviewPage(ttk.Frame):
                 new_doc.ActiveTextStyle = new_doc.TextStyles.Item("shui")
             except Exception:
                 pass
-            self._cad_write_annotations(ms, proj, hydrant_offsets, sep_cad_unflipped if self._separation_applied else None)
+            self._cad_write_annotations(ms, proj, hydrant_offsets, segments=annot_segments, pipe_unflipped=sep_cad_unflipped if self._separation_applied else None)
 
             # 保存
             new_doc.SaveAs(filepath)
@@ -4072,6 +5254,312 @@ class PreviewPage(ttk.Frame):
             ))
         return segs
 
+    @staticmethod
+    def _sin_tol(deg):
+        return math.sin(math.radians(deg))
+
+    def _build_cad_pipe_segments(self, proj, sep_cad_unflipped=None, pipe_unflipped=None):
+        """构建CAD管道绘制段：合并共线同管径管道，再按阀门位置分裂。"""
+        TOL = self._sin_tol(2.0)
+        segments = []
+
+        # Phase 1: Filter pipes
+        eligible = []
+        for p in self.cad_data_manager.pipes:
+            if self.hide_invalid_var.get() and not p.is_active:
+                continue
+            eligible.append(p)
+
+        b_pipes = [p for p in eligible if self.cad_data_manager.id_type(p.pipe_id) == "B"]
+        non_b = [p for p in eligible if self.cad_data_manager.id_type(p.pipe_id) != "B"]
+
+        # Phase 2: Build node adjacency for non-B pipes (must come before _coord_for_node)
+        node_pipes = defaultdict(list)
+        all_node_pipes = defaultdict(list)   # 含 B_：分离模式下 _coord_for_node 需为 B_ 支管端点提供坐标
+        for p in eligible:
+            all_node_pipes[p.start_node_id].append((p, p.end_node_id))
+            all_node_pipes[p.end_node_id].append((p, p.start_node_id))
+        for p in non_b:
+            node_pipes[p.start_node_id].append((p, p.end_node_id))
+            node_pipes[p.end_node_id].append((p, p.start_node_id))
+
+        def _coord_for_node(nid):
+            if pipe_unflipped:
+                for pp, _ in all_node_pipes.get(nid, []):
+                    pp_coords = pipe_unflipped.get(pp.pipe_id)
+                    if pp_coords:
+                        if nid == pp.start_node_id:
+                            return pp_coords[0]
+                        elif nid == pp.end_node_id:
+                            return pp_coords[1]
+                return None
+            return proj.get(nid)
+
+        if not non_b:
+            for p in b_pipes:
+                p1 = _coord_for_node(p.start_node_id)
+                p2 = _coord_for_node(p.end_node_id)
+                if not p1 or not p2:
+                    continue
+                sd = {
+                    "pipe_ids": [p.pipe_id],
+                    "pipe_objects": [p],
+                    "start_proj": p1, "end_proj": p2,
+                    "total_length": p.length,
+                    "nominal_diameter": p.nominal_diameter,
+                    "_annotate": True,
+                }
+                segments.append(sd)
+            return segments, list(segments)
+
+        # Phase 3: Find mergeable nodes
+        collinear_cache = {}
+
+        def check_collinear(nid, onid1, onid2):
+            key = (nid, onid1, onid2) if nid < onid1 else (onid1, nid, onid2)
+            if key in collinear_cache:
+                return collinear_cache[key]
+            p1 = _coord_for_node(onid1)
+            pm = _coord_for_node(nid)
+            p2 = _coord_for_node(onid2)
+            if not (p1 and pm and p2):
+                collinear_cache[key] = False
+                return False
+            v1 = (pm[0] - p1[0], pm[1] - p1[1])
+            v2 = (p2[0] - pm[0], p2[1] - pm[1])
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            len1 = math.hypot(*v1)
+            len2 = math.hypot(*v2)
+            if len1 < 1 or len2 < 1:
+                result = True
+            else:
+                result = abs(cross) / (len1 * len2) < TOL
+            collinear_cache[key] = result
+            return result
+
+        merge_nodes = set()
+        for nid, connected in node_pipes.items():
+            if len(connected) != 2:
+                continue
+            p1, p2 = connected[0][0], connected[1][0]
+            if p1.nominal_diameter != p2.nominal_diameter:
+                continue
+            if check_collinear(nid, connected[0][1], connected[1][1]):
+                merge_nodes.add(nid)
+
+        # Phase 4: Walk to build merged chains
+        processed = set()
+        chains = []
+
+        for start_pipe in non_b:
+            if start_pipe.pipe_id in processed:
+                continue
+            chain_nodes = [start_pipe.start_node_id, start_pipe.end_node_id]
+            chain_pipes = [(start_pipe, False)]
+            processed.add(start_pipe.pipe_id)
+
+            walk_forward = True
+            while walk_forward:
+                cur_node = chain_nodes[-1]
+                if cur_node not in merge_nodes:
+                    break
+                connected = node_pipes.get(cur_node, [])
+                next_entries = [(pp, other) for (pp, other) in connected
+                                if pp.pipe_id not in processed and other not in chain_nodes]
+                if len(next_entries) != 1:
+                    break
+                next_pipe, next_other = next_entries[0]
+                if next_pipe.nominal_diameter != chain_pipes[-1][0].nominal_diameter:
+                    break
+                # 分离模式下：L_/R_ 竖管段不合并（两段之间应保留分离虚线间隙）
+                if self._separation_applied:
+                    _last_t = self.cad_data_manager.id_type(chain_pipes[-1][0].pipe_id)
+                    _nxt_t = self.cad_data_manager.id_type(next_pipe.pipe_id)
+                    if _last_t in ("L", "R") and _nxt_t in ("L", "R") and _last_t != _nxt_t:
+                        break
+                prev_node = chain_nodes[-2] if len(chain_nodes) >= 2 else None
+                if prev_node and not check_collinear(cur_node, prev_node, next_other):
+                    break
+                rev_flag = (next_pipe.end_node_id == cur_node)
+                chain_nodes.append(next_other)
+                chain_pipes.append((next_pipe, rev_flag))
+                processed.add(next_pipe.pipe_id)
+
+            walk_backward = True
+            while walk_backward:
+                cur_node = chain_nodes[0]
+                if cur_node not in merge_nodes:
+                    break
+                connected = node_pipes.get(cur_node, [])
+                next_entries = [(pp, other) for (pp, other) in connected
+                                if pp.pipe_id not in processed and other not in chain_nodes]
+                if len(next_entries) != 1:
+                    break
+                next_pipe, next_other = next_entries[0]
+                if next_pipe.nominal_diameter != chain_pipes[0][0].nominal_diameter:
+                    break
+                # 分离模式下：L_/R_ 竖管段不合并（两段之间应保留分离虚线间隙）
+                if self._separation_applied:
+                    _first_t = self.cad_data_manager.id_type(chain_pipes[0][0].pipe_id)
+                    _nxt_t = self.cad_data_manager.id_type(next_pipe.pipe_id)
+                    if _first_t in ("L", "R") and _nxt_t in ("L", "R") and _first_t != _nxt_t:
+                        break
+                old_first = chain_nodes[1] if len(chain_nodes) >= 2 else None
+                if old_first and not check_collinear(cur_node, next_other, old_first):
+                    break
+                rev_flag = (next_pipe.start_node_id == cur_node)
+                chain_nodes.insert(0, next_other)
+                chain_pipes.insert(0, (next_pipe, rev_flag))
+                processed.add(next_pipe.pipe_id)
+
+            chains.append({
+                "start_node": chain_nodes[0],
+                "end_node": chain_nodes[-1],
+                "pipe_entries": chain_pipes,
+                "chain_nodes": chain_nodes,
+            })
+
+        # Phase 5: Split chains at valve positions → (draw_segments, annotation_entries)
+        valve_map = defaultdict(list)
+        for valve in self.cad_data_manager.valves:
+            if valve.pipe_id:
+                valve_map[valve.pipe_id].append(valve)
+
+        draw_segments = []
+        annot_entries = []
+
+        for chain in chains:
+            chain_pipes = chain["pipe_entries"]
+            total_raw = sum(p.raw_length for p, _ in chain_pipes)
+
+            # Full-chain annotation entry (always created, no valve split)
+            full_seg = self._make_segment_from_entries(chain_pipes, proj=proj, sep_cad_unflipped=sep_cad_unflipped)
+            if not full_seg:
+                continue
+            annot_entries.append(full_seg)
+
+            # Collect valve t-centers along the merged line
+            chain_valve_centers = []
+            cum_raw = 0.0
+            for i, (pipe, rev) in enumerate(chain_pipes):
+                for valve in valve_map.get(pipe.pipe_id, []):
+                    if rev:
+                        p_start_id, p_end_id = pipe.end_node_id, pipe.start_node_id
+                    else:
+                        p_start_id, p_end_id = pipe.start_node_id, pipe.end_node_id
+                    p_sn = self.cad_data_manager.node_by_id.get(p_start_id)
+                    p_en = self.cad_data_manager.node_by_id.get(p_end_id)
+                    if not p_sn or not p_en:
+                        t_sub = 0.5
+                    else:
+                        pv = (valve.x - p_sn.x, valve.y - p_sn.y, valve.z - p_sn.z)
+                        pe = (p_en.x - p_sn.x, p_en.y - p_sn.y, p_en.z - p_sn.z)
+                        len_pe_sq = pe[0]**2 + pe[1]**2 + pe[2]**2
+                        t_sub = max(0.0, min(1.0, (pv[0]*pe[0] + pv[1]*pe[1] + pv[2]*pe[2]) / len_pe_sq)) if len_pe_sq > 0 else 0.5
+                    t_center = (cum_raw + t_sub * pipe.raw_length) / total_raw if total_raw > 0 else 0.0
+                    chain_valve_centers.append(t_center)
+                cum_raw += pipe.raw_length
+
+            if not chain_valve_centers:
+                draw_segments.append(full_seg)
+                continue
+
+            # Compute valve gap intervals (±150mm 沙漏端线)
+            full_cad_len = math.hypot(full_seg["end_proj"][0] - full_seg["start_proj"][0],
+                                       full_seg["end_proj"][1] - full_seg["start_proj"][1])
+            VALVE_HALF = 150.0
+            gap_intervals = []
+            for tc in chain_valve_centers:
+                t_half = VALVE_HALF / full_cad_len if full_cad_len > 0 else 0.0
+                gap_intervals.append((max(0.0, tc - t_half), min(1.0, tc + t_half)))
+
+            # Merge overlapping gaps
+            gap_intervals.sort()
+            merged_gaps = []
+            for lo, hi in gap_intervals:
+                if not merged_gaps or lo > merged_gaps[-1][1]:
+                    merged_gaps.append([lo, hi])
+                else:
+                    merged_gaps[-1][1] = max(merged_gaps[-1][1], hi)
+
+            # Draw segments = chain minus gaps
+            base_sx, base_sy = full_seg["start_proj"]
+            base_ex, base_ey = full_seg["end_proj"]
+            base_dx = base_ex - base_sx
+            base_dy = base_ey - base_sy
+
+            cur = 0.0
+            for lo, hi in merged_gaps:
+                if lo > cur + 0.002:
+                    draw_segments.append(dict(full_seg,
+                        start_proj=(base_sx + cur * base_dx, base_sy + cur * base_dy),
+                        end_proj=(base_sx + lo * base_dx, base_sy + lo * base_dy),
+                        total_length=full_seg["total_length"] * (lo - cur),
+                        _annotate=False, _seg_t_start=cur, _seg_t_end=lo))
+                cur = max(cur, hi)
+            if cur < 1.0 - 0.002:
+                draw_segments.append(dict(full_seg,
+                    start_proj=(base_sx + cur * base_dx, base_sy + cur * base_dy),
+                    end_proj=(base_ex, base_ey),
+                    total_length=full_seg["total_length"] * (1.0 - cur),
+                    _annotate=False, _seg_t_start=cur, _seg_t_end=1.0))
+
+        # Phase 6: Add B_ pipes to both lists
+        for p in b_pipes:
+            p1 = _coord_for_node(p.start_node_id)
+            p2 = _coord_for_node(p.end_node_id)
+            if not p1 or not p2:
+                continue
+            seg_d = {
+                "pipe_ids": [p.pipe_id],
+                "pipe_objects": [p],
+                "start_proj": p1, "end_proj": p2,
+                "total_length": p.length,
+                "nominal_diameter": p.nominal_diameter,
+                "_pipe_entries": [(p, False)],
+                "_annotate": True,
+            }
+            draw_segments.append(seg_d)
+            annot_entries.append(dict(seg_d))
+
+        return draw_segments, annot_entries
+
+    def _make_segment_from_entries(self, pipe_entries, proj, sep_cad_unflipped):
+        """从 pipe_entries 列表创建单段。"""
+        if not pipe_entries:
+            return None
+        pipes = [p for p, _ in pipe_entries]
+        first_p, first_rev = pipe_entries[0]
+        last_p, last_rev = pipe_entries[-1]
+
+        if sep_cad_unflipped:
+            first_pp = sep_cad_unflipped.get(first_p.pipe_id)
+            last_pp = sep_cad_unflipped.get(last_p.pipe_id)
+            if not first_pp or not last_pp:
+                return None
+            sx, sy = first_pp[1] if first_rev else first_pp[0]
+            ex, ey = last_pp[0] if last_rev else last_pp[1]
+        else:
+            sn1 = first_p.end_node_id if first_rev else first_p.start_node_id
+            sn2 = last_p.start_node_id if last_rev else last_p.end_node_id
+            p1 = proj.get(sn1)
+            p2 = proj.get(sn2)
+            if not p1 or not p2:
+                return None
+            sx, sy = p1
+            ex, ey = p2
+
+        total_len = sum(p.length for p in pipes)
+        return {
+            "pipe_ids": [p.pipe_id for p in pipes],
+            "pipe_objects": pipes,
+            "start_proj": (sx, sy),
+            "end_proj": (ex, ey),
+            "total_length": total_len,
+            "nominal_diameter": pipes[0].nominal_diameter,
+            "_pipe_entries": pipe_entries,
+        }
+
     def _cad_write_separation_dashed_lines(self, ms, new_doc):
         """反写分离灰虚线到CAD"""
         pipe_endpoints = getattr(self, '_sep_pipe_endpoints', None)
@@ -4119,10 +5607,11 @@ class PreviewPage(ttk.Frame):
                 l_pid = r_pid = None
                 for pid in cps:
                     fn = pipe_to_floor.get(pid)
-                    if fn == lo.name and pid.startswith('L_'):
-                        l_pid = pid
-                    if fn == hi.name and pid.startswith('R_'):
-                        r_pid = pid
+                    if fn and self.cad_data_manager.id_type(pid) in ("L", "R"):
+                        if fn == lo.name:
+                            l_pid = pid
+                        if fn == hi.name:
+                            r_pid = pid
                 if not (l_pid and r_pid):
                     continue
                 lp = pipe_node_proj.get((l_pid, node.node_id))
@@ -4134,11 +5623,18 @@ class PreviewPage(ttk.Frame):
                 line = ms.AddLine(p1, p2)
                 line.Layer = layer_name
 
-    def _cad_write_annotations(self, ms, proj, hydrant_offsets, pipe_unflipped=None):
-        """反写标注文字"""
-        for pipe in self.cad_data_manager.pipes:
-            if self.hide_invalid_var.get() and not pipe.is_active:
+    def _cad_write_annotations(self, ms, proj, hydrant_offsets, pipe_unflipped=None, segments=None):
+        """反写标注文字：公称管径（左侧）、立管编号+横管标高（右侧），仅复选框勾选时反写"""
+        if segments is None:
+            _s, segments = self._build_cad_pipe_segments(proj, pipe_unflipped, pipe_unflipped)
+
+        for seg in segments:
+            if not seg.get("_annotate", True):
                 continue
+            id_type = self.cad_data_manager.id_type
+            first_pipe = seg["pipe_objects"][0]
+            is_b = (len(seg["pipe_ids"]) == 1 and id_type(seg["pipe_ids"][0]) == "B")
+
             # 跳过短管DN标注
             skip_dn = False
             if self.skip_dn_short_pipe.get():
@@ -4146,55 +5642,21 @@ class PreviewPage(ttk.Frame):
                     threshold = float(self.skip_dn_min_entry.get())
                 except ValueError:
                     threshold = self.skip_dn_min_length
-                if pipe.length < threshold:
+                if seg["total_length"] < threshold:
                     skip_dn = True
-            if pipe_unflipped:
-                pp = pipe_unflipped.get(pipe.pipe_id)
-                if not pp:
-                    continue
-                sx, sy = pp[0]
-                ex, ey = pp[1]
-            else:
-                p1 = proj.get(pipe.start_node_id)
-                p2 = proj.get(pipe.end_node_id)
-                if not p1 or not p2:
-                    continue
-                sx, sy = p1
-                ex, ey = p2
-            if hydrant_offsets and pipe.pipe_id.startswith('B_'):
-                mid_id = hydrant_offsets.get(pipe.end_node_id)
+
+            sx, sy = seg["start_proj"]
+            ex, ey = seg["end_proj"]
+
+            # 消火栓支管偏移（仅 B_ 单管段）
+            if hydrant_offsets and is_b:
+                mid_id = hydrant_offsets.get(first_pipe.end_node_id)
                 if mid_id:
                     mp = proj.get(mid_id)
                     if mp:
                         ex = mp[0] - 600.0
                         ey = mp[1]
 
-            text_parts = []
-            flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0) if self.calculation_available else 0
-            if self.show_pipe_id.get():
-                text_parts.append(pipe.pipe_id)
-            if not pipe.pipe_id.startswith('B_'):
-                if self.show_nominal.get() and not pipe.pipe_id.startswith('L_') and not skip_dn:
-                    text_parts.append(pipe.nominal_diameter)
-                if self.show_length.get():
-                    text_parts.append(f"{pipe.length:.2f}m")
-            if self.calculation_available and self.show_flow.get() and not pipe.pipe_id.startswith('L_'):
-                flow = self.pipe_results.get(pipe.pipe_id, {}).get('flow_lps', 0)
-                if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
-                    text_parts.append(f"{flow:.2f}L/s")
-            if self.calculation_available and self.show_velocity.get() and not pipe.pipe_id.startswith('L_'):
-                vel = self.pipe_results.get(pipe.pipe_id, {}).get('velocity_mps', 0.0)
-                if abs(vel) > 0.001 or self.show_zero_flow_label_var.get():
-                    text_parts.append(f"{vel:.2f}m/s")
-            if self.calculation_available and self.show_loss.get() and not pipe.pipe_id.startswith('L_'):
-                loss = self.pipe_results.get(pipe.pipe_id, {}).get('total_loss', 0)
-                if abs(flow) > 0.001 or self.show_zero_flow_label_var.get():
-                    text_parts.append(f"{loss:.2f}m")
-
-            if not text_parts:
-                continue
-
-            text = "_".join(text_parts)
             mx = (sx + ex) / 2
             my = (sy + ey) / 2
             dx = ex - sx
@@ -4202,44 +5664,142 @@ class PreviewPage(ttk.Frame):
             L = math.hypot(dx, dy)
             if L < 0.01:
                 continue
-            # 在CAD坐标系中（Y取反）计算法线偏移
-            cad_mx = mx
-            cad_my = -my
-            cad_nx = dy / L * 175.0  # CAD管线方向(dx,-dy)垂直向量X
-            cad_ny = dx / L * 175.0  # CAD管线方向(dx,-dy)垂直向量Y
-            angle = math.degrees(math.atan2(-dy, dx))
-            flip = (angle > 90 or angle < -90)
-            if flip:
-                tx = cad_mx - cad_nx
-                ty = cad_my - cad_ny
-                angle += 180
-            else:
-                tx = cad_mx + cad_nx
-                ty = cad_my + cad_ny
-            angle = angle % 360
 
-            try:
-                txt = ms.AddText(text, APoint(tx, ty, 0), 350.0)
-                txt.rotation = math.radians(angle)
-                txt.Layer = "PipeLoss_标注"
+            # CAD 平面坐标：Y 取反
+            cad_mx, cad_my = mx, -my
+            angle_deg = math.degrees(math.atan2(-dy, dx))
+            if angle_deg < 0:
+                angle_deg += 360
+            # 管道方向在 90~270 时翻转 180°，使文字始终朝上且平行管道
+            if abs(angle_deg - 270) < 0.001:
+                angle_deg = 90
+            elif 90 < angle_deg < 270:
+                angle_deg += 180 if angle_deg <= 180 else -180
+            if angle_deg >= 360:
+                angle_deg -= 360
+            rad_angle = math.radians(angle_deg)
+
+            # 管线垂向单位向量
+            perp_x = dy / L
+            perp_y = dx / L
+
+            # 文字高度方向
+            txt_hx = -math.sin(rad_angle)
+            txt_hy = math.cos(rad_angle)
+
+            # 左侧文字：公称管径
+            left_parts = []
+            if not is_b and self.show_nominal.get() and not skip_dn:
+                left_parts.append(seg["nominal_diameter"])
+
+            # 右侧文字：立管编号 + 横管标高
+            right_parts = []
+            if not is_b:
+                if self.show_riser_id.get():
+                    if len(seg["pipe_objects"]) > 1:
+                        rn_set = {getattr(p, 'riser_number', '') for p in seg["pipe_objects"]}
+                        rn_set.discard('')
+                        if len(rn_set) == 1:
+                            right_parts.append(rn_set.pop())
+                    else:
+                        rn = getattr(first_pipe, 'riser_number', '')
+                        if rn:
+                            right_parts.append(rn)
+                if self.show_elevation.get():
+                    elev = None
+                    for floor in self.cad_data_manager.floors:
+                        if first_pipe in getattr(floor, 'pipes', []):
+                            elev = floor.pipe_z_offset
+                            break
+                    if elev is None:
+                        sn = self.cad_data_manager.node_by_id.get(first_pipe.start_node_id)
+                        elev = sn.z / 1000.0 if sn else 0.0
+                    right_parts.append(f"FL{elev:.2f}")
+
+            if not left_parts and not right_parts:
+                continue
+
+            def _write_text_center(text, side):
+                """side: +1 → perp 方向侧, -1 → 反侧
+                文字中心距管线 300，再按高度方向反算插入点"""
+                cx = cad_mx + side * 300.0 * perp_x
+                cy = cad_my + side * 300.0 * perp_y
+                tx = cx - 175.0 * txt_hx
+                ty = cy - 175.0 * txt_hy
                 try:
-                    txt.StyleName = "shui"
+                    txt = ms.AddText(text, APoint(tx, ty, 0), 350.0)
+                    txt.rotation = rad_angle
+                    txt.Layer = "PipeLoss_标注"
+                    try:
+                        txt.StyleName = "shui"
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
+
+            if left_parts:
+                _write_text_center("_".join(left_parts), -1)
+            if right_parts:
+                _write_text_center("_".join(right_parts), +1)
 
     def modify_sprinkler(self, sp_pipes=None):
         """打开喷头修改对话框"""
         if sp_pipes is None:
             sp_pipes = [self.cad_data_manager.pipe_by_id[pid]
                         for pid in self.selected_pipes
-                        if pid.startswith("SP_") and pid in self.cad_data_manager.pipe_by_id]
+                        if self.cad_data_manager.id_type(pid) == "SP" and pid in self.cad_data_manager.pipe_by_id]
         if not sp_pipes:
             self.show_temp_message("未选中任何喷头短管", 2000)
             return
         root = self.winfo_toplevel()
         self.SprinklerModifyDialog(root, self, sp_pipes)
+
+    def four_sprinkler_check(self):
+        """四喷头校核：四个喷头流量平均后除以围合面积，得到喷水强度（L/min·m²）"""
+        sp_pipes = [self.cad_data_manager.pipe_by_id[pid]
+                    for pid in self.selected_pipes
+                    if pid in self.cad_data_manager.pipe_by_id
+                    and self.cad_data_manager.id_type(pid) == "SP"]
+        if len(sp_pipes) != 4:
+            self.show_temp_message("四喷头校核需恰好选中4根喷头短管", 2000)
+            return
+
+        rows = []
+        for pipe in sp_pipes:
+            s_node_id = pipe.end_node_id
+            flow = self.node_flows.get(s_node_id)
+            if flow is None:
+                self.show_temp_message(f"未找到节点 {s_node_id} 的流量结果，请先完成计算", 3000)
+                return
+            rows.append((pipe.start_node_id, s_node_id, float(flow)))
+
+        pts = []
+        for pipe in sp_pipes:
+            node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+            if node is None:
+                self.show_temp_message(f"未找到喷头节点 {pipe.start_node_id}", 2000)
+                return
+            pts.append((node.x / 1000.0, node.y / 1000.0))
+
+        # 围合面积：以重心为中心按极角排序成凸四边形，鞋带公式
+        cx = sum(p[0] for p in pts) / 4.0
+        cy = sum(p[1] for p in pts) / 4.0
+        ordered = sorted(pts, key=lambda p: math.atan2(p[1] - cy, p[0] - cx))
+        area = 0.0
+        for i in range(4):
+            x1, y1 = ordered[i]
+            x2, y2 = ordered[(i + 1) % 4]
+            area += x1 * y2 - x2 * y1
+        area = abs(area) / 2.0
+        if area <= 1e-9:
+            self.show_temp_message("四个喷头坐标围合面积为零，无法校核", 2500)
+            return
+
+        avg_flow = sum(r[2] for r in rows) / 4.0
+        intensity = avg_flow / area * 60.0
+
+        root = self.winfo_toplevel()
+        self.FourSprinklerCheckDialog(root, self, rows, area, avg_flow, intensity)
 
     # ==================== 喷头修改对话框 ====================
     class SprinklerModifyDialog:
@@ -4303,6 +5863,15 @@ class PreviewPage(ttk.Frame):
             ttk.Radiobutton(dirf, text="上喷", variable=self.dir_var, value=1).pack(side="left", padx=(10, 0))
             ttk.Radiobutton(dirf, text="下喷", variable=self.dir_var, value=0).pack(side="left", padx=(10, 0))
 
+            def _on_dir_changed(*args):
+                # 切换上/下喷时，短立管长度缺省填入设置页对应的长度值
+                config = self.config.get_live_config()
+                if self.dir_var.get() == 1:
+                    self.len_var.set(str(config.get("sprinkler_up_pipe_len", 0.6)))
+                else:
+                    self.len_var.set(str(config.get("sprinkler_down_pipe_len", 0.2)))
+            self.dir_var.trace('w', _on_dir_changed)
+
             if params_differ:
                 warn = ttk.Label(self.dialog, text="⚠ 选中的喷头参数不一致，将以第一根喷头参数显示",
                                  foreground="red")
@@ -4355,7 +5924,7 @@ class PreviewPage(ttk.Frame):
             config = self.config.get_live_config()
             default_K = config.get("sprinkler_K", 80)
             self.k_var.set(str(default_K))
-            self.len_var.set("0.1")
+            self.len_var.set(str(config.get("sprinkler_up_pipe_len", 0.6)))
             self.dir_var.set(1)
             self._dn_manual = False
             self._on_k_changed()
@@ -4400,10 +5969,54 @@ class PreviewPage(ttk.Frame):
             self.preview.show_temp_message(f"已修改 {len(self.sp_pipes)} 根喷头短管", 2000)
             self.dialog.destroy()
 
+    class FourSprinklerCheckDialog:
+        """四喷头校核结果对话框"""
+
+        def __init__(self, parent, preview, rows, area, avg_flow, intensity):
+            self.dialog = tk.Toplevel(parent)
+            self.dialog.title("四喷头校核")
+            self.dialog.resizable(False, False)
+            self.dialog.transient(parent)
+
+            header = ttk.Frame(self.dialog)
+            header.pack(fill="x", padx=14, pady=(12, 4))
+            ttk.Label(header, text="喷头", font=("TkDefaultFont", 9, "bold")).pack(side="left")
+            ttk.Label(header, text="流量(L/s)", font=("TkDefaultFont", 9, "bold")).pack(side="right")
+
+            for base_id, s_node_id, flow in rows:
+                rowf = ttk.Frame(self.dialog)
+                rowf.pack(fill="x", padx=14, pady=2)
+                ttk.Label(rowf, text=base_id).pack(side="left")
+                ttk.Label(rowf, text=f"{flow:.3f}").pack(side="right")
+
+            info = ttk.Frame(self.dialog)
+            info.pack(fill="x", padx=14, pady=(10, 2))
+            ttk.Label(info, text=f"围合面积：{area:.2f} m²").pack(anchor="w", pady=1)
+            ttk.Label(info, text=f"四喷头平均流量：{avg_flow:.3f} L/s").pack(anchor="w", pady=1)
+            ttk.Label(info, text=f"喷水强度：{intensity:.2f} L/min·m²",
+                      font=("TkDefaultFont", 11, "bold"), foreground="#1a5fb4").pack(anchor="w", pady=(6, 0))
+
+            bf = ttk.Frame(self.dialog)
+            bf.pack(fill="x", padx=14, pady=(10, 12))
+            ttk.Button(bf, text="确认", command=self.dialog.destroy).pack(side="right")
+
+            self.dialog.update_idletasks()
+            w = self.dialog.winfo_width()
+            h = self.dialog.winfo_height()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+            self.dialog.geometry(f"+{x}+{y}")
+
     # ----------------------------------------------------------------------
     # 交互事件
     # ----------------------------------------------------------------------
     def on_mouse_wheel(self, event):
+        if self.canvas is None:
+            return
         self._destroy_hover_tooltip()
         scale_factor = 1.1 if event.delta > 0 else 0.9
         self.scale *= scale_factor
@@ -4418,6 +6031,8 @@ class PreviewPage(ttk.Frame):
         self.drag_start = (event.x, event.y)
     
     def on_mouse_middle_drag(self, event):
+        if self.canvas is None:
+            return
         if self.drag_start:
             dx = event.x - self.drag_start[0]
             dy = event.y - self.drag_start[1]
@@ -4427,6 +6042,8 @@ class PreviewPage(ttk.Frame):
             self.redraw()
 
     def on_left_click(self, event):
+        if self.canvas is None:
+            return
         self._destroy_hover_tooltip()
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
@@ -4517,26 +6134,26 @@ class PreviewPage(ttk.Frame):
         self.redraw()
 
     def _get_pipes_in_rect(self, canvas_min_x, canvas_min_y, canvas_max_x, canvas_max_y) -> Set[str]:
-        """返回与矩形（画布坐标）相交的管道ID集合（精确线段相交）"""
         result = set()
-        # 预先计算矩形的边界
-        left = canvas_min_x
-        right = canvas_max_x
-        top = canvas_min_y
-        bottom = canvas_max_y
-        
+        left, right, top, bottom = canvas_min_x, canvas_max_x, canvas_min_y, canvas_max_y
+        use_offset = (self.hydrant_branch_flat_var.get() and self.current_view_mode == "global")
+    
         for pipe in self.cad_data_manager.pipes:
-            # 仅当“隐藏无效管”勾选时，才跳过无效管道
             if self.hide_invalid_var.get() and not pipe.is_active:
                 continue
             start_w = self.projected_coords.get(pipe.start_node_id)
             end_w = self.projected_coords.get(pipe.end_node_id)
             if not start_w or not end_w:
                 continue
+    
+            if use_offset and self.cad_data_manager.id_type(pipe.pipe_id) == "B":
+                start_w = self.projected_coords.get(pipe.start_node_id)
+                if start_w:
+                    end_w = (start_w[0] - 600.0, start_w[1])
+    
             start_c = self.world_to_canvas(*start_w)
             end_c = self.world_to_canvas(*end_w)
-            
-            # 快速包围盒剔除（可选，提高性能）
+            # 包围盒剔除
             pipe_min_x = min(start_c[0], end_c[0])
             pipe_max_x = max(start_c[0], end_c[0])
             pipe_min_y = min(start_c[1], end_c[1])
@@ -4544,8 +6161,6 @@ class PreviewPage(ttk.Frame):
             if (pipe_max_x < left or pipe_min_x > right or
                 pipe_max_y < top or pipe_min_y > bottom):
                 continue
-            
-            # 精确检测：线段与矩形是否相交（包括线段完全在矩形内部、线段穿过矩形、线段端点落在矩形内）
             if self._segment_intersects_rect(start_c, end_c, left, right, top, bottom):
                 result.add(pipe.pipe_id)
         return result
@@ -4590,14 +6205,73 @@ class PreviewPage(ttk.Frame):
         return False
 
     def on_right_click(self, event):
+        if self.canvas is None:
+            return
         self._destroy_hover_tooltip()
         canvas_x = self.canvas.canvasx(event.x)
         canvas_y = self.canvas.canvasy(event.y)
-        threshold = 10  # 像素阈值
+        threshold = 10
+        cad = self.cad_data_manager
 
-        # 查找最近的管道和阀门
+        if not self.is_spliced:
+            # 检测校准图形元素（绿色CP、橙色虚线管道）
+            calib_items = self.canvas.find_overlapping(canvas_x-3, canvas_y-3, canvas_x+3, canvas_y+3)
+            calib_cp_id = None
+            calib_pipe_cp_id = None
+            for item in calib_items:
+                tags = self.canvas.gettags(item)
+                for tag in tags:
+                    if tag.startswith("calib_cp_"):
+                        calib_cp_id = tag[9:]
+                    if tag.startswith("calib_pipe_"):
+                        calib_pipe_cp_id = tag[11:]
+            calib_target_id = calib_cp_id or calib_pipe_cp_id
+            if calib_target_id:
+                calib_cp = cad.get_connection_point_by_id(calib_target_id)
+                if calib_cp:
+                    rect = cad.get_calibration_rect_for_cp(calib_cp.point_id)
+                    if rect:
+                        menu = tk.Menu(self, tearoff=0)
+                        menu.add_command(label="删除校准配对",
+                            command=lambda c=calib_cp, r=rect: self._delete_calibration_for_cp(c, r))
+                        menu.add_separator()
+                        if not rect.is_spliced:
+                            if rect.base_building_id == "ZT" or not self._zt_has_pending_work():
+                                menu.add_command(label="管网拼接",
+                                    command=lambda r=rect: self._splice_network(r))
+                        menu.tk_popup(event.x_root, event.y_root)
+                        self.canvas.focus_set()
+                        return
+
+        # ── 快速路径：已选中管道时，用 canvas 原生四叉树快速判断是否空白处，跳过全量遍历 ──
+        if self.selected_pipes:
+            nearby = self.canvas.find_overlapping(canvas_x-3, canvas_y-3, canvas_x+3, canvas_y+3)
+            is_blank = True
+            for item in nearby:
+                for tag in self.canvas.gettags(item):
+                    if tag == "pipe" or tag.startswith("pipe:"):
+                        is_blank = False
+                        break
+                if not is_blank:
+                    break
+            if is_blank:
+                menu = tk.Menu(self, tearoff=0)
+                self._build_selection_menu(menu)
+                if self.current_view_mode == "floor" and not self.is_spliced:
+                    self._build_calibrate_menu(menu)
+                menu.add_separator()
+                menu.add_command(label="显示全部管道", command=self.zoom_to_all_pipes)
+                if menu.index("end") is not None:
+                    menu.tk_popup(event.x_root, event.y_root)
+                self.canvas.focus_set()
+                return
+
         pipe_dist, clicked_pipe = self._find_nearest_pipe((canvas_x, canvas_y))
         valve_dist, clicked_valve = self._find_nearest_valve((canvas_x, canvas_y))
+        if not self.is_spliced:
+            cp_dist, clicked_cp = self._find_nearest_connection_point((canvas_x, canvas_y))
+        else:
+            cp_dist, clicked_cp = 9999, None
 
         menu = tk.Menu(self, tearoff=0)
 
@@ -4605,30 +6279,76 @@ class PreviewPage(ttk.Frame):
             self._build_pipe_menu(menu, clicked_pipe)
         elif valve_dist < threshold and clicked_valve:
             self._build_valve_menu(menu, clicked_valve)
+        elif cp_dist < 15 and clicked_cp:
+            self._build_connection_point_menu(menu, clicked_cp)
         else:
-            # 无管道/阀门，尝试查找最近的节点
             node_dist, clicked_node = self._find_nearest_node((canvas_x, canvas_y))
             if node_dist < threshold and clicked_node:
                 self._build_node_menu(menu, clicked_node)
             if self.selected_pipes:
                 self._build_selection_menu(menu)
+            if self.current_view_mode == "floor" and not self.is_spliced:
+                self._build_calibrate_menu(menu)
+
+        # 所有画布统一提供"显示全部管道"（相当于CAD的 zoom→e 范围缩放）
+        menu.add_separator()
+        menu.add_command(label="显示全部管道", command=self.zoom_to_all_pipes)
 
         if menu.index("end") is not None:
             menu.tk_popup(event.x_root, event.y_root)
 
         self.canvas.focus_set()
 
+    def zoom_to_all_pipes(self):
+        """缩放平移使当前画布显示全部管道（相当于CAD的 zoom→e 范围缩放）"""
+        canvas = self.canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        if self.current_view_mode != "global":
+            # 楼层视图：先过滤投影到当前楼层范围，再范围居中
+            self.update_projection()
+            self._filter_projected_to_current_floor()
+            self.auto_center()
+            # 保存当前视图状态（楼层视图记录到 floor_view_state，供切换回来时保持）
+            cur_floor = getattr(canvas, 'current_display_floor', None) or self.current_floor_name
+            if cur_floor:
+                self.floor_view_state[cur_floor] = (self.scale, self.translate_x, self.translate_y)
+        else:
+            # 整体管网/拼接视图：投影已由绘制流程维护（等轴测），直接范围居中
+            self.auto_center()
+        self.redraw()
+
     def _find_nearest_pipe(self, canvas_pt):
         min_dist = float('inf')
         nearest_pipe = None
+        # 判断是否处于展开模式
+        use_offset = (self.hydrant_branch_flat_var.get() and self.current_view_mode == "global")
+        
         for pipe in self.cad_data_manager.pipes:
-            if self.hide_invalid_var.get() and not pipe.is_active:   # 仅当“隐藏无效管”勾选时，才跳过无效管道
+            if self.hide_invalid_var.get() and not pipe.is_active:
                 continue
             start_w = self.projected_coords.get(pipe.start_node_id)
             end_w = self.projected_coords.get(pipe.end_node_id)
             if not start_w or not end_w:
-                continue
-            # 转换为画布像素坐标
+                # 连接管跨楼栋：终点可能不在当前 projected_coords 中，与 draw_pipe 一致用回退
+                if pipe.pipe_type == "连接管":
+                    if start_w is None:
+                        sn = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+                        if sn:
+                            start_w = self.project_point(sn.x, sn.y, sn.z)
+                    if end_w is None:
+                        en = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
+                        if en:
+                            end_w = self.project_point(en.x, en.y, en.z)
+                if not start_w or not end_w:
+                    continue
+    
+            # 对 B_ 管道应用偏移：将末端移动到起点左侧 600 单位
+            if use_offset and self.cad_data_manager.id_type(pipe.pipe_id) == "B":
+                start_w = self.projected_coords.get(pipe.start_node_id)
+                if start_w:
+                    end_w = (start_w[0] - 600.0, start_w[1])
+    
             start_c = self.world_to_canvas(*start_w)
             end_c = self.world_to_canvas(*end_w)
             dist = self.point_to_line_distance(canvas_pt, start_c, end_c)
@@ -4649,20 +6369,74 @@ class PreviewPage(ttk.Frame):
                 nearest_valve = valve
         return min_dist, nearest_valve
 
+    def _find_nearest_connection_point(self, canvas_pt):
+        min_dist = float('inf')
+        nearest_cp = None
+        cad = self.cad_data_manager
+        for cp in cad.connection_points:
+            rect = cad.get_calibration_rect_for_cp(cp.point_id) if hasattr(cad, 'get_calibration_rect_for_cp') else None
+            if rect:
+                if cp.building_id == rect.base_building_id:
+                    vx = cp.x + cp.calib_dx
+                    vy = cp.y + cp.calib_dy
+                else:
+                    a = rect.transform_angle
+                    r = math.radians(a)
+                    if a != 0:
+                        vx = cp.x * math.cos(r) - cp.y * math.sin(r) + rect.transform_dx + cp.calib_dx
+                        vy = cp.x * math.sin(r) + cp.y * math.cos(r) + rect.transform_dy + cp.calib_dy
+                    else:
+                        vx = cp.x + rect.transform_dx + cp.calib_dx
+                        vy = cp.y + rect.transform_dy + cp.calib_dy
+                px, py = self.project_point(vx, vy, cp.z)
+                pos = (px, py)
+            else:
+                if cp.calib_dx or cp.calib_dy:
+                    px, py = self.project_point(cp.x + cp.calib_dx, cp.y + cp.calib_dy, cp.z)
+                    pos = (px, py)
+                else:
+                    pos = self.projected_coords.get(cp.node_id)
+                    if not pos:
+                        px, py = self.project_point(cp.x, cp.y, cp.z)
+                        pos = (px, py)
+            cpos = self.world_to_canvas(*pos)
+            dist = math.hypot(canvas_pt[0] - cpos[0], canvas_pt[1] - cpos[1])
+            if dist < min_dist:
+                min_dist = dist
+                nearest_cp = cp
+        return min_dist, nearest_cp
+
     def _find_nearest_node(self, canvas_pt):
         min_dist = float('inf')
         nearest_node = None
+        use_offset = self.hydrant_branch_flat_var.get() and self.current_view_mode == "global"
+
+        # 预构建 B_ 消火栓支管末端节点 → 偏移后起点位置映射，
+        # 避免对每个节点都全量遍历管道（拼接视图 2000+ 节点 × 2000+ 管道 = O(n²) 卡顿）
+        b_end_offset = None
+        if use_offset:
+            b_end_offset = {}
+            for pipe in self.cad_data_manager.pipes:
+                if self.cad_data_manager.id_type(pipe.pipe_id) == "B":
+                    start_w = self.projected_coords.get(pipe.start_node_id)
+                    if start_w:
+                        b_end_offset[pipe.end_node_id] = (start_w[0] - 600.0, start_w[1])
+
         for node in self.cad_data_manager.nodes:
             wpos = self.projected_coords.get(node.node_id)
             if not wpos:
                 continue
+            # 消火栓支管末端节点：使用偏移后的起点左侧 600 单位位置
+            if b_end_offset is not None:
+                off = b_end_offset.get(node.node_id)
+                if off:
+                    wpos = off
             cpos = self.world_to_canvas(*wpos)
             dist = math.hypot(canvas_pt[0] - cpos[0], canvas_pt[1] - cpos[1])
             if dist < min_dist:
                 min_dist = dist
                 nearest_node = node
         return min_dist, nearest_node
-
     # ----------------------------------------------------------------------
     # Alt 悬停信息框
     # ----------------------------------------------------------------------
@@ -4671,11 +6445,16 @@ class PreviewPage(ttk.Frame):
 
     def _on_alt_release(self, event):
         self.alt_pressed = False
+        self._last_mouse_alt = False
         self._destroy_hover_tooltip()
 
     def on_mouse_move(self, event):
         self._destroy_hover_tooltip()
-        if not self.alt_pressed:
+        # 用 event.state 检测 Alt（Mod1=0x0004），不依赖键盘焦点：
+        # 即使预览窗口非激活（如刚点了控制栏），只要鼠标在画布上仍可显示
+        alt_down = self.alt_pressed or bool(event.state & 0x0004) or bool(event.state & 0x20000)
+        self._last_mouse_alt = alt_down
+        if not alt_down:
             return
         if self._hover_tooltip_id:
             self.after_cancel(self._hover_tooltip_id)
@@ -4702,7 +6481,7 @@ class PreviewPage(ttk.Frame):
 
     def _show_hover_tooltip(self):
         self._hover_tooltip_id = None
-        if not self.alt_pressed or not self._hover_canvas_pos:
+        if not (self.alt_pressed or self._last_mouse_alt) or not self._hover_canvas_pos:
             return
         if not self.canvas or not self.canvas.winfo_exists():
             return
@@ -4714,6 +6493,15 @@ class PreviewPage(ttk.Frame):
         win.overrideredirect(True)
         win.attributes('-alpha', 0.9)
         win.attributes('-topmost', True)
+        # 鼠标事件穿透（Windows WS_EX_TRANSPARENT）：信息框不拦截鼠标事件，
+        # 画布中键平移/左键框选/拖动保持可用；信息框销毁仍由画布 <Motion> 驱动。
+        try:
+            import ctypes
+            hwnd = win.winfo_id()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, style | 0x20)
+        except Exception:
+            pass
         label = tk.Label(win, text="\n".join(lines),
                          justify=tk.LEFT,
                          background="#FFFFE8",
@@ -4739,6 +6527,19 @@ class PreviewPage(ttk.Frame):
         self._hover_tooltip_win = win
 
     def _get_hover_info(self, canvas_pt):
+        # ----- 新增：检测鼠标是否在楼层分离虚线上 -----
+        # 获取所有虚线对象
+        dashed_items = self.canvas.find_withtag("separation_line")
+        if dashed_items:
+            # 遍历每条虚线，计算鼠标到线段的距离（像素）
+            for item in dashed_items:
+                coords = self.canvas.coords(item)
+                if len(coords) >= 4:
+                    x1, y1, x2, y2 = coords[:4]
+                    dist = self.point_to_line_distance(canvas_pt, (x1, y1), (x2, y2))
+                    if dist < 10:  # 阈值10像素
+                        return (None, None)  # 在虚线上，不显示任何信息
+
         threshold = 10
         # 优先级：节点 > 阀门 > 管道
         dist, node = self._find_nearest_node(canvas_pt)
@@ -4755,11 +6556,20 @@ class PreviewPage(ttk.Frame):
                 )
             else:
                 flow_val = 0.0
+            # 所属楼层（NodeData 无 floor_name，通过楼层 nodes 归属判断）
+            node_floor_name = ""
+            if node_obj:
+                for floor in self.cad_data_manager.floors:
+                    if node_obj in floor.nodes:
+                        node_floor_name = floor.name
+                        break
             node_lines = [
                 f"节点编号: {node_id}",
-                f"节点流量: {flow_val:.2f}L/s",
-                f"节点压力: {pressure_val:.2f}m"
             ]
+            if node_floor_name:
+                node_lines.append(f"所属楼层: {node_floor_name}")
+            node_lines.append(f"节点流量: {flow_val:.2f}L/s")
+            node_lines.append(f"节点压力: {pressure_val:.2f}m")
             # 消火栓（优先于喷头）
             if node.hydrants:
                 hyd_id = node.hydrants[0]
@@ -4780,14 +6590,44 @@ class PreviewPage(ttk.Frame):
         dist, valve = self._find_nearest_valve(canvas_pt)
         if valve and dist < threshold:
             lines = [f"阀门编号: {valve.valve_id}"]
+            if valve.floor_name:
+                lines.append(f"所属楼层: {valve.floor_name}")
             return ("valve", lines)
         dist, pipe = self._find_nearest_pipe(canvas_pt)
         if pipe and dist < threshold:
             lines = [f"管道编号: {pipe.pipe_id}"]
+            # 所属楼层（通过楼层 pipes 归属判断）
+            pipe_floor_name = ""
+            pipe_floor = None
+            for floor in self.cad_data_manager.floors:
+                if pipe in floor.pipes:
+                    pipe_floor_name = floor.name
+                    pipe_floor = floor
+                    break
+            if pipe_floor_name:
+                lines.append(f"所属楼层: {pipe_floor_name}")
+            # 横管标高（R_、L_、B_ 立管/连接管/支管不显示）
+            if self.cad_data_manager.id_type(pipe.pipe_id) not in ("R", "L", "B"):
+                pipe_elev = pipe_floor.pipe_z_offset if pipe_floor else None
+                if pipe_elev is None:
+                    sn = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+                    if sn:
+                        pipe_elev = sn.z / 1000.0
+                if pipe_elev is not None:
+                    lines.append(f"标高: {pipe_elev:.2f}m")
             if pipe.riser_number:
                 lines.append(f"立管编号: {pipe.riser_number}")
             lines.append(f"公称管径: {pipe.nominal_diameter or '0'}")
             lines.append(f"管长: {pipe.length:.2f}m")
+            # 当量长度分配（当量长度法计算后存在）
+            static_eq = getattr(pipe, 'static_equiv', None)
+            dynamic_eq = getattr(pipe, 'dynamic_equiv', None)
+            if static_eq is not None:
+                lines.append(f"静态当量: {static_eq:.3f}m + 动态当量: {dynamic_eq:.3f}m")
+                eq_detail = getattr(pipe, 'equiv_detail', None)
+                if eq_detail:
+                    for name, val in eq_detail:
+                        lines.append(f"  {name}: {val:.3f}m")
             pres = self.pipe_results.get(pipe.pipe_id, {})
             flow = pres.get('flow_lps', 0.0)
             vel = pres.get('velocity_mps', 0.0)
@@ -4799,6 +6639,25 @@ class PreviewPage(ttk.Frame):
         return (None, None)
 
     def _build_pipe_menu(self, menu, pipe):
+        # 立管接出消火栓（仅整体画布 + 有效的未拆分立管管道）
+        # 在立管离楼面标高 1.1m 处一分为二，接出正西 0.6m DN65 消火栓支管，末端挂消火栓
+        if (self.current_view_mode == "global"
+                and pipe.is_active
+                and self.cad_data_manager.id_type(pipe.pipe_id) == "R"
+                and not pipe.pipe_id.endswith("_A")
+                and not pipe.pipe_id.endswith("_B")):
+            menu.add_command(label="立管接出消火栓",
+                command=lambda pid=pipe.pipe_id: self.riser_attach_hydrant(pid))
+            menu.add_separator()
+
+        # 合并立管段（仅整体画布；已拆分且中间节点无支管/消火栓、管径一致时显示）
+        if self.current_view_mode == "global":
+            can_m, _reason = self.cad_data_manager.can_merge_riser_segments(pipe.pipe_id)
+            if can_m:
+                menu.add_command(label="合并立管段",
+                    command=lambda pid=pipe.pipe_id: self.merge_riser_segments(pid))
+                menu.add_separator()
+
         # 添加阀门（如果无阀门）
         has_valve = any(v.pipe_id == pipe.pipe_id for v in self.cad_data_manager.valves)
         if not has_valve:
@@ -4839,6 +6698,7 @@ class PreviewPage(ttk.Frame):
         menu.add_command(label="删除管道", command=lambda: self.delete_pipe(pipe.pipe_id))
         menu.add_command(label="放大管径", command=lambda: self.change_pipe_diameter(pipe.pipe_id, "up"))
         menu.add_command(label="缩小管径", command=lambda: self.change_pipe_diameter(pipe.pipe_id, "down"))
+        menu.add_command(label="修改管径", command=lambda: self.show_diameter_dialog([pipe.pipe_id]))
         if self.velocity_check_var.get() and self.calculation_available:
             menu.add_command(label="校正管径",
                              command=lambda pid=pipe.pipe_id: self.correct_single_pipe_diameter(pid, "up"))
@@ -4886,6 +6746,49 @@ class PreviewPage(ttk.Frame):
             menu.add_command(label="用水点编组", command=lambda: self.group_demand_point(pipe))
             menu.add_command(label="用水点移出组", command=lambda: self.ungroup_demand_point(pipe))
 
+        # ===== 连接点操作（仅区域模式，自由端节点无连接点时添加，有时删除） =====
+        if self.cad_data_manager.building_order and not self.is_spliced:
+            start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+            end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
+            free_nodes_in_region = []
+            for _node in (start_node, end_node):
+                if _node and len(_node.connected_pipes) == 1:
+                    if self._get_building_prefix() and _node.node_id.startswith(self._get_building_prefix()):
+                        free_nodes_in_region.append(_node)
+                    elif not self._get_building_prefix():
+                        free_nodes_in_region.append(_node)
+            for _node in free_nodes_in_region:
+                has_cp = any(cp.node_id == _node.node_id for cp in self.cad_data_manager.connection_points)
+                if not has_cp:
+                    if not pipe.is_active:
+                        continue
+                    menu.add_command(
+                        label="添加连接点",
+                        command=lambda n=_node: self._add_connection_point_on_node(n)
+                    )
+                else:
+                    menu.add_command(
+                        label="删除连接点",
+                        command=lambda n=_node: self._delete_connection_point_by_node(n.node_id)
+                    )
+                    # 该节点上的连接点对象
+                    cp_on_node = next((cp for cp in self.cad_data_manager.connection_points
+                                       if cp.node_id == _node.node_id), None)
+                    if cp_on_node:
+                        if cp_on_node.paired_with:
+                            menu.add_command(
+                                label="解除配对",
+                                command=lambda c=cp_on_node: self._unpair_connection_points([c])
+                            )
+                            rect = self.cad_data_manager.get_calibration_rect_for_cp(cp_on_node.point_id)
+                            if rect:
+                                menu.add_command(
+                                    label="删除校准配对",
+                                    command=lambda c=cp_on_node, r=rect: self._delete_calibration_for_cp(c, r)
+                                )
+                        else:
+                            self._add_pair_submenu(menu, [cp_on_node], "连接点配对")
+
         # 检查管道是否关联消火栓
         start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
         end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
@@ -4921,7 +6824,7 @@ class PreviewPage(ttk.Frame):
                     menu.add_cascade(label="加入用水点组", menu=submenu)
 
         # 喷头短管右键菜单
-        if pipe.pipe_id.startswith("SP_"):
+        if self.cad_data_manager.id_type(pipe.pipe_id) == "SP":
             menu.add_separator()
             menu.add_command(label="修改喷头和短管",
                              command=lambda p=pipe: self.modify_sprinkler([p]))
@@ -4945,14 +6848,18 @@ class PreviewPage(ttk.Frame):
 
 
     def _build_selection_menu(self, menu):
+        is_sprinkler = self.config_manager.get_live_config().get("system_type") == "sprinkler"
         menu.add_command(label="放大管径（选择集）", command=lambda: self.change_selected_pipes_diameter("up"))
         menu.add_command(label="缩小管径（选择集）", command=lambda: self.change_selected_pipes_diameter("down"))
-        menu.add_command(label="改为消火栓支管（选择集）", command=self.change_selected_to_hydrant_branch)
+        menu.add_command(label="修改管径（选择集）", command=self.show_selection_diameter_dialog)
+        if not is_sprinkler:
+            menu.add_command(label="改为消火栓支管（选择集）", command=self.change_selected_to_hydrant_branch)
         menu.add_separator()
         menu.add_command(label="使无效（选择集）", command=lambda: self.set_selected_pipes_active(False))
         menu.add_command(label="使有效（选择集）", command=lambda: self.set_selected_pipes_active(True))
         menu.add_command(label="删除（选择集）", command=self.delete_selected_pipes)
-        menu.add_command(label="消火栓编成用水点组", command=self.group_selected_hydrants)
+        if not is_sprinkler:
+            menu.add_command(label="消火栓编成用水点组", command=self.group_selected_hydrants)
         if self.velocity_check_var.get() and self.calculation_available:
             menu.add_command(label="校正管径（选择集）",
                              command=lambda: self.correct_selected_pipes_diameter("up"))
@@ -4984,11 +6891,42 @@ class PreviewPage(ttk.Frame):
             menu.add_command(label="用水点编组（选择集）", command=self.group_demand_points_selected)
             menu.add_command(label="用水点移出组（选择集）", command=self.ungroup_demand_points_selected)
 
+        # ===== 连接点操作（选择集）（仅区域模式） =====
+        if self.cad_data_manager.building_order and free_nodes and not self.is_spliced:
+            has_free_without_cp = any(
+                not any(cp.node_id == n.node_id for cp in self.cad_data_manager.connection_points)
+                for n in free_nodes
+            )
+            has_free_with_cp = any(
+                any(cp.node_id == n.node_id for cp in self.cad_data_manager.connection_points)
+                for n in free_nodes
+            )
+            if has_free_without_cp:
+                menu.add_command(label="添加连接点（选择集）", command=self._add_connection_points_selected)
+            if has_free_with_cp:
+                menu.add_command(label="删除连接点（选择集）", command=self._delete_connection_points_selected)
+            # ==== 连接点配对（选择集）====
+            cps_in_sel = self._get_connection_points_in_selection()
+            unpaired_cps = [cp for cp in cps_in_sel if not cp.paired_with]
+            paired_cps = [cp for cp in cps_in_sel if cp.paired_with]
+            if unpaired_cps:
+                self._add_pair_submenu(menu, unpaired_cps, "连接点配对（选择集）")
+            if paired_cps:
+                menu.add_command(label="解除配对（选择集）",
+                    command=lambda c=paired_cps: self._unpair_connection_points(c))
+
         # 喷头短管选择集菜单
-        if any(pid.startswith("SP_") for pid in self.selected_pipes
-               if pid in self.cad_data_manager.pipe_by_id):
+        sp_selected = [pid for pid in self.selected_pipes
+                       if pid in self.cad_data_manager.pipe_by_id
+                       and self.cad_data_manager.id_type(pid) == "SP"]
+        if sp_selected:
             menu.add_separator()
             menu.add_command(label="修改喷头和短管", command=self.modify_sprinkler)
+            # 四喷头校核：选中集中SP短管恰好4根、已有计算结果、喷淋系统（允许混选其他管道）
+            if len(sp_selected) == 4 \
+                    and self.calculation_available \
+                    and self.config_manager.get_live_config().get("system_type") == "sprinkler":
+                menu.add_command(label="四喷头校核", command=self.four_sprinkler_check)
 
     def group_selected_hydrants(self):
         """将选择集中与消火栓关联的节点编成一个新的用水点组"""
@@ -5174,6 +7112,11 @@ class PreviewPage(ttk.Frame):
             n = self.cad_data_manager.node_by_id.get(nid)
             if n:
                 n.status = "关"
+            # 同步用水点组中的状态（供水点与用水点页面、计算模块均以 demand_node.status 为准）
+            for group in self.cad_data_manager.demand_groups.values():
+                for demand_node in group.demand_nodes:
+                    if demand_node.node_id == nid:
+                        demand_node.status = "关"
 
         # 记录检修区
         zone_id = f"maintenance_zone_{self._next_zone_id}"
@@ -5206,6 +7149,11 @@ class PreviewPage(ttk.Frame):
             n = self.cad_data_manager.node_by_id.get(nid)
             if n:
                 n.status = "开"
+            # 同步用水点组中的状态（供水点与用水点页面、计算模块均以 demand_node.status 为准）
+            for group in self.cad_data_manager.demand_groups.values():
+                for demand_node in group.demand_nodes:
+                    if demand_node.node_id == nid:
+                        demand_node.status = "开"
 
         if zone in self.maintenance_zones:
             self.maintenance_zones.remove(zone)
@@ -5228,6 +7176,8 @@ class PreviewPage(ttk.Frame):
         """从管道列表中获取所有自由端节点（连接管道数==1）"""
         free_nodes = set()
         for pipe in pipes:
+            if not pipe.is_active:
+                continue
             start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
             end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
             if start_node and len(start_node.connected_pipes) == 1:
@@ -5618,6 +7568,22 @@ class PreviewPage(ttk.Frame):
             menu.add_separator()
         menu.add_command(label="取消", command=lambda: None)
 
+    def _build_connection_point_menu(self, menu, cp):
+        if self.is_spliced:
+            return
+        if self.cad_data_manager.building_order:
+            if not cp.paired_with:
+                self._add_pair_submenu(menu, [cp], "连接点配对")
+            else:
+                menu.add_command(label="解除配对",
+                    command=lambda: self._unpair_connection_points([cp]))
+                rect = self.cad_data_manager.get_calibration_rect_for_cp(cp.point_id)
+                if rect:
+                    menu.add_command(label="删除校准配对",
+                        command=lambda: self._delete_calibration_for_cp(cp, rect))
+            menu.add_separator()
+        menu.add_command(label="删除连接点", command=lambda: self._delete_connection_point(cp.point_id))
+
     def _can_be_hydrant_branch(self, pipe):
         """检查管道是否满足改为消火栓支管的条件（消火栓系统，且一端自由，且自由端节点不是供水点）"""
         config = self.config_manager.get_live_config()
@@ -5822,6 +7788,97 @@ class PreviewPage(ttk.Frame):
         free2 = find_free_end(end_node)
         return free1 is not None or free2 is not None
 
+    def show_diameter_dialog(self, pipe_ids):
+        """弹出管径选择对话框，将选中管道管径改为所选值"""
+        if not pipe_ids:
+            return
+        config = self.config_manager.get_live_config()
+        system_type = config.get("system_type", "indoor_hydrant")
+        material = config.get("pipe_material", "镀锌钢管")
+        # 映射到 material_manager 可识别的类型（与管径校正逻辑一致）
+        if system_type == "sprinkler":
+            dia_system_type = "sprinkler"
+        elif system_type == "outdoor_hydrant":
+            dia_system_type = "hydrant"
+        else:
+            dia_system_type = "hydrant"
+        # 管径列表：本单体管材对应的管径（与设置页颜色管径对照表一致）
+        dn_list = self.material_manager.get_sorted_diameters(material, dia_system_type)
+        if not dn_list:
+            self.show_temp_message("当前管材无可用管径列表", 2500)
+            return
+        # 当前管径（取第一条管道）
+        first_pipe = self.cad_data_manager.pipe_by_id.get(pipe_ids[0])
+        current_dn = first_pipe.nominal_diameter if first_pipe else ""
+        dialog = tk.Toplevel(self)
+        dialog.title("修改管径")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(False, False)
+        dialog.grab_set()
+        self.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - 320) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - 160) // 2
+        dialog.geometry(f"320x160+{max(x, 0)}+{max(y, 0)}")
+
+        ttk.Label(dialog, text=f"选择管径（共 {len(pipe_ids)} 根管道）:",
+                  padding=(12, 12, 12, 4)).pack(anchor="w")
+        var = tk.StringVar(value=current_dn if current_dn in dn_list else dn_list[0])
+        combo = ttk.Combobox(dialog, textvariable=var, values=dn_list,
+                             state="readonly", width=12)
+        combo.pack(anchor="w", padx=12, pady=4)
+
+        def on_ok():
+            new_dn = var.get()
+            if not new_dn:
+                return
+            self._apply_diameter_to_pipes(pipe_ids, new_dn, material)
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog, padding=(12, 8, 12, 12))
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="确定", command=on_ok).pack(side="right", padx=(8, 0))
+        ttk.Button(btn_frame, text="取消", command=dialog.destroy).pack(side="right")
+
+    def show_selection_diameter_dialog(self):
+        """选择集管道统一修改管径"""
+        if not self.selected_pipes:
+            self.show_temp_message("请先选择管道", 2000)
+            return
+        pipe_ids = [pid for pid in self.selected_pipes if pid in self.cad_data_manager.pipe_by_id]
+        if not pipe_ids:
+            return
+        self.show_diameter_dialog(pipe_ids)
+
+    def _apply_diameter_to_pipes(self, pipe_ids, new_dn, material):
+        """将指定管道的管径改为 new_dn（记录撤销、刷新）"""
+        new_info = self.material_manager.get_diameter_info(material, new_dn)
+        if not new_info.get("inner", 0):
+            self.show_temp_message(f"管径 {new_dn} 无内径数据，无法修改", 2500)
+            return
+        modified = False
+        for pid in pipe_ids:
+            pipe = self.cad_data_manager.pipe_by_id.get(pid)
+            if not pipe or not pipe.is_active:
+                continue
+            if pipe.nominal_diameter == new_dn:
+                continue
+            old_dn = pipe.nominal_diameter
+            self._record_change('attr', pipe, 'nominal_diameter', old_dn, new_dn)
+            pipe.nominal_diameter = new_dn
+            pipe.inner_diameter = new_info["inner"]
+            modified = True
+        if modified:
+            config = self.config_manager.get_live_config()
+            self.cad_data_manager.update_pipe_types(config)
+            self._refresh_after_modification(keep_view=True)
+            self.show_temp_message(f"已将 {len(pipe_ids)} 根管道管径修改为 {new_dn}", 2500)
+        else:
+            self.show_temp_message("管径无需修改", 2000)
+
     def change_pipe_diameter(self, pipe_id, direction):
         # 保存当前选择集
         old_selection = set(self.selected_pipes)
@@ -6024,14 +8081,14 @@ class PreviewPage(ttk.Frame):
     
             # 在目标节点上创建消火栓（如果还没有）
             if not target_node.hydrants:
-                new_id = f"H_{len(self.cad_data_manager.hydrants)+1:04d}"
+                new_id = self.cad_data_manager._prefix_id(f"H_{len(self.cad_data_manager.hydrants)+1:04d}")
                 hydrant = HydrantData(
                     hydrant_id=new_id,
                     node_id=target_node.node_id,
                     x=target_node.x,
                     y=target_node.y,
                     z=target_node.z,
-                    block_name=config.get("hydrant_block_name", "hydrant"),
+                    block_name=config.get("hydrant_block_name", "hydrant").split(",")[0].strip(),
                     entity_handle=""
                 )
                 # 为消火栓分配所属楼层（基于节点所在的楼层）
@@ -6052,9 +8109,9 @@ class PreviewPage(ttk.Frame):
                 target_node.hydrants.append(new_id)
                 self._record_change('add', hydrant)
 
-                # 新增：将消火栓添加到对应楼层的 hydrants 列表
                 if hydrant.floor_name:
-                    floor = self.cad_data_manager.floor_by_name.get(hydrant.floor_name)
+                    hbid = self.cad_data_manager.get_building_by_entity(hydrant.hydrant_id)
+                    floor = self.cad_data_manager.lookup_floor(hydrant.floor_name, hbid)
                     if floor and hydrant not in floor.hydrants:
                         floor.hydrants.append(hydrant)
             # 节点已有消火栓，无需重复创建
@@ -6156,6 +8213,60 @@ class PreviewPage(ttk.Frame):
     
         return True
 
+    def riser_attach_hydrant(self, pipe_id):
+        """整体画布：立管接出消火栓。
+
+        立管离楼面标高 1.1m 处一分为二，接出正西 0.6m 水平消火栓支管（DN65），
+        支管末端挂消火栓。整操作记录为一条 'riser_attach' 撤销命令（一步回退，
+        含恢复原立管）。整体画布投影增量维护，管网视觉位置不动。
+        """
+        cad = self.cad_data_manager
+        config = self.config_manager.get_live_config()
+        orig_pipe = cad.pipe_by_id.get(pipe_id)
+        created, err = cad.attach_hydrant_to_riser(pipe_id, config)
+        if err or not created:
+            self.show_temp_message(err or "操作失败", 2000)
+            return
+        if orig_pipe:
+            self.undo_stack.append({
+                'type': 'riser_attach',
+                'orig_pipe': orig_pipe,
+                'created': created,
+            })
+            self.redo_stack.clear()
+            if len(self.undo_stack) > self.max_undo:
+                self.undo_stack.pop(0)
+        added_nodes = [obj for t, obj in created if t == 'node']
+        self._refresh_global_projection_delta(added_nodes, [])
+        self.update_projection()
+        self.redraw()
+        self.show_temp_message(f"已接出消火栓（立管 {pipe_id} 拆分 + 正西 0.6m 支管）", 2000)
+
+    def merge_riser_segments(self, pipe_id):
+        """整体画布：合并已拆分的立管段 R_xxx_A/_B 回 R_xxx。
+
+        需先删除支管与消火栓（中间节点无其他连接）。整操作记录为一条 'riser_merge'
+        撤销命令（一步回退）。整体画布投影增量维护，管网视觉位置不动。
+        """
+        cad = self.cad_data_manager
+        created, deleted, err = cad.merge_riser_segments(pipe_id)
+        if err:
+            self.show_temp_message(err, 2000)
+            return
+        self.undo_stack.append({
+            'type': 'riser_merge',
+            'deleted': deleted,
+            'created': created,
+        })
+        self.redo_stack.clear()
+        if len(self.undo_stack) > self.max_undo:
+            self.undo_stack.pop(0)
+        removed_nodes = [obj.node_id for t, obj in deleted if t == 'node']
+        self._refresh_global_projection_delta([], removed_nodes)
+        self.update_projection()
+        self.redraw()
+        self.show_temp_message(f"已合并立管段为 {pipe_id[:-2]}", 2000)
+
     def add_hydrant_on_node(self, node):
         """在指定节点上添加消火栓（不改变管道）"""
         if node.hydrants:
@@ -6168,12 +8279,12 @@ class PreviewPage(ttk.Frame):
             self.show_temp_message("只能向仅连接一根管道的节点添加消火栓", 2000)
             return
         config = self.config_manager.get_live_config()
-        new_id = f"H_{len(self.cad_data_manager.hydrants)+1:04d}"
+        new_id = self.cad_data_manager._prefix_id(f"H_{len(self.cad_data_manager.hydrants)+1:04d}")
         hydrant = HydrantData(
             hydrant_id=new_id,
             node_id=node.node_id,
             x=node.x, y=node.y, z=node.z,
-            block_name=config.get("hydrant_block_name", "hydrant"),
+            block_name=config.get("hydrant_block_name", "hydrant").split(",")[0].strip(),
             entity_handle=""
         )
         # ★ 为新消火栓分配楼层名（基于所属节点所在的楼层）
@@ -6187,9 +8298,9 @@ class PreviewPage(ttk.Frame):
         node.hydrants.append(new_id)
         self._record_change('add', hydrant)
 
-        # 新增：将消火栓添加到对应楼层的 hydrants 列表（用于楼层预览）
         if hydrant.floor_name:
-            floor = self.cad_data_manager.floor_by_name.get(hydrant.floor_name)
+            hbid = self.cad_data_manager.get_building_by_entity(hydrant.hydrant_id)
+            floor = self.cad_data_manager.lookup_floor(hydrant.floor_name, hbid)
             if floor and hydrant not in floor.hydrants:
                 floor.hydrants.append(hydrant)
 
@@ -6211,9 +8322,9 @@ class PreviewPage(ttk.Frame):
         if node:
             node.hydrants.remove(hydrant_id)
         
-        # 从楼层 hydrants 列表中移除
         if hydrant.floor_name:
-            floor = self.cad_data_manager.floor_by_name.get(hydrant.floor_name)
+            hbid = self.cad_data_manager.get_building_by_entity(hydrant.hydrant_id)
+            floor = self.cad_data_manager.lookup_floor(hydrant.floor_name, hbid)
             if floor and hydrant in floor.hydrants:
                 floor.hydrants.remove(hydrant)
         
@@ -6295,8 +8406,10 @@ class PreviewPage(ttk.Frame):
         # 绘制重复立管的红色箭头标记（根据复选框状态）
         if self.show_riser_warning.get() and self.duplicate_risers_by_floor:
             current_floor_name = self.current_floor_name
-            if current_floor_name in self.duplicate_risers_by_floor:
-                duplicate_list = self.duplicate_risers_by_floor[current_floor_name]
+            bid = self._current_building_id
+            search_key = (bid + "|" + current_floor_name) if bid else current_floor_name
+            if search_key in self.duplicate_risers_by_floor:
+                duplicate_list = self.duplicate_risers_by_floor[search_key]
                 if any(dr.riser_id == riser.riser_id for dr in duplicate_list):
                     # 绘制一个加长的红色箭头，箭头指向立管圆心
                     arrow_len = max(20, int(20 * self.scale))
@@ -6322,8 +8435,11 @@ class PreviewPage(ttk.Frame):
         import logging
         logger = logging.getLogger(__name__)
         
+        prefix = self._get_building_prefix()
         for pipe in self.cad_data_manager.pipes:
-            if not pipe.pipe_id.startswith("R_"):
+            if self.cad_data_manager.id_type(pipe.pipe_id) != "R":
+                continue
+            if prefix and not pipe.pipe_id.startswith(prefix):
                 continue
             
             start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
@@ -6392,18 +8508,21 @@ class PreviewPage(ttk.Frame):
         target_dn = "DN65"
         target_info = self.material_manager.get_diameter_info(material, target_dn)
         if not target_info or target_info.get("inner", 0) == 0:
-            self.show_temp_message(f"未找到管径 {target_dn} 信息，无法校正", 2000)
+            self.show_temp_message(f"未找到管径 {target_dn} 信息，无法重建", 2000)
             return
         target_inner = target_info["inner"]
+        prefix = self._get_building_prefix()
 
         # 1. 收集所有 B_ 支管对应的 mid_node（与立管相连的那个节点）
         mid_nodes = set()
         for pipe in cad.pipes:
-            if pipe.pipe_id.startswith("B_"):
+            if prefix and not pipe.pipe_id.startswith(prefix):
+                continue
+            if self.cad_data_manager.id_type(pipe.pipe_id) == "B":
                 start_node = cad.node_by_id.get(pipe.start_node_id)
                 end_node = cad.node_by_id.get(pipe.end_node_id)
                 for node in (start_node, end_node):
-                    if node and any(pid.startswith("R_") for pid in node.connected_pipes):
+                    if node and any(self.cad_data_manager.id_type(pid) == "R" for pid in node.connected_pipes):
                         mid_nodes.add(node.node_id)
                         break
 
@@ -6482,7 +8601,7 @@ class PreviewPage(ttk.Frame):
                 continue
 
             # 获取所有非 B_ 的连接管道（需要遍历的方向）
-            directions = [pid for pid in mid_node.connected_pipes if not pid.startswith("B_")]
+            directions = [pid for pid in mid_node.connected_pipes if self.cad_data_manager.id_type(pid) != "B"]
             if len(directions) < 2:
                 warnings.append(f"节点 {mid_node_id} 连接管道不足2个方向，跳过")
                 continue
@@ -6561,8 +8680,13 @@ class PreviewPage(ttk.Frame):
 
     def delete_invalid_pipes(self):
         """删除所有标记为无效的管道和节点（弹出确认对话框），记录撤销信息。"""
-        invalid_pipes = [p for p in self.cad_data_manager.pipes if not p.is_active]
-        invalid_nodes = [n for n in self.cad_data_manager.nodes if not n.is_active and len(n.connected_pipes) == 0]
+        prefix = self._get_building_prefix()
+        invalid_pipes = [p for p in self.cad_data_manager.pipes
+                         if not p.is_active
+                         and (not prefix or p.pipe_id.startswith(prefix))]
+        invalid_nodes = [n for n in self.cad_data_manager.nodes
+                         if not n.is_active and len(n.connected_pipes) == 0
+                         and (not prefix or n.node_id.startswith(prefix))]
 
         if not invalid_pipes and not invalid_nodes:
             self.show_temp_message("没有需要删除的无效管道或孤立无效节点", 2000)
@@ -6583,7 +8707,7 @@ class PreviewPage(ttk.Frame):
                     undo_hydrants.append(hydrant)
         undo_risers = []
         for pipe in invalid_pipes:
-            if pipe.pipe_id.startswith('R_'):
+            if self.cad_data_manager.id_type(pipe.pipe_id) == "R":
                 riser = self.cad_data_manager.riser_by_id.get(pipe.pipe_id)
                 if riser:
                     undo_risers.append(riser)
@@ -6615,7 +8739,7 @@ class PreviewPage(ttk.Frame):
                     floor.pipes.remove(pipe)
             self.cad_data_manager.pipes.remove(pipe)
             del self.cad_data_manager.pipe_by_id[pipe.pipe_id]
-            if pipe.pipe_id.startswith('R_'):
+            if self.cad_data_manager.id_type(pipe.pipe_id) == "R":
                 deleted_riser_ids.append(pipe.pipe_id)
 
         for riser_id in deleted_riser_ids:
@@ -6645,6 +8769,7 @@ class PreviewPage(ttk.Frame):
 
         config = self.config_manager.get_live_config()
         self.cad_data_manager.update_pipe_types(config)
+        self.update_invalid_controls_state()
 
         self.occlusion_cache_valid = False
         self.redraw()
@@ -6690,14 +8815,14 @@ class PreviewPage(ttk.Frame):
 
         max_id = 0
         for v in self.cad_data_manager.valves:
-            if v.valve_id.startswith("V_"):
+            if self.cad_data_manager.id_type(v.valve_id) == "V":
                 try:
-                    num = int(v.valve_id[2:])
+                    num = int(v.valve_id.split('_')[-1])
                     if num > max_id:
                         max_id = num
                 except:
                     pass
-        new_id = f"V_{max_id+1:04d}"
+        new_id = self.cad_data_manager._prefix_id(f"V_{max_id+1:04d}")
 
         from cad_data_manager import ValveData
         new_valve = ValveData(
@@ -6705,7 +8830,7 @@ class PreviewPage(ttk.Frame):
             pipe_id=pipe_id,
             status="OPEN",
             x=mid_x, y=mid_y, z=mid_z,
-            block_name=self.config_manager.get_live_config().get("valve_block_name", "valve"),
+            block_name=self.config_manager.get_live_config().get("valve_block_name", "valve").split(",")[0].strip(),
             attribute_name=self.config_manager.get_live_config().get("valve_attribute_name", "Status"),
             attribute_value="OPEN",
             entity_handle="",
@@ -6795,7 +8920,8 @@ class PreviewPage(ttk.Frame):
         self.path_combo['values'] = display_items
         if display_items:
             self.path_combo.current(0)
-            self.on_path_selected()
+        # 空列表同样调用 on_path_selected 以清空残留高亮
+        self.on_path_selected()
 
     def on_path_selected(self, event=None):
         idx = self.path_combo.current()
@@ -6819,12 +8945,20 @@ class PreviewPage(ttk.Frame):
     def refresh_data(self, keep_view=False):
         if not self.cad_data_manager.is_loaded:
             return
+        # 数据可能变化，投影质心缓存失效
+        self._centroid_cache = None
+        # 确保临时画布隐藏（不干扰后续标签页布局）
+        if hasattr(self, '_temp_canvas') and self._temp_canvas:
+            if self._temp_canvas.winfo_ismapped():
+                self._temp_canvas.pack_forget()
         # 重新计算坐标和连通性
         if self.cad_data_manager.floors:
             config = self.config_manager.get_live_config()
-            self.cad_data_manager.align_floors_to_baseline()
-            if not self._skip_z_recalc:
-                self.cad_data_manager.assign_node_z_coordinates(config)
+            # 区域模式：不进行全局重新对齐（各楼栋已在提取时单独对齐并赋值 Z）
+            if not self.cad_data_manager.building_order:
+                self.cad_data_manager.align_floors_to_baseline()
+                if not self._skip_z_recalc:
+                    self.cad_data_manager.assign_node_z_coordinates(config)
 
             unit_factor = self.cad_data_manager.unit_factors.get(config.get("drawing_unit", "毫米"), 0.001)
             for pipe in self.cad_data_manager.pipes:
@@ -6842,18 +8976,24 @@ class PreviewPage(ttk.Frame):
         self.update_projection()
         self.compute_reachability()
         # 更新楼层颜色映射（因为楼层标高可能已改变）
-        self.update_floor_color_map()    
-    
+        self.update_floor_color_map()
+
+        # 区域模式：检查是否需重建楼栋标签（楼栋列表变化时）
+        if (bool(self.cad_data_manager.building_order)
+                and self.cad_data_manager.building_order
+                and set(self.cad_data_manager.building_order) != set(self._building_managers.keys())):
+            self.rebuild_floor_tabs()
+            return
+
         # 检查分组映射是否变化，若变化则需要重建标签页
         current_grouped_map = getattr(self.cad_data_manager, 'grouped_floors_map', {})
-        need_rebuild = (self.floor_notebook is None) or (not self.floor_notebook.tabs()) or (current_grouped_map != self._cached_grouped_floors_map)
+        need_rebuild = current_grouped_map != self._cached_grouped_floors_map
+        if not self.is_spliced:
+            need_rebuild = need_rebuild or (self.floor_notebook is None) or (not self.floor_notebook.tabs())
         
         if self.floor_notebook is None:
-            if hasattr(self, '_widgets_created'):
-                delattr(self, '_widgets_created')
-            self.create_widgets()
-            self.update_projection()
-            self.compute_reachability()
+            self.rebuild_floor_tabs()
+            return
         
         if need_rebuild:
             self.rebuild_floor_tabs()
@@ -6888,12 +9028,117 @@ class PreviewPage(ttk.Frame):
             self.arrow_check.config(state="disabled")
             self.node_pressure_check.config(state="disabled")
 
+        # 连接点编号复选框：仅区域模式可用
+        if hasattr(self, 'connection_id_check'):
+            if self.cad_data_manager.building_order:
+                self.connection_id_check.config(state="normal")
+            else:
+                self.connection_id_check.config(state="disabled")
+
         # 同步重复立管信息（用于整体管网高亮）
         self.duplicate_risers_by_floor = self.cad_data_manager.duplicate_risers_by_floor
         self.update_invalid_controls_state()
         self.redraw()
 
-    def _record_change(self, action, target, attr=None, old=None, new=None, obj_type=None):
+    def _undo_remove_obj(self, obj, obj_type):
+        """撤销"添加"：从全局列表/索引/节点连接/楼层引用中移除对象。
+
+        供现有 'add' 命令与复合命令（立管接出/合并/删除支管连带）的撤销使用。
+        """
+        cad = self.cad_data_manager
+        if obj_type == 'valve':
+            if obj in cad.valves:
+                cad.valves.remove(obj)
+            cad.valve_by_id.pop(obj.valve_id, None)
+        elif obj_type == 'hydrant':
+            if obj in cad.hydrants:
+                cad.hydrants.remove(obj)
+            cad.hydrant_by_id.pop(obj.hydrant_id, None)
+            node = cad.node_by_id.get(obj.node_id)
+            if node and obj.hydrant_id in node.hydrants:
+                node.hydrants.remove(obj.hydrant_id)
+            if obj.floor_name:
+                hbid = cad.get_building_by_entity(obj.hydrant_id)
+                floor = cad.lookup_floor(obj.floor_name, hbid)
+                if floor and obj in floor.hydrants:
+                    floor.hydrants.remove(obj)
+        elif obj_type == 'pipe':
+            if obj in cad.pipes:
+                cad.pipes.remove(obj)
+            cad.pipe_by_id.pop(obj.pipe_id, None)
+            start_node = cad.node_by_id.get(obj.start_node_id)
+            end_node = cad.node_by_id.get(obj.end_node_id)
+            if start_node and obj.pipe_id in start_node.connected_pipes:
+                start_node.connected_pipes.remove(obj.pipe_id)
+            if end_node and obj.pipe_id in end_node.connected_pipes:
+                end_node.connected_pipes.remove(obj.pipe_id)
+            for floor in cad.floors:
+                if obj in floor.pipes:
+                    floor.pipes.remove(obj)
+        elif obj_type == 'node':
+            if obj in cad.nodes:
+                cad.nodes.remove(obj)
+            cad.node_by_id.pop(obj.node_id, None)
+            for pid in list(obj.connected_pipes):
+                pipe = cad.pipe_by_id.get(pid)
+                if pipe:
+                    for nid in (pipe.start_node_id, pipe.end_node_id):
+                        adj = cad.node_by_id.get(nid)
+                        if adj and pid in adj.connected_pipes:
+                            adj.connected_pipes.remove(pid)
+            for floor in cad.floors:
+                if obj in floor.nodes:
+                    floor.nodes.remove(obj)
+
+    def _undo_restore_obj(self, obj, obj_type):
+        """撤销"删除"：恢复对象到全局列表/索引/节点连接/楼层引用。
+
+        供现有 'delete' 命令与复合命令（立管接出/合并/删除支管连带）的撤销使用。
+        """
+        cad = self.cad_data_manager
+        if obj_type == 'valve':
+            if obj not in cad.valves:
+                cad.valves.append(obj)
+            if obj.valve_id not in cad.valve_by_id:
+                cad.valve_by_id[obj.valve_id] = obj
+        elif obj_type == 'hydrant':
+            if obj not in cad.hydrants:
+                cad.hydrants.append(obj)
+            if obj.hydrant_id not in cad.hydrant_by_id:
+                cad.hydrant_by_id[obj.hydrant_id] = obj
+            node = cad.node_by_id.get(obj.node_id)
+            if node and obj.hydrant_id not in node.hydrants:
+                node.hydrants.append(obj.hydrant_id)
+            if obj.floor_name:
+                hbid = cad.get_building_by_entity(obj.hydrant_id)
+                floor = cad.lookup_floor(obj.floor_name, hbid)
+                if floor and obj not in floor.hydrants:
+                    floor.hydrants.append(obj)
+        elif obj_type == 'pipe':
+            if obj not in cad.pipes:
+                cad.pipes.append(obj)
+            if obj.pipe_id not in cad.pipe_by_id:
+                cad.pipe_by_id[obj.pipe_id] = obj
+            start_node = cad.node_by_id.get(obj.start_node_id)
+            end_node = cad.node_by_id.get(obj.end_node_id)
+            if start_node and obj.pipe_id not in start_node.connected_pipes:
+                start_node.connected_pipes.append(obj.pipe_id)
+            if end_node and obj.pipe_id not in end_node.connected_pipes:
+                end_node.connected_pipes.append(obj.pipe_id)
+            for floor in cad.floors:
+                if obj not in floor.pipes:
+                    if (start_node and start_node in floor.nodes) or (end_node and end_node in floor.nodes):
+                        floor.pipes.append(obj)
+        elif obj_type == 'node':
+            if obj not in cad.nodes:
+                cad.nodes.append(obj)
+            if obj.node_id not in cad.node_by_id:
+                cad.node_by_id[obj.node_id] = obj
+            for floor in cad.floors:
+                if obj not in floor.nodes:
+                    floor.nodes.append(obj)
+
+    def _record_change(self, action, target, attr=None, old=None, new=None, obj_type=None, connection_points=None):
         if action == 'attr':
             cmd = {'type': 'attr', 'obj': target, 'attr': attr, 'old': old, 'new': new}
         elif action == 'add':
@@ -6922,8 +9167,12 @@ class PreviewPage(ttk.Frame):
                 else:
                     obj_type = 'unknown'
             cmd = {'type': 'delete', 'obj': target, 'obj_type': obj_type}
+            if connection_points:
+                cmd['connection_points'] = connection_points
         elif action == 'delete_batch':
             cmd = {'type': 'delete_batch', 'obj': target}
+            if connection_points:
+                cmd['connection_points'] = connection_points
         else:
             return
         self.undo_stack.append(cmd)
@@ -6935,6 +9184,8 @@ class PreviewPage(ttk.Frame):
         if not self.undo_stack:
             return
         cmd = self.undo_stack.pop()
+        # 记录撤销前节点集合（用于撤销后同步整体画布投影缓存）
+        _before_node_ids = set(self.cad_data_manager.node_by_id.keys())
         if cmd['type'] == 'attr':
             obj = cmd['obj']
             setattr(obj, cmd['attr'], cmd['old'])
@@ -6956,7 +9207,8 @@ class PreviewPage(ttk.Frame):
                 if node and obj.hydrant_id in node.hydrants:
                     node.hydrants.remove(obj.hydrant_id)
                 if obj.floor_name:
-                    floor = self.cad_data_manager.floor_by_name.get(obj.floor_name)
+                    hbid = self.cad_data_manager.get_building_by_entity(obj.hydrant_id)
+                    floor = self.cad_data_manager.lookup_floor(obj.floor_name, hbid)
                     if floor and obj in floor.hydrants:
                         floor.hydrants.remove(obj)
             elif obj_type == 'pipe':
@@ -6973,6 +9225,23 @@ class PreviewPage(ttk.Frame):
                 for floor in self.cad_data_manager.floors:
                     if obj in floor.pipes:
                         floor.pipes.remove(obj)
+            elif obj_type == 'node':
+                # 撤销手动添加的节点（如立管接出消火栓的 1.1m/支管末端节点）
+                if obj in self.cad_data_manager.nodes:
+                    self.cad_data_manager.nodes.remove(obj)
+                if obj.node_id in self.cad_data_manager.node_by_id:
+                    del self.cad_data_manager.node_by_id[obj.node_id]
+                # 清理该节点在相邻管道上的连接引用
+                for pid in list(obj.connected_pipes):
+                    pipe = self.cad_data_manager.pipe_by_id.get(pid)
+                    if pipe:
+                        for nid in (pipe.start_node_id, pipe.end_node_id):
+                            adj = self.cad_data_manager.node_by_id.get(nid)
+                            if adj and pid in adj.connected_pipes:
+                                adj.connected_pipes.remove(pid)
+                for floor in self.cad_data_manager.floors:
+                    if obj in floor.nodes:
+                        floor.nodes.remove(obj)
             self.redo_stack.append(cmd)
         elif cmd['type'] == 'delete':
             obj = cmd['obj']
@@ -6991,7 +9260,8 @@ class PreviewPage(ttk.Frame):
                 if node and obj.hydrant_id not in node.hydrants:
                     node.hydrants.append(obj.hydrant_id)
                 if obj.floor_name:
-                    floor = self.cad_data_manager.floor_by_name.get(obj.floor_name)
+                    hbid = self.cad_data_manager.get_building_by_entity(obj.hydrant_id)
+                    floor = self.cad_data_manager.lookup_floor(obj.floor_name, hbid)
                     if floor and obj not in floor.hydrants:
                         floor.hydrants.append(obj)
             elif obj_type == 'pipe':
@@ -7011,6 +9281,13 @@ class PreviewPage(ttk.Frame):
                     if obj not in floor.pipes:
                         if (start_node and start_node in floor.nodes) or (end_node and end_node in floor.nodes):
                             floor.pipes.append(obj)
+                # 恢复关联的连接点（清除配对，保持两侧均未配对）
+                cp_list = cmd.get('connection_points')
+                if cp_list:
+                    for cp in cp_list:
+                        cp.paired_with = ""
+                        if cp not in self.cad_data_manager.connection_points:
+                            self.cad_data_manager.connection_points.append(cp)
             elif obj_type == 'node':
                 if obj not in self.cad_data_manager.nodes:
                     self.cad_data_manager.nodes.append(obj)
@@ -7037,6 +9314,13 @@ class PreviewPage(ttk.Frame):
                     if pipe not in floor.pipes:
                         if (start_node and start_node in floor.nodes) or (end_node and end_node in floor.nodes):
                             floor.pipes.append(pipe)
+            # 恢复关联的连接点（清除配对，保持两侧均未配对）
+            cp_list = cmd.get('connection_points')
+            if cp_list:
+                for cp in cp_list:
+                    cp.paired_with = ""
+                    if cp not in self.cad_data_manager.connection_points:
+                        self.cad_data_manager.connection_points.append(cp)
             self.redo_stack.append(cmd)
         elif cmd['type'] == 'delete_invalid_batch':
             # 撤销批量删除无效管：按逆序恢复消火栓 → 节点 → 立管 → 管道
@@ -7054,7 +9338,8 @@ class PreviewPage(ttk.Frame):
                 if node and hydrant.hydrant_id not in node.hydrants:
                     node.hydrants.append(hydrant.hydrant_id)
                 if hydrant.floor_name:
-                    floor = self.cad_data_manager.floor_by_name.get(hydrant.floor_name)
+                    hbid = self.cad_data_manager.get_building_by_entity(hydrant.hydrant_id)
+                    floor = self.cad_data_manager.lookup_floor(hydrant.floor_name, hbid)
                     if floor and hydrant not in floor.hydrants:
                         floor.hydrants.append(hydrant)
 
@@ -7096,6 +9381,27 @@ class PreviewPage(ttk.Frame):
             self.duplicate_risers_by_floor = self.cad_data_manager.duplicate_risers_by_floor
 
             self.redo_stack.append(cmd)
+        elif cmd['type'] == 'riser_attach':
+            # 撤销"立管接出消火栓"（一个命令一步回退）：逆序删除新对象 + 恢复原立管
+            for obj_type, obj in reversed(cmd['created']):
+                self._undo_remove_obj(obj, obj_type)
+            self._undo_restore_obj(cmd['orig_pipe'], 'pipe')
+            self.redo_stack.append(cmd)
+        elif cmd['type'] == 'riser_merge':
+            # 撤销"合并立管段"：删除合并后的 R_xxx + 逆序恢复 A/B/mid
+            for obj_type, obj in reversed(cmd['created']):
+                self._undo_remove_obj(obj, obj_type)
+            for obj_type, obj in reversed(cmd['deleted']):
+                self._undo_restore_obj(obj, obj_type)
+            self.redo_stack.append(cmd)
+        elif cmd['type'] == 'riser_detach':
+            # 撤销"删除消火栓支管（连带）"：删除合并后的 R_xxx + 逆序恢复
+            # 支管/消火栓/A/B/mid/末端节点（无任何中间态）
+            for obj_type, obj in reversed(cmd['merged']):
+                self._undo_remove_obj(obj, obj_type)
+            for obj_type, obj in reversed(cmd['deleted']):
+                self._undo_restore_obj(obj, obj_type)
+            self.redo_stack.append(cmd)
         elif cmd['type'] == 'batch_attr':
             changes = cmd['changes']
             for item in changes:
@@ -7108,7 +9414,15 @@ class PreviewPage(ttk.Frame):
     
         # 撤销操作后，拓扑结构可能变化，遮挡缓存必须失效
         self.occlusion_cache_valid = False
-        
+
+        # 整体画布投影缓存增量同步：撤销恢复/删除的节点加入/移出缓存，
+        # 否则立管段等恢复后因投影缺失画不出来（缓存键与节点无关，不会自动重建）
+        _after_node_ids = set(self.cad_data_manager.node_by_id.keys())
+        _added_nodes = [self.cad_data_manager.node_by_id[i]
+                        for i in _after_node_ids if i not in _before_node_ids]
+        _removed_ids = [i for i in _before_node_ids if i not in _after_node_ids]
+        self._refresh_global_projection_delta(_added_nodes, _removed_ids)
+
         # 刷新视图和其他页面
         self.redraw()
         root = self.winfo_toplevel()
@@ -7130,9 +9444,9 @@ class PreviewPage(ttk.Frame):
         if not self.canvas or not self.canvas.winfo_exists():
             return
         self.canvas.delete("floor_info")
-        if not self.cad_data_manager.floors or not self.current_floor_name or self.current_floor_name == "单层":
+        if not self.cad_data_manager.floors or not self.current_floor_name:
             return
-        floor = self.cad_data_manager.floor_by_name.get(self.current_floor_name)
+        floor = self.cad_data_manager.lookup_floor(self.current_floor_name, self._current_building_id)
         if not floor:
             return
         info_text = f"楼面标高: {floor.elevation:.2f}m  管网标高: {floor.pipe_z_offset:.2f}m"
@@ -7145,7 +9459,7 @@ class PreviewPage(ttk.Frame):
             self.canvas.create_text(20, h - 20, text=info_text, fill="white",
                                     anchor="sw", font=("Arial", 10), tags="floor_info")      
 
-    def set_pipe_active(self, pipe_id, active):
+    def set_pipe_active(self, pipe_id, active, redraw=True):
         pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
         if not pipe:
             return
@@ -7160,20 +9474,43 @@ class PreviewPage(ttk.Frame):
         for node in (start_node, end_node):
             if node and len(node.connected_pipes) == 1:
                 node.is_active = active
-        self.redraw()
-        self._refresh_other_pages()
+        if redraw:
+            self.redraw()
+            self._refresh_other_pages()
     
     def set_selected_pipes_active(self, active):
+        # 批量处理时逐根跳过重绘，循环结束后统一重绘一次（避免 N 根管道重绘 N 次）
         for pid in self.selected_pipes:
-            self.set_pipe_active(pid, active)
+            self.set_pipe_active(pid, active, redraw=False)
         self.redraw()
+        self._refresh_other_pages()
     
     def delete_pipe(self, pipe_id, record=True):
         pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
         if not pipe:
             return
-        if record:
-            self._record_change('delete', pipe, obj_type='pipe')
+        # 消火栓支管（B 型 is_hydrant_branch）：记录末端消火栓与中间节点，
+        # 删除管道后连带删除消火栓、自动合并立管段、清理孤立末端节点
+        is_hydrant_branch_pipe = (self.cad_data_manager.id_type(pipe_id) == "B"
+                                  and getattr(pipe, 'is_hydrant_branch', False))
+        attached_hydrants = []
+        mid_node = None
+        end_node = self.cad_data_manager.node_by_id.get(pipe.end_node_id)
+        if is_hydrant_branch_pipe:
+            mid_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
+            if end_node:
+                for hid in list(end_node.hydrants):
+                    h = self.cad_data_manager.hydrant_by_id.get(hid)
+                    if h and h not in attached_hydrants:
+                        attached_hydrants.append(h)
+        if record and not is_hydrant_branch_pipe:
+            # 删除前快照关联的连接点（用于undo恢复）
+            removed_cps = []
+            for nid in (pipe.start_node_id, pipe.end_node_id):
+                for cp in self.cad_data_manager.connection_points:
+                    if cp.node_id == nid and cp not in removed_cps:
+                        removed_cps.append(cp)
+            self._record_change('delete', pipe, obj_type='pipe', connection_points=removed_cps)
         
         # 从节点连接列表中移除
         start_node = self.cad_data_manager.node_by_id.get(pipe.start_node_id)
@@ -7192,7 +9529,7 @@ class PreviewPage(ttk.Frame):
         del self.cad_data_manager.pipe_by_id[pipe_id]
         
         # 如果是立管管道，同步删除对应的立管对象
-        if pipe_id.startswith('R_'):
+        if self.cad_data_manager.id_type(pipe_id) == "R":
             riser = self.cad_data_manager.riser_by_id.get(pipe_id)
             if riser:
                 # 从楼层立管列表中移除（如果有 floor.risers 属性）
@@ -7207,7 +9544,76 @@ class PreviewPage(ttk.Frame):
             # 重新计算重复立管信息
             self.cad_data_manager.check_duplicate_risers_in_floor()
             self.duplicate_risers_by_floor = self.cad_data_manager.duplicate_risers_by_floor
-            
+        
+        # 清理与此管道端点节点关联的连接点（使用 remove_connection_point 确保配对清理）
+        if start_node:
+            for cp in list(self.cad_data_manager.connection_points):
+                if cp.node_id == start_node.node_id:
+                    self.cad_data_manager.remove_connection_point(cp.point_id)
+        if end_node:
+            for cp in list(self.cad_data_manager.connection_points):
+                if cp.node_id == end_node.node_id:
+                    self.cad_data_manager.remove_connection_point(cp.point_id)
+
+        if is_hydrant_branch_pipe:
+            detach_deleted = [('pipe', pipe)]
+            # 1) 连带删除支管末端挂接的消火栓（纯数据删除，统一记录到 'riser_detach'）
+            for h in attached_hydrants:
+                hnode = self.cad_data_manager.node_by_id.get(h.node_id)
+                if hnode and h.hydrant_id in hnode.hydrants:
+                    hnode.hydrants.remove(h.hydrant_id)
+                if h in self.cad_data_manager.hydrants:
+                    self.cad_data_manager.hydrants.remove(h)
+                self.cad_data_manager.hydrant_by_id.pop(h.hydrant_id, None)
+                if h.floor_name:
+                    hbid = self.cad_data_manager.get_building_by_entity(h.hydrant_id)
+                    hfloor = self.cad_data_manager.lookup_floor(h.floor_name, hbid)
+                    if hfloor and h in hfloor.hydrants:
+                        hfloor.hydrants.remove(h)
+                detach_deleted.append(('hydrant', h))
+
+            # 2) 自动合并立管段（数据层，不单独记录）
+            merged = []
+            if mid_node:
+                segs = [p_id for p_id in mid_node.connected_pipes
+                        if self.cad_data_manager.id_type(p_id) == "R"
+                        and (p_id.endswith("_A") or p_id.endswith("_B"))]
+                if len(segs) == 2:
+                    ok, _reason = self.cad_data_manager.can_merge_riser_segments(segs[0])
+                    if ok:
+                        m_created, m_deleted, m_err = self.cad_data_manager.merge_riser_segments(segs[0])
+                        if not m_err and m_created:
+                            merged = m_created
+                            detach_deleted.extend(m_deleted)
+
+            # 3) 清理支管末端孤立节点（纯删除，不单独记录）
+            if end_node and (not end_node.connected_pipes and not end_node.hydrants
+                    and not any(cp.node_id == end_node.node_id
+                                for cp in self.cad_data_manager.connection_points)):
+                if end_node in self.cad_data_manager.nodes:
+                    self.cad_data_manager.nodes.remove(end_node)
+                self.cad_data_manager.node_by_id.pop(end_node.node_id, None)
+                for floor in self.cad_data_manager.floors:
+                    if end_node in floor.nodes:
+                        floor.nodes.remove(end_node)
+                detach_deleted.append(('node', end_node))
+
+            # 4) 整操作记录为一条 'riser_detach'（一步撤销完整回退，无中间态）。
+            # 无条件记录（含批量删除 record=False）：批量删支管的撤销也完整；
+            # delete_batch 撤销恢复支管时幂等跳过，不冲突。
+            self.undo_stack.append({
+                'type': 'riser_detach',
+                'deleted': detach_deleted,
+                'merged': merged,
+            })
+            self.redo_stack.clear()
+            if len(self.undo_stack) > self.max_undo:
+                self.undo_stack.pop(0)
+
+            # 5) 整体画布投影增量维护（管网视觉位置不动）
+            removed_node_ids = [obj.node_id for t, obj in detach_deleted if t == 'node']
+            self._refresh_global_projection_delta([], removed_node_ids)
+
         self.occlusion_cache_valid = False
         self.redraw()
         self._refresh_other_pages()
@@ -7223,15 +9629,109 @@ class PreviewPage(ttk.Frame):
                 to_delete_pipes.append(pipe)
         if not to_delete_pipes:
             return
-        # 记录批量删除命令
-        self._record_change('delete_batch', to_delete_pipes)
+        # 批量删除前快照所有关联的连接点
+        batch_removed_cps = []
+        for pipe in to_delete_pipes:
+            for nid in (pipe.start_node_id, pipe.end_node_id):
+                for cp in self.cad_data_manager.connection_points:
+                    if cp.node_id == nid and cp not in batch_removed_cps:
+                        batch_removed_cps.append(cp)
+        # 记录批量删除命令（含连接点快照）
+        self._record_change('delete_batch', to_delete_pipes, connection_points=batch_removed_cps)
         # 执行删除（不单独记录）
         for pipe in to_delete_pipes:
             self.delete_pipe(pipe.pipe_id, record=False)
         self.selected_pipes.clear()
         self.occlusion_cache_valid = False
         self.redraw()
-    
+
+    def _add_connection_point_on_node(self, node):
+        """在指定节点上添加连接点（仅区域模式）。"""
+        # 多楼层合并检查：合并楼层标签不允许添加连接点
+        canvas = self._current_canvas
+        if canvas and hasattr(canvas, 'actual_floors') and len(canvas.actual_floors) > 1:
+            self.show_temp_message("请切换到单层标签后再添加连接点（当前为合并楼层）", 3000)
+            return
+        # 孤立管道警告：两端均为自由节点时提示用户
+        if node.connected_pipes:
+            pipe_id = node.connected_pipes[0]
+            pipe = self.cad_data_manager.pipe_by_id.get(pipe_id)
+            if pipe:
+                other_nid = (pipe.start_node_id if pipe.end_node_id == node.node_id
+                             else pipe.end_node_id)
+                other_node = self.cad_data_manager.node_by_id.get(other_nid)
+                if other_node and len(other_node.connected_pipes) == 1:
+                    if not messagebox.askyesno("警告", "该管道两端均为自由节点，可能未连入管网。确定继续添加连接点？", parent=self.winfo_toplevel()):
+                        return
+        building_id = self._current_building_id or ""
+        floor_name = "" if self.current_view_mode == "global" else (self.current_floor_name or "")
+        cad = self.cad_data_manager
+        point_id = cad.add_connection_point(node.node_id, building_id, floor_name)
+        if point_id:
+            self.show_temp_message(f"已添加连接点 {point_id}", 2000)
+            self.update_projection()
+            self.redraw()
+
+    def _delete_connection_point(self, point_id):
+        """删除指定ID的连接点。"""
+        if self.cad_data_manager.remove_connection_point(point_id):
+            self.show_temp_message(f"已删除连接点 {point_id}", 2000)
+            self.update_projection()
+            self.redraw()
+
+    def _delete_connection_point_by_node(self, node_id):
+        """删除指定节点上的连接点。"""
+        cad = self.cad_data_manager
+        for cp in list(cad.connection_points):
+            if cp.node_id == node_id:
+                self._delete_connection_point(cp.point_id)
+                return
+
+    def _add_connection_points_selected(self):
+        """批量添加连接点——在选集中所有自由端节点上添加。"""
+        if not self.selected_pipes:
+            return
+        pipes = [self.cad_data_manager.pipe_by_id[pid] for pid in self.selected_pipes
+                 if pid in self.cad_data_manager.pipe_by_id]
+        free_nodes = self._get_free_end_nodes_from_pipes(pipes)
+        bprefix = self._get_building_prefix()
+        count = 0
+        building_id = (self._current_building_id or "").rstrip("_") if self._current_building_id else ""
+        for node in free_nodes:
+            if bprefix and not node.node_id.startswith(bprefix):
+                continue
+            has_cp = any(cp.node_id == node.node_id for cp in self.cad_data_manager.connection_points)
+            if not has_cp:
+                floor_name = "" if self.current_view_mode == "global" else (self.current_floor_name or "")
+                point_id = self.cad_data_manager.add_connection_point(node.node_id, building_id, floor_name)
+                if point_id:
+                    count += 1
+        if count:
+            self.show_temp_message(f"已添加 {count} 个连接点", 2000)
+            self.update_projection()
+            self.redraw()
+
+    def _delete_connection_points_selected(self):
+        """批量删除连接点——删除选集中所有自由端节点上的连接点。"""
+        if not self.selected_pipes:
+            return
+        pipes = [self.cad_data_manager.pipe_by_id[pid] for pid in self.selected_pipes
+                 if pid in self.cad_data_manager.pipe_by_id]
+        free_nodes = self._get_free_end_nodes_from_pipes(pipes)
+        bprefix = self._get_building_prefix()
+        count = 0
+        for node in free_nodes:
+            if bprefix and not node.node_id.startswith(bprefix):
+                continue
+            for cp in list(self.cad_data_manager.connection_points):
+                if cp.node_id == node.node_id:
+                    self.cad_data_manager.remove_connection_point(cp.point_id)
+                    count += 1
+        if count:
+            self.show_temp_message(f"已删除 {count} 个连接点", 2000)
+            self.update_projection()
+            self.redraw()
+
     def _delete_node(self, node_id):
         node = self.cad_data_manager.node_by_id.get(node_id)
         if not node:
@@ -7267,6 +9767,7 @@ class PreviewPage(ttk.Frame):
         self.velocity_check_var.set(False)
         self.velocity_check_cb.config(state="disabled")
         self._update_hydrant_flat_state()
+        self.update_invalid_controls_state()
         self.highlight_path_pipes = set()
         self.highlight_path_nodes = set()
         self.selected_pipes.clear()
@@ -7280,12 +9781,865 @@ class PreviewPage(ttk.Frame):
         self._next_zone_id = 0
         self._cached_grouped_floors_map = None
         self.floor_view_state.clear()
+        # 销毁所有 building_notebook 子控件，清除区域模式残留 Widget
+        if hasattr(self, 'building_notebook') and self.building_notebook:
+            for child in self.building_notebook.winfo_children():
+                child.destroy()
+        self._building_managers.clear()
+        if self._pairing_dialog:
+            self._pairing_dialog.dialog.destroy()
+            self._pairing_dialog = None
+        self._current_building_id = None
         self.current_floor_name = None
         self.node_pressures = {}
         self.node_flows = {}
         self._destroy_hover_tooltip()
         self.alt_pressed = False
+        self._last_mouse_alt = False
+        if self.cad_data_manager.is_loaded:
+            # 隐藏临时画布
+            if hasattr(self, '_temp_canvas') and self._temp_canvas:
+                if self._temp_canvas.winfo_ismapped():
+                    self._temp_canvas.pack_forget()
+            self._current_canvas = None
+            self.canvas = None
+            self.rebuild_floor_tabs()
+            # 同步缓存，防止 refresh_data 因 _cached_grouped_floors_map=None 触发第二次无用重建
+            self._cached_grouped_floors_map = getattr(self.cad_data_manager, 'grouped_floors_map', {}).copy()
+        else:
+            # 无数据时：隐藏所有 notebook，恢复临时画布占位
+            if self._single_building and self._single_building.floor_notebook:
+                self._single_building.floor_notebook.pack_forget()
+            if hasattr(self, 'building_notebook') and self.building_notebook:
+                self.building_notebook.pack_forget()
+            if hasattr(self, '_temp_canvas') and self._temp_canvas:
+                self._current_canvas = self._temp_canvas
+                self.canvas = self._temp_canvas
+                if not self._temp_canvas.winfo_ismapped():
+                    self._temp_canvas.pack(fill="both", expand=True)
+            self.redraw()
+        self.is_spliced = False
+        self._spliced_canvas = None
+
+    # ── 阶段七：连接点配对辅助方法 ──
+
+    def _get_connection_points_in_selection(self):
+        """返回当前 selected_pipes 中所有自由端节点上的连接点（去重）。"""
+        result = []
+        seen = set()
+        pipes = [self.cad_data_manager.pipe_by_id[pid]
+                 for pid in self.selected_pipes
+                 if pid in self.cad_data_manager.pipe_by_id]
+        free_nodes = self._get_free_end_nodes_from_pipes(pipes)
+        for node in free_nodes:
+            for cp in self.cad_data_manager.connection_points:
+                if cp.node_id == node.node_id and cp.point_id not in seen:
+                    seen.add(cp.point_id)
+                    result.append(cp)
+        return result
+
+    def _add_pair_submenu(self, menu, cp_list, label):
+        """构建「连接点配对」二级/三级菜单。"""
+        current_bid = self._current_building_id or ""
+        targets = {}
+        for cp in self.cad_data_manager.connection_points:
+            if cp.building_id == current_bid or cp.paired_with:
+                continue
+            if cp.building_id not in targets:
+                targets[cp.building_id] = set()
+            targets[cp.building_id].add(cp.floor_name or "")
+
+        if not targets:
+            return
+
+        pair_menu = tk.Menu(menu, tearoff=0)
+        for bid in sorted(targets.keys()):
+            floors = targets[bid]
+            if len(floors) == 1:
+                fname = next(iter(floors))
+                pair_menu.add_command(
+                    label=bid if not fname else f"{bid}（{fname}）",
+                    command=lambda b=bid, f=fname or None: self._open_pair_dialog(cp_list, b, f))
+            else:
+                sub = tk.Menu(pair_menu, tearoff=0)
+                for fname in sorted(floors):
+                    label_txt = fname if fname else "整体管网"
+                    sub.add_command(label=label_txt,
+                        command=lambda b=bid, f=fname or None: self._open_pair_dialog(cp_list, b, f))
+                pair_menu.add_cascade(label=bid, menu=sub)
+        menu.add_cascade(label=label, menu=pair_menu)
+
+    def _open_pair_dialog(self, source_cps, target_bid, target_floor=None):
+        """打开连接点配对对话框。"""
+        if self._pairing_dialog:
+            self._pairing_dialog.dialog.lift()
+            return
+        target_cps = [
+            cp for cp in self.cad_data_manager.connection_points
+            if cp.building_id == target_bid and not cp.paired_with
+            and (target_floor is None or cp.floor_name == target_floor or not cp.floor_name)
+        ]
+        if not target_cps:
+            self.show_temp_message(f"楼栋 {target_bid} 无可用未配对连接点", 2000)
+            return
+        self._pairing_dialog = ConnectionPairingDialog(
+            parent=self,
+            dialog_title=f"{self._current_building_id} ↔ {target_bid}",
+            source_cps=[cp for cp in source_cps if not cp.paired_with],
+            target_cps=target_cps,
+        )
+
+    def _unpair_connection_points(self, cp_list):
+        """解除列表中所有连接点的配对关系。"""
+        cp_ids = {cp.point_id for cp in cp_list}
+        for cp in cp_list:
+            if cp.paired_with:
+                partner = self.cad_data_manager.get_connection_point_by_id(cp.paired_with)
+                if partner:
+                    partner.paired_with = ""
+                    cp_ids.add(partner.point_id)
+                cp.paired_with = ""
+        # 清理涉及这些 CP 的校准矩形框
+        self.cad_data_manager.calibration_rects = [
+            r for r in self.cad_data_manager.calibration_rects
+            if not any(base_id in cp_ids or tgt_id in cp_ids
+                       for base_id, tgt_id in r.pairings)
+        ]
+        self._update_unpaired_count()
         self.redraw()
+
+    def _update_unpaired_count(self):
+        """更新底部未配对连接点统计。"""
+        total = sum(1 for cp in self.cad_data_manager.connection_points if not cp.paired_with)
+        if total:
+            self.unpaired_label.config(text=f"未配对连接点总数：{total}")
+        else:
+            self.unpaired_label.config(text="")
+
+    # ── 阶段十辅助方法 ──
+
+    def _delete_calibration_for_cp(self, cp, rect):
+        """删除整个目标单体的所有校准条目（清空 calib_dx/dy，保留配对关系）。"""
+        cad = self.cad_data_manager
+        target_bid = rect.target_building_id
+        base_bid = rect.base_building_id
+        to_delete = [r for r in cad.calibration_rects
+                     if r.base_building_id == base_bid and r.target_building_id == target_bid]
+        for dr in to_delete:
+            for base_id, tgt_id in dr.pairings:
+                for cid in (base_id, tgt_id):
+                    c = cad.get_connection_point_by_id(cid)
+                    if c:
+                        c.calib_dx = c.calib_dy = 0.0
+        cad.calibration_rects = [r for r in cad.calibration_rects if r not in to_delete]
+        self.redraw()
+
+    def _check_rect_distances_ok(self, rect):
+        """检查校准条目中所有配对距离是否 ≥ 0.1m。"""
+        cad = self.cad_data_manager
+        for base_cp_id, tgt_cp_id in rect.pairings:
+            bcp = cad.get_connection_point_by_id(base_cp_id)
+            tcp = cad.get_connection_point_by_id(tgt_cp_id)
+            if not bcp or not tcp:
+                continue
+            vx = tcp.x * math.cos(math.radians(rect.transform_angle)) - tcp.y * math.sin(math.radians(rect.transform_angle)) + rect.transform_dx
+            vy = tcp.x * math.sin(math.radians(rect.transform_angle)) + tcp.y * math.cos(math.radians(rect.transform_angle)) + rect.transform_dy
+            dist_m = math.sqrt((bcp.x - vx) ** 2 + (bcp.y - vy) ** 2 + (bcp.z - tcp.z) ** 2) / 1000.0
+            if dist_m < 0.1:
+                return False
+        return True
+
+    def _get_cp_pipe_dir(self, cp):
+        """提取连接点所在管道的方向单位向量（连接点节点 → 管道另一端）。
+
+        返回 (dx, dy) 单位向量；无有效管道时返回 None。
+        供自动放置/拼接的方向平行约束使用（与 Shift 拖动方向逻辑一致）。
+        """
+        cad = self.cad_data_manager
+        node = cad.node_by_id.get(cp.node_id)
+        if not node:
+            return None
+        for nid in node.connected_pipes:
+            pipe = cad.pipe_by_id.get(nid)
+            if not pipe:
+                continue
+            other_nid = (pipe.start_node_id if pipe.end_node_id == node.node_id
+                         else pipe.end_node_id)
+            other = cad.node_by_id.get(other_nid)
+            if other:
+                dx = other.x - node.x
+                dy = other.y - node.y
+                dlen = math.hypot(dx, dy)
+                if dlen > 0.001:
+                    return (dx / dlen, dy / dlen)
+        return None
+
+    def _on_calib_shift_click(self, event):
+        """Shift+左键点击校准连接点 → 若该CP有rect且未校准，开始拖动。"""
+        canvas = self.canvas
+        canvas_x = canvas.canvasx(event.x)
+        canvas_y = canvas.canvasy(event.y)
+        cad = self.cad_data_manager
+
+        cp_dist, clicked_cp = self._find_nearest_connection_point((canvas_x, canvas_y))
+        if cp_dist >= 15 or not clicked_cp:
+            self.show_temp_message(f"Shift: 未找到CP (mindist={cp_dist:.0f})", 1500)
+            return
+        clicked_rect = cad.get_calibration_rect_for_cp(clicked_cp.point_id)
+        if not clicked_rect:
+            self.show_temp_message(f"Shift: CP无rect", 1500)
+            return
+        if clicked_rect.is_calibrated:
+            self.show_temp_message(f"Shift: 已校准", 1500)
+            return
+        self.show_temp_message(f"Shift: OK CP={clicked_cp.point_id}", 1500)
+
+        # 查找管道方向向量（目标方用虚拟空间方向，基准方用原始方向）
+        node = cad.node_by_id.get(clicked_cp.node_id)
+        if not node:
+            self.show_temp_message("Shift: 无node", 1500)
+            return
+        dir_vec = None
+        is_target = clicked_cp.building_id != clicked_rect.base_building_id
+        for nid in node.connected_pipes:
+            pipe = cad.pipe_by_id.get(nid)
+            if not pipe:
+                continue
+            other_nid = (pipe.start_node_id if pipe.end_node_id == node.node_id
+                         else pipe.end_node_id)
+            other = cad.node_by_id.get(other_nid)
+            if other:
+                if is_target:
+                    a = clicked_rect.transform_angle
+                    r = math.radians(a)
+                    def _v(x, y):
+                        if a != 0:
+                            return (x*math.cos(r)-y*math.sin(r)+clicked_rect.transform_dx,
+                                    x*math.sin(r)+y*math.cos(r)+clicked_rect.transform_dy)
+                        else:
+                            return (x+clicked_rect.transform_dx, y+clicked_rect.transform_dy)
+                    v_cp = _v(clicked_cp.x, clicked_cp.y)
+                    v_ot = _v(other.x, other.y)
+                    dx = v_ot[0] - v_cp[0]
+                    dy = v_ot[1] - v_cp[1]
+                else:
+                    dx = other.x - node.x
+                    dy = other.y - node.y
+                dlen = math.hypot(dx, dy)
+                if dlen > 0.001:
+                    dir_vec = (dx / dlen, dy / dlen)
+                    break
+        if dir_vec is None:
+            self.show_temp_message("Shift: 无dir", 1500)
+            return
+        self._calib_drag = (clicked_rect, clicked_cp, dir_vec)
+
+    def _on_calib_shift_drag(self, event):
+        """Shift+左键拖动 → 修改被拖CP个体的 calib_dx/dy。"""
+        if self._calib_drag is None:
+            return
+        rect, cp, (dir_x, dir_y) = self._calib_drag
+        if not hasattr(self, '_calib_last_mouse'):
+            self._calib_last_mouse = (event.x, event.y)
+            self._calib_drag_accum = 0.0
+        dx_px = event.x - self._calib_last_mouse[0]
+        dy_px = event.y - self._calib_last_mouse[1]
+        self._calib_last_mouse = (event.x, event.y)
+        proj = dx_px * dir_x - dy_px * dir_y
+        if abs(proj) < 1:
+            return
+        scale = self.scale
+        if scale < 0.001:
+            return
+        self._calib_drag_accum += proj / scale
+        step_rounded = round(self._calib_drag_accum / 100.0) * 100.0
+        if abs(step_rounded) < 100:
+            return
+        self._calib_drag_accum -= step_rounded
+        cp.calib_dx += step_rounded * dir_x
+        cp.calib_dy += step_rounded * dir_y
+        self.redraw()
+
+    def _on_calib_shift_release(self, event):
+        """Shift+左键释放 → 清理拖拽状态。"""
+        self._calib_drag = None
+        if hasattr(self, '_calib_last_mouse'):
+            del self._calib_last_mouse
+        if hasattr(self, '_calib_drag_accum'):
+            del self._calib_drag_accum
+
+    # ── 阶段九：校准配对 ──
+
+    def _zt_has_pending_work(self):
+        """ZT 是否有未完成的校准配对或管网拼接。"""
+        cad = self.cad_data_manager
+        for cp in cad.connection_points:
+            if cp.building_id == "ZT" and cp.paired_with:
+                if not cad.get_calibration_rect_for_cp(cp.point_id):
+                    return True
+        for rect in cad.calibration_rects:
+            # ZT 有未拼接的校准条目即视为未完成工作（新流程下校准随拼接完成）
+            if rect.base_building_id == "ZT" and not rect.is_spliced:
+                return True
+        return False
+
+    def _is_building_base(self, bid):
+        """检查指定楼栋是否可作为拼接基准（坐标不动）。"""
+        if bid == "ZT":
+            return True
+        bd = self.cad_data_manager.building_data.get(bid, {})
+        if bd.get("is_spliced"):
+            return True
+        return bd.get("is_base", False)
+
+    def _check_calibrate_conditions(self):
+        """检查「校准配对」菜单显示条件。返回 (can_show, hint)。"""
+        cad = self.cad_data_manager
+        if not cad.building_order:
+            return False, ""
+        if self.current_view_mode != "floor":
+            return False, ""
+        bid = self._active_building.building_id if self._active_building else None
+        if not bid:
+            return False, ""
+        if not self._is_building_base(bid):
+            return False, ""
+        # ZT 有未完成工作时，非 ZT 单体屏蔽校准菜单
+        if "ZT" in cad.building_data and bid != "ZT" and self._zt_has_pending_work():
+            return False, "请先在室外管网完成所有校准配对和管网拼接"
+        # 无 ZT 且全项目无基准单体 → 不可校准
+        if "ZT" not in cad.building_data:
+            if not any(bd.get("is_base") for bd in cad.building_data.values()):
+                return False, "请先在楼栋标签上设置基准管网"
+        cur_floor = self.current_floor_name
+        if not cur_floor:
+            return False, ""
+        # 条件3：当前楼层存在已配对连接点
+        has_paired = False
+        for cp in cad.connection_points:
+            if cp.building_id == bid and cp.floor_name == cur_floor and cp.paired_with:
+                has_paired = True
+                break
+        if not has_paired:
+            return False, ""
+        # 条件4：全局所有连接点均已配对
+        if any(not cp.paired_with for cp in cad.connection_points):
+            return False, "尚有未配对的连接点"
+        # 条件5：是否存在已配对但尚无校准条目的连接点
+        has_paired_without_rect = False
+        for cp in cad.connection_points:
+            if cp.building_id == bid and cp.floor_name == cur_floor and cp.paired_with:
+                if not cad.get_calibration_rect_for_cp(cp.point_id):
+                    has_paired_without_rect = True
+                    break
+        if not has_paired_without_rect:
+            return False, ""
+        # 条件6：若配对面全是 ZT 且 ZT 未校准 → 先去 ZT 楼层执行校准
+        all_to_zt = True
+        for cp in cad.connection_points:
+            if cp.building_id == bid and cp.floor_name == cur_floor and cp.paired_with:
+                partner = cad.get_connection_point_by_id(cp.paired_with)
+                if partner and partner.building_id != "ZT":
+                    all_to_zt = False
+                    break
+        if all_to_zt:
+            zt_rects = cad.get_calibration_rects_for_floor("ZT", cur_floor)
+            if not zt_rects or not all(r.is_calibrated for r in zt_rects):
+                return False, "应先到室外管网平面完成校准并拼接"
+        return True, ""
+
+    def _build_calibrate_menu(self, menu):
+        """将「校准配对」菜单项加入右键菜单（条件满足时）。"""
+        can_show, hint = self._check_calibrate_conditions()
+        if can_show:
+            menu.add_separator()
+            menu.add_command(label="校准配对", command=self._execute_calibrate)
+        elif hint:
+            menu.add_separator()
+            menu.add_command(label=f"校准配对（{hint}）", state="disabled")
+
+    def _execute_calibrate(self):
+        """执行校准配对：仅对尚无校准条目的配对生成 rect。"""
+        from cad_data_manager import CalibrationRectData
+        cad = self.cad_data_manager
+        bid = self._active_building.building_id if self._active_building else None
+        if not bid:
+            return
+        cur_floor = self.current_floor_name
+        groups = {}
+        for cp in cad.connection_points:
+            if cp.building_id != bid or cp.floor_name != cur_floor:
+                continue
+            if not cp.paired_with:
+                continue
+            partner = cad.get_connection_point_by_id(cp.paired_with)
+            if not partner:
+                continue
+            key = (partner.building_id, partner.floor_name or "")
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((cp, partner))
+        if not groups:
+            self.show_temp_message("当前楼层无可配对的连接点", 2000)
+            return
+        count = 0
+        for (tgt_bid, tgt_floor), pairs in groups.items():
+            # 过滤：只取尚无 rect 的配对
+            new_pairs = [(cp, partner) for cp, partner in pairs
+                         if not cad.get_calibration_rect_for_cp(cp.point_id)]
+            if not new_pairs:
+                continue
+            rect_id = f"calib_{bid}_{tgt_bid}_{tgt_floor}_{len(cad.calibration_rects)}"
+            rect = CalibrationRectData(
+                rect_id=rect_id,
+                base_building_id=bid,
+                target_building_id=tgt_bid,
+                target_floor_name=tgt_floor,
+                pairings=[(cp.point_id, partner.point_id) for cp, partner in new_pairs]
+            )
+            for floor in cad.floors:
+                if floor.building_id == tgt_bid and floor.name == tgt_floor:
+                    if floor.rect_min and floor.rect_max:
+                        rect.rect_min_x = floor.rect_min[0]
+                        rect.rect_min_y = floor.rect_min[1]
+                        rect.rect_max_x = floor.rect_max[0]
+                        rect.rect_max_y = floor.rect_max[1]
+                    break
+            self._auto_place_rect(rect)
+            # 生成的校准条目保持"未校准"状态，用户可用 Shift+左键拖动微调
+            cad.add_calibration_rect(rect)
+            count += 1
+        if count:
+            self.show_temp_message(f"已生成 {count} 个校准条目", 2000)
+        else:
+            self.show_temp_message("当前所有配对已有校准条目", 2000)
+        self.redraw()
+
+    def _splice_network(self, rect):
+        """管网拼接：整体移动目标单体坐标，生成连接管。"""
+        cad = self.cad_data_manager
+        base_bid = rect.base_building_id
+        target_bid = rect.target_building_id
+
+        if rect.is_spliced:
+            messagebox.showinfo("提示", "该校准配对已拼接")
+            return
+
+        # 拼接前置校验：所有配对距离须 ≥ 0.1m（即用户已完成 Shift 拖动微调）。
+        # 未拖动（距离 < 0.1m）时拦截，防止错位拼接。
+        if not self._check_rect_distances_ok(rect):
+            self.show_temp_message("配对距离 < 0.1m，请先Shift拖动调整连接点位置", 2000)
+            return
+
+        # A: 落实两侧校准拖拽 calib_dx/dy 到节点坐标（归零，使校准线位置正确）
+        affected_pipe_ids = set()
+        for base_cp_id, tgt_cp_id in rect.pairings:
+            for cp_id in (base_cp_id, tgt_cp_id):
+                cp = cad.get_connection_point_by_id(cp_id)
+                if cp and (cp.calib_dx != 0 or cp.calib_dy != 0):
+                    node = cad.node_by_id.get(cp.node_id)
+                    if node:
+                        node.x += cp.calib_dx
+                        node.y += cp.calib_dy
+                        cp.calib_dx = 0.0
+                        cp.calib_dy = 0.0
+                        for pid in node.connected_pipes:
+                            affected_pipe_ids.add(pid)
+
+        # 阀门重定位：被 calib 移动了的管道上的阀门回到管道中点
+        for pid in affected_pipe_ids:
+            pipe = cad.pipe_by_id.get(pid)
+            if not pipe:
+                continue
+            for v in cad.valves:
+                if v.pipe_id == pid:
+                    sn = cad.node_by_id.get(pipe.start_node_id)
+                    en = cad.node_by_id.get(pipe.end_node_id)
+                    if sn and en:
+                        v.x = (sn.x + en.x) / 2
+                        v.y = (sn.y + en.y) / 2
+                        v.z = (sn.z + en.z) / 2
+                        v.distance_on_pipe = 0.5
+                    break
+
+        # 同步所有 CP 坐标到节点
+        for cp in cad.connection_points:
+            node = cad.node_by_id.get(cp.node_id)
+            if node:
+                cp.x, cp.y, cp.z = node.x, node.y, node.z
+
+        # A2: 重算基准侧被 Step A 移动的管道（目标侧在 Step C 后由 D1 重算）
+        prefix = target_bid + "_"
+        for pid in affected_pipe_ids:
+            pipe = cad.pipe_by_id.get(pid)
+            if pipe and not pipe.pipe_id.startswith(prefix):
+                sn = cad.node_by_id.get(pipe.start_node_id)
+                en = cad.node_by_id.get(pipe.end_node_id)
+                if sn and en:
+                    pipe.start_point = (sn.x, sn.y, sn.z)
+                    pipe.end_point = (en.x, en.y, en.z)
+
+        # B: 目标单体坐标应用完整刚体变换（旋转+平移，与校准虚线 _virt 完全一致）。
+        # 原来仅用平均平移（angle 不落地），导致拼接后单体不旋转、与虚线显示不一致。
+        td_x = rect.transform_dx
+        td_y = rect.transform_dy
+        t_a = rect.transform_angle
+        rad = math.radians(t_a)
+
+        def _apply_pt(x, y):
+            if t_a != 0:
+                return (x * math.cos(rad) - y * math.sin(rad) + td_x,
+                        x * math.sin(rad) + y * math.cos(rad) + td_y)
+            return (x + td_x, y + td_y)
+
+        # C0: 检查是否需要跳过坐标移动（目标也是基准单体时不移动）
+        skip_move = self._is_building_base(target_bid)
+
+        if not skip_move:
+            # C: 应用刚体变换到节点坐标（唯一坐标源）
+            for node in cad.nodes:
+                if node.node_id.startswith(prefix):
+                    node.x, node.y = _apply_pt(node.x, node.y)
+
+            # C2: 拼接后校准变换清零
+            rect.transform_dx = rect.transform_dy = rect.transform_angle = 0.0
+
+            # D: 派生数据同步
+            # D1: 管道——从节点重算坐标
+            for pipe in cad.pipes:
+                if pipe.pipe_id.startswith(prefix):
+                    sn = cad.node_by_id.get(pipe.start_node_id)
+                    en = cad.node_by_id.get(pipe.end_node_id)
+                    if sn and en:
+                        pipe.start_point = (sn.x, sn.y, sn.z)
+                        pipe.end_point = (en.x, en.y, en.z)
+
+            # D2: 消火栓
+            for h in cad.hydrants:
+                if h.hydrant_id.startswith(prefix):
+                    h.x, h.y = _apply_pt(h.x, h.y)
+
+            # D3: 阀门
+            for v in cad.valves:
+                if v.valve_id.startswith(prefix):
+                    v.x, v.y = _apply_pt(v.x, v.y)
+
+            # D4: 立管
+            for r in cad.risers:
+                if r.riser_id.startswith(prefix):
+                    r.x, r.y = _apply_pt(r.x, r.y)
+                    r.note_x, r.note_y = _apply_pt(r.note_x, r.note_y)
+
+            # D5: 连接点
+            for cp in cad.connection_points:
+                if cp.building_id == target_bid:
+                    node = cad.node_by_id.get(cp.node_id)
+                    if node:
+                        cp.x, cp.y, cp.z = node.x, node.y, node.z
+
+            # D6: 楼层数据
+            for floor in cad.floors:
+                if floor.building_id == target_bid:
+                    ap = floor.align_point
+                    ax, ay = _apply_pt(ap[0], ap[1])
+                    floor.align_point = (ax, ay, ap[2])
+                    floor.rect_min = _apply_pt(floor.rect_min[0], floor.rect_min[1])
+                    floor.rect_max = _apply_pt(floor.rect_max[0], floor.rect_max[1])
+                    if floor.rect_corners:
+                        floor.rect_corners = [list(_apply_pt(c[0], c[1])) for c in floor.rect_corners]
+        else:
+            # 不移动坐标时仍清零变换（校准已被消费）
+            rect.transform_dx = rect.transform_dy = rect.transform_angle = 0.0
+
+        # E: 生成连接管
+        config = self.config_manager.get_live_config()
+        drawing_unit = config.get("drawing_unit", "毫米")
+        unit_factor = cad.unit_factors.get(drawing_unit, 0.001)
+        pipe_num = cad.get_next_connection_pipe_number(base_bid)
+
+        for base_cp_id, target_cp_id in rect.pairings:
+            bcp = cad.get_connection_point_by_id(base_cp_id)
+            tcp = cad.get_connection_point_by_id(target_cp_id)
+            if not bcp or not tcp:
+                continue
+            bn = cad.node_by_id.get(bcp.node_id)
+            tn = cad.node_by_id.get(tcp.node_id)
+            if not bn or not tn:
+                continue
+
+            dn_list = []
+            for nid in bn.connected_pipes:
+                p = cad.pipe_by_id.get(nid)
+                if p:
+                    dn_list.append(cad.parse_dn_to_float(p.nominal_diameter))
+            for nid in tn.connected_pipes:
+                p = cad.pipe_by_id.get(nid)
+                if p:
+                    dn_list.append(cad.parse_dn_to_float(p.nominal_diameter))
+            max_dn = max(dn_list) if dn_list else 0.0
+
+            conn = PipeData(
+                pipe_id=f"{base_bid}_C_{pipe_num:03d}",
+                start_node_id=bn.node_id,
+                end_node_id=tn.node_id,
+                start_point=(bn.x, bn.y, bn.z),
+                end_point=(tn.x, tn.y, tn.z),
+                nominal_diameter=f"DN{int(max_dn)}" if max_dn > 0 else "",
+                pipe_type="连接管",
+                is_active=True,
+            )
+            if conn.nominal_diameter:
+                material = config.get("pipe_material", "镀锌钢管")
+                dinfo = self.material_manager.get_diameter_info(material, conn.nominal_diameter)
+                if dinfo and dinfo.get("inner", 0) > 0:
+                    conn.inner_diameter = dinfo["inner"]
+            sx, sy, sz = conn.start_point
+            ex, ey, ez = conn.end_point
+            conn.raw_length = math.hypot(ex - sx, ey - sy, ez - sz)
+            conn.length = conn.raw_length * unit_factor
+
+            cad.pipes.append(conn)
+            cad.pipe_by_id[conn.pipe_id] = conn
+            bn.connected_pipes.append(conn.pipe_id)
+            tn.connected_pipes.append(conn.pipe_id)
+            # 加入基准楼层 floor.pipes，使楼层视图可见
+            for f in cad.floors:
+                if f.building_id == base_bid:
+                    f_z_mm = f.pipe_z_offset / unit_factor
+                    if abs(bn.z - f_z_mm) < 10.0:
+                        if not any(p.pipe_id == conn.pipe_id for p in f.pipes):
+                            f.pipes.append(conn)
+                        break
+            pipe_num += 1
+
+        # F: 标记已拼接 + 基准属性
+        cad.building_data[target_bid]["is_spliced"] = True
+        cad.building_data[target_bid]["base_building_id"] = base_bid
+        rect.is_spliced = True
+        # 拼接即校准结束：拼接后该配对禁止再调节连接点位置（Shift拖动被 _on_calib_shift_click 拦截）
+        rect.is_calibrated = True
+
+        # G: 清缓存 + 刷新
+        self._global_cache_key = None
+        self._global_projected_coords.clear()
+        self.update_projection()
+        self.redraw()
+        self._update_spliced_tab()
+        self.show_temp_message(f"管网拼接完成：{target_bid} → {base_bid}", 3000)
+
+    def _auto_place_rect(self, rect):
+        """对单个矩形框执行自动放置算法（平移+旋转，管线方向优先）。
+
+        旋转角 = 管线方向对齐角（目标方引入管方向与基准方供水管方向之差，消歧同向），
+        平移 = 连接点质心对齐（单对时沿基准方方向外移 100mm）。
+        连接点位置残差（画图偏差所致）由用户 Shift+左键拖动微调。
+        仅计算并存储变换参数 (transform_dx/dy/angle)，不修改实际坐标。
+        坐标修改仅在最终"连接"操作时执行。
+        """
+        # 双方均为基准单体 → 不自动放置，transform 清零
+        if self._is_building_base(rect.base_building_id) and self._is_building_base(rect.target_building_id):
+            rect.transform_dx = rect.transform_dy = rect.transform_angle = 0.0
+            return
+        from cad_data_manager import solve_kabsch_2d, single_pair_placement
+        cad = self.cad_data_manager
+
+        base_pts, tgt_pts = [], []
+        pair_infos = []
+        for base_cp_id, tgt_cp_id in rect.pairings:
+            bcp = cad.get_connection_point_by_id(base_cp_id)
+            tcp = cad.get_connection_point_by_id(tgt_cp_id)
+            if not bcp or not tcp:
+                continue
+            base_pts.append((bcp.x, bcp.y))
+            tgt_pts.append((tcp.x, tcp.y))
+            pair_infos.append((bcp, tcp))
+        if not pair_infos:
+            return
+
+        # 方向优先：旋转角 = 平均"从目标方方向到基准方方向"的有符号角（消歧同向）
+        dir_diffs = []
+        for bcp, tcp in pair_infos:
+            bdir = self._get_cp_pipe_dir(bcp)
+            tdir = self._get_cp_pipe_dir(tcp)
+            if bdir is None or tdir is None:
+                continue
+            if bdir[0] * tdir[0] + bdir[1] * tdir[1] < 0:
+                tdir = (-tdir[0], -tdir[1])
+            # 从 tdir 到 bdir 的有符号角（度）：旋转 tdir 使方向与 bdir 平行
+            diff = math.degrees(math.atan2(
+                tdir[0] * bdir[1] - tdir[1] * bdir[0],
+                tdir[0] * bdir[0] + tdir[1] * bdir[1]))
+            dir_diffs.append(diff)
+
+        if dir_diffs:
+            angle = sum(dir_diffs) / len(dir_diffs)
+            rad = math.radians(angle)
+
+            def _rot(p):
+                return (p[0] * math.cos(rad) - p[1] * math.sin(rad),
+                        p[0] * math.sin(rad) + p[1] * math.cos(rad))
+
+            if len(base_pts) == 1:
+                # 单对：连接点目标沿基准方供水管方向外移 100mm（保持共线不重叠语义）
+                bcp = pair_infos[0][0]
+                bdir = self._get_cp_pipe_dir(bcp)
+                if bdir is not None:
+                    n = (bcp.x - bdir[0] * 100.0, bcp.y - bdir[1] * 100.0)
+                    rp = _rot(tgt_pts[0])
+                    dx = n[0] - rp[0]
+                    dy = n[1] - rp[1]
+                else:
+                    dx = dy = 0.0
+            else:
+                # 多对：旋转后目标连接点质心对齐到基准连接点质心
+                cb = (sum(p[0] for p in base_pts) / len(base_pts),
+                      sum(p[1] for p in base_pts) / len(base_pts))
+                ct = (sum(p[0] for p in tgt_pts) / len(tgt_pts),
+                      sum(p[1] for p in tgt_pts) / len(tgt_pts))
+                rt = _rot(ct)
+                dx = cb[0] - rt[0]
+                dy = cb[1] - rt[1]
+        elif len(base_pts) >= 2:
+            # 无有效方向：回退纯点 Kabsch（历史行为）
+            dx, dy, angle = solve_kabsch_2d(base_pts, tgt_pts)
+        elif len(base_pts) == 1:
+            # 无有效方向：回退共线拉直 100mm（历史行为）
+            bcp, tcp = pair_infos[0]
+            pipe_dir = self._get_cp_pipe_dir(bcp)
+            dx, dy, dz = single_pair_placement(
+                (bcp.x, bcp.y, bcp.z), (tcp.x, tcp.y, tcp.z), pipe_dir)
+            angle = 0.0
+        else:
+            return
+        rect.transform_dx = dx
+        rect.transform_dy = dy
+        rect.transform_angle = angle
+        # 不修改实际坐标——坐标修改仅在最终"连接"操作时执行
+
+    def draw_calibration_rects(self):
+        """在基准方画布上绘制校准视觉元素（橙色虚线管道+绿色CP，叠加个体偏移calib_dx/dy）。"""
+        cad = self.cad_data_manager
+        if not cad.building_order:
+            return
+        bid = self._active_building.building_id if self._active_building else None
+        if not bid:
+            return
+        canvas = self._current_canvas
+        if not canvas:
+            return
+        canvas.delete("calibration_rect")
+        for rect in cad.calibration_rects:
+            if rect.base_building_id != bid:
+                continue
+            has_floor = False
+            for base_cp_id, _ in rect.pairings:
+                cp = cad.get_connection_point_by_id(base_cp_id)
+                if cp and cp.floor_name == self.current_floor_name:
+                    has_floor = True
+                    break
+            if not has_floor:
+                continue
+
+            dx = rect.transform_dx
+            dy = rect.transform_dy
+            angle = rect.transform_angle
+            rad = math.radians(angle)
+
+            def _virt(x, y):
+                if angle != 0:
+                    nx = x * math.cos(rad) - y * math.sin(rad) + dx
+                    ny = x * math.sin(rad) + y * math.cos(rad) + dy
+                else:
+                    nx = x + dx
+                    ny = y + dy
+                return nx, ny
+
+            # ── 目标方连接点和管道（叠加 calib 偏移）──
+            for base_cp_id, tgt_cp_id in rect.pairings:
+                bcp = cad.get_connection_point_by_id(base_cp_id)
+                tcp = cad.get_connection_point_by_id(tgt_cp_id)
+                if not bcp or not tcp:
+                    continue
+
+                # 目标方CP：_virt(原始) + calib 个体偏移
+                vx, vy = _virt(tcp.x, tcp.y)
+                tvx = vx + tcp.calib_dx
+                tvy = vy + tcp.calib_dy
+                ttx, tty = self.project_point(tvx, tvy, tcp.z)
+                tcx, tcy = self.world_to_canvas(ttx, tty)
+
+                # 目标方管道：另一端固定于 _virt(other)，CP端移动
+                node = cad.node_by_id.get(tcp.node_id)
+                if node:
+                    for pipe in cad.pipes:
+                        other_nid = None
+                        if pipe.start_node_id == tcp.node_id:
+                            other_nid = pipe.end_node_id
+                        elif pipe.end_node_id == tcp.node_id:
+                            other_nid = pipe.start_node_id
+                        if other_nid:
+                            other = cad.node_by_id.get(other_nid)
+                            if other:
+                                ovx, ovy = _virt(other.x, other.y)
+                                otx, oty = self.project_point(ovx, ovy, other.z)
+                                ocx, ocy = self.world_to_canvas(otx, oty)
+                                canvas.create_line(
+                                    tcx, tcy, ocx, ocy,
+                                    fill="#CC6600", width=2, dash=(4, 4),
+                                    tags=("calibration_rect", f"calib_pipe_{tcp.point_id}", f"calib_cp_{tcp.point_id}"))
+                                break
+
+                # 基准方CP位置（应用 calib 偏移）
+                bvx = bcp.x + bcp.calib_dx
+                bvy = bcp.y + bcp.calib_dy
+                btx, bty = self.project_point(bvx, bvy, bcp.z)
+                bcx, bcy = self.world_to_canvas(btx, bty)
+
+                # 基准方管道覆盖：仅当基准方CP被拖动过（calib != 0）才画橙色虚线
+                if bcp.calib_dx != 0.0 or bcp.calib_dy != 0.0:
+                    bnode = cad.node_by_id.get(bcp.node_id)
+                    if bnode:
+                        for bp in cad.pipes:
+                            b_other_nid = None
+                            if bp.start_node_id == bcp.node_id:
+                                b_other_nid = bp.end_node_id
+                            elif bp.end_node_id == bcp.node_id:
+                                b_other_nid = bp.start_node_id
+                            if b_other_nid:
+                                b_other = cad.node_by_id.get(b_other_nid)
+                                if b_other:
+                                    botx, boty = self.project_point(b_other.x, b_other.y, b_other.z)
+                                    bocx, bocy = self.world_to_canvas(botx, boty)
+                                    canvas.create_line(
+                                        bcx, bcy, bocx, bocy,
+                                        fill="#CC6600", width=2, dash=(4, 4),
+                                        tags=("calibration_rect", f"calib_pipe_{bcp.point_id}", f"calib_cp_{bcp.point_id}"))
+                                    break
+
+                # 目标方连接点（绿色圆点，带CP ID tag）
+                canvas.create_oval(
+                    tcx - 5, tcy - 5, tcx + 5, tcy + 5,
+                    fill="#32CD32", outline="#006400", width=1,
+                    tags=("calibration_rect", f"calib_cp_{tcp.point_id}"))
+
+                # 距离标签（基准方偏移后位置 → 目标方偏移后位置）
+                midx = (bcx + tcx) / 2
+                midy = (bcy + tcy) / 2
+                dx_m = (tvx - bvx) / 1000.0
+                dy_m = (tvy - bvy) / 1000.0
+                dz_m = (tcp.z - bcp.z) / 1000.0
+                dist_m = math.sqrt(dx_m ** 2 + dy_m ** 2 + dz_m ** 2)
+                canvas.create_text(
+                    midx, midy - 10,
+                    text=f"ΔX={dx_m:.3f} ΔY={dy_m:.3f} ΔZ={dz_m:.3f}",
+                    fill="white", font=("Arial", 14), anchor="s",
+                    tags="calibration_rect")
+                if dist_m < 0.1:
+                    canvas.create_text(
+                        midx, midy + 10,
+                        text="⚠", fill="red",
+                        font=("Arial", 16, "bold"), anchor="n",
+                        tags="calibration_rect")
 
     def get_state_for_export(self) -> dict:
         """返回预览页面完整状态，供导出使用。"""
@@ -7294,6 +10648,8 @@ class PreviewPage(ttk.Frame):
             "color_list": self.layer_color_list,
             "floor_color_map": self.floor_color_map,
             "pipe_floor_map": self.pipe_floor_map,
+            "_building_view_angles": self._building_view_angles,
+            "_building_layer_colors_enabled": self._building_layer_colors_enabled,
             "separation_values": self.separation_values,
             "_separation_applied": self._separation_applied,
             "show_nominal": self.show_nominal.get(),
@@ -7304,6 +10660,7 @@ class PreviewPage(ttk.Frame):
             "show_node_ids": self.show_node_ids.get(),
             "show_pipe_id": self.show_pipe_id.get(),
             "show_elevation": self.show_elevation.get(),
+            "show_connection_id_var": self.show_connection_id_var.get(),
             "show_node_pressure": self.show_node_pressure.get(),
             "show_occlusion_var": self.show_occlusion_var.get(),
             "show_riser_warning": self.show_riser_warning.get(),
@@ -7337,6 +10694,17 @@ class PreviewPage(ttk.Frame):
                 for z in self.maintenance_zones
             ],
             "_next_zone_id": self._next_zone_id,
+            "building_states": {
+                bid: {
+                    "current_floor_name": mgr.current_floor_name,
+                    "current_view_mode": mgr.current_view_mode,
+                    "floor_view_state": {
+                        k: list(v) if isinstance(v, tuple) else v
+                        for k, v in mgr.floor_view_state.items()
+                    },
+                }
+                for bid, mgr in self._building_managers.items()
+            },
         }
 
     def restore_imported_state(self, data: dict):
@@ -7353,6 +10721,10 @@ class PreviewPage(ttk.Frame):
             self.pipe_floor_map = data["pipe_floor_map"]
         if "layer_colors_enabled" in data:
             self.layer_colors_enabled.set(data["layer_colors_enabled"])
+        if "_building_view_angles" in data:
+            self._building_view_angles = data["_building_view_angles"]
+        if "_building_layer_colors_enabled" in data:
+            self._building_layer_colors_enabled = data["_building_layer_colors_enabled"]
 
         # 分离值
         if "separation_values" in data:
@@ -7370,6 +10742,7 @@ class PreviewPage(ttk.Frame):
             "show_node_ids": self.show_node_ids,
             "show_pipe_id": self.show_pipe_id,
             "show_elevation": self.show_elevation,
+            "show_connection_id_var": self.show_connection_id_var,
             "show_node_pressure": self.show_node_pressure,
             "show_occlusion_var": self.show_occlusion_var,
             "show_riser_warning": self.show_riser_warning,
@@ -7406,6 +10779,17 @@ class PreviewPage(ttk.Frame):
                 for k, v in data["floor_view_state"].items()
             }
 
+        if "building_states" in data:
+            for bid, st in data["building_states"].items():
+                mgr = self._building_managers.get(bid)
+                if mgr:
+                    mgr.current_floor_name = st.get("current_floor_name")
+                    mgr.current_view_mode = st.get("current_view_mode")
+                    mgr.floor_view_state = {
+                        k: tuple(v) if isinstance(v, list) else v
+                        for k, v in st.get("floor_view_state", {}).items()
+                    }
+
         # 选择集
         self.selected_pipes = set(data.get("selected_pipes", []))
         self.selected_valve_id = data.get("selected_valve_id")
@@ -7427,6 +10811,16 @@ class PreviewPage(ttk.Frame):
                 )
                 for z in data["maintenance_zones"]
             ]
+            # 同步检修区用水点状态（兼容旧版本遗留：node/pipe 已关但 demand_node.status 未同步）
+            for zone in self.maintenance_zones:
+                for nid in zone.node_ids:
+                    n = self.cad_data_manager.node_by_id.get(nid)
+                    if n:
+                        n.status = "关"
+                    for group in self.cad_data_manager.demand_groups.values():
+                        for demand_node in group.demand_nodes:
+                            if demand_node.node_id == nid:
+                                demand_node.status = "关"
         if "_next_zone_id" in data:
             self._next_zone_id = data["_next_zone_id"]
 
@@ -7654,4 +11048,282 @@ class SprinklerCapacityDialog(tk.Toplevel):
         x = px + (pw - w) // 2
         y = py + (ph - h) // 2
         self.geometry(f"+{x}+{y}")
+
+
+class ConnectionPairingDialog:
+    """非模态连接点配对对话框——两列表格，行内直接拖拽排序，勾选配对。"""
+
+    def __init__(self, parent, dialog_title, source_cps, target_cps):
+        self.parent = parent
+        self._timer_id = None
+        self._drag_idx = -1
+        self._drag_side = None
+        self._drag_motion_bind = None
+        self._drag_release_bind = None
+
+        # 构建行数据：来源未配对CP（左列） + 目标未配对CP（右列）
+        src_sorted = sorted(source_cps, key=lambda cp: cp.point_id)
+        tgt_sorted = sorted(target_cps, key=lambda cp: cp.point_id)
+        n = max(len(src_sorted), len(tgt_sorted))
+        self.rows = []
+        for i in range(n):
+            src = src_sorted[i] if i < len(src_sorted) else None
+            tgt = tgt_sorted[i] if i < len(tgt_sorted) else None
+            self.rows.append({
+                "source": src,
+                "target": tgt,
+                "checked": False,
+                "var": tk.BooleanVar(value=False),
+            })
+
+        self.dialog = tk.Toplevel(parent.canvas.winfo_toplevel() if hasattr(parent, 'canvas') else parent)
+        self.dialog.title(dialog_title)
+        self.dialog.transient(parent.canvas.winfo_toplevel() if hasattr(parent, 'canvas') else parent)
+        self.dialog.resizable(False, False)
+        self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 提示行
+        ttk.Label(self.dialog,
+                  text="直接拖拽行：拖拽左侧=重排来源连接点，拖拽右侧=重排目标连接点",
+                  font=("", 9)).pack(padx=10, pady=(10, 0))
+
+        # 列标题
+        col_header = ttk.Frame(self.dialog)
+        col_header.pack(fill="x", padx=15, pady=(5, 0))
+        ttk.Label(col_header, text="来源连接点", font=("Consolas", 9, "bold"),
+                  width=30, anchor="w").pack(side="left", padx=5)
+        ttk.Label(col_header, text="目标连接点", font=("Consolas", 9, "bold"),
+                  width=30, anchor="w").pack(side="left", padx=35)
+        # 滚动行区域
+        outer_frame = ttk.Frame(self.dialog)
+        outer_frame.pack(fill="both", expand=True, padx=10, pady=2)
+
+        self.scroll_canvas = tk.Canvas(outer_frame, highlightthickness=0, width=480, height=280)
+        scrollbar = ttk.Scrollbar(outer_frame, orient="vertical", command=self.scroll_canvas.yview)
+        self.inner_frame = ttk.Frame(self.scroll_canvas)
+        self.inner_frame.bind("<Configure>",
+            lambda e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")))
+        self.scroll_canvas.create_window((0, 0), window=self.inner_frame, anchor="nw")
+        self.scroll_canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self._build_rows()
+
+        # 底部按钮
+        btn_frame = ttk.Frame(self.dialog)
+        btn_frame.pack(fill="x", padx=10, pady=(5, 10))
+        ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side="left", padx=2)
+        ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side="left", padx=2)
+        ttk.Label(btn_frame, text="").pack(side="left", fill="x", expand=True)
+        ttk.Button(btn_frame, text="确认配对", command=self._confirm).pack(side="right", padx=2)
+        ttk.Button(btn_frame, text="取消", command=self._on_close).pack(side="right", padx=2)
+
+        self.dialog.update_idletasks()
+        self._center_dialog()
+        self._start_refresh_timer()
+
+    # ── 行构建 ──
+
+    def _build_rows(self):
+        for child in self.inner_frame.winfo_children():
+            child.destroy()
+        for i, row in enumerate(self.rows):
+            bg = "#e8ffe8" if row["checked"] and row["source"] and row["target"] else "#ffffff"
+
+            rf = tk.Frame(self.inner_frame, bg=bg)
+            rf.pack(fill="x", padx=2, pady=1)
+
+            # 来源连接点（可拖拽）
+            src_text = row["source"].point_id if row["source"] else ""
+            src_font = ("Consolas", 9, "bold") if row["source"] else ("Consolas", 9)
+            src_lbl = tk.Label(rf, text=src_text, width=30, anchor="w", font=src_font, bg=bg)
+            src_lbl.pack(side="left", padx=5)
+            src_lbl.bind("<ButtonPress-1>", lambda e, idx=i, side="source": self._on_drag_start(e, idx, side))
+
+            # 箭头
+            tk.Label(rf, text="→", font=("", 9), bg=bg, fg="#aaa").pack(side="left", padx=5)
+
+            # 目标连接点（可拖拽）
+            tgt_text = row["target"].point_id if row["target"] else ""
+            tgt_lbl = tk.Label(rf, text=tgt_text, width=30, anchor="w", font=("Consolas", 9), bg=bg)
+            tgt_lbl.pack(side="left", padx=5)
+            tgt_lbl.bind("<ButtonPress-1>", lambda e, idx=i, side="target": self._on_drag_start(e, idx, side))
+
+            # 复选框（仅两列都有值时才显示）
+            if row["source"] and row["target"]:
+                ttk.Checkbutton(rf, variable=row["var"],
+                    command=lambda r=row: self._on_check_toggle(r)).pack(side="right", padx=5)
+
+    def _on_check_toggle(self, row):
+        row["checked"] = row["var"].get()
+        self._build_rows()
+
+    # ── 拖拽排序 ──
+
+    def _on_drag_start(self, event, idx, side):
+        """按下标签开始拖拽。side='source'|'target' 由绑定层决定。"""
+        self._drag_idx = idx
+        self._drag_side = side
+
+        # 高亮被拖拽的行
+        children = self.inner_frame.winfo_children()
+        if idx < len(children):
+            children[idx].configure(bg="#d0e0ff")
+            for lbl in children[idx].winfo_children():
+                if isinstance(lbl, tk.Label):
+                    lbl.configure(bg="#d0e0ff")
+
+        # 临时绑定到 dialog 根窗口确保所有事件都能捕获
+        self._drag_motion_bind = self.dialog.bind("<B1-Motion>", self._on_drag_motion)
+        self._drag_release_bind = self.dialog.bind("<ButtonRelease-1>", self._on_drag_end)
+
+    def _on_drag_motion(self, event):
+        """拖拽中：高亮目标行位置。"""
+        if self._drag_idx < 0:
+            return
+        children = self.inner_frame.winfo_children()
+        target_idx = self._row_index_from_y(event.y_root)
+        for i, child in enumerate(children):
+            if i == self._drag_idx:
+                bg = "#d0e0ff"
+            elif i == target_idx and i != self._drag_idx:
+                bg = "#e0ffe0"
+            else:
+                bg = "#e8ffe8" if (self.rows[i]["checked"]
+                    and self.rows[i]["source"] and self.rows[i]["target"]) else "#ffffff"
+            child.configure(bg=bg)
+            for lbl in child.winfo_children():
+                if isinstance(lbl, tk.Label):
+                    lbl.configure(bg=bg)
+
+    def _on_drag_end(self, event):
+        """释放行：执行 swap 排序。"""
+        if self._drag_idx < 0:
+            return
+        # 解绑临时事件
+        if self._drag_motion_bind:
+            self.dialog.unbind("<B1-Motion>", self._drag_motion_bind)
+            self._drag_motion_bind = None
+        if self._drag_release_bind:
+            self.dialog.unbind("<ButtonRelease-1>", self._drag_release_bind)
+            self._drag_release_bind = None
+
+        target_idx = self._row_index_from_y(event.y_root)
+        if 0 <= target_idx < len(self.rows) and target_idx != self._drag_idx:
+            side = self._drag_side
+            # 只交换指定列的内容，不碰另一列
+            src_a = self.rows[self._drag_idx][side]
+            src_b = self.rows[target_idx][side]
+            self.rows[self._drag_idx][side] = src_b
+            self.rows[target_idx][side] = src_a
+
+        self._drag_idx = -1
+        self._drag_side = None
+        self._build_rows()
+
+    def _row_index_from_y(self, y_root):
+        """根据鼠标 Y 坐标（root）计算所在行索引。"""
+        children = self.inner_frame.winfo_children()
+        for i, child in enumerate(children):
+            if not child.winfo_ismapped():
+                continue
+            cy = child.winfo_rooty()
+            ch = child.winfo_height()
+            if y_root < cy + ch // 2:
+                return i
+        return len(self.rows) - 1
+
+    # ── 全选/取消全选 ──
+
+    def _select_all(self):
+        for row in self.rows:
+            if row["source"] and row["target"]:
+                row["var"].set(True)
+                row["checked"] = True
+        self._build_rows()
+
+    def _deselect_all(self):
+        for row in self.rows:
+            row["checked"] = False
+            row["var"].set(False)
+        self._build_rows()
+
+    # ── 确认配对 ──
+
+    def _confirm(self):
+        paired_count = 0
+        for row in self.rows:
+            if not (row["checked"] and row["source"] and row["target"]):
+                continue
+            if row["source"].paired_with or row["target"].paired_with:
+                continue
+            row["source"].paired_with = row["target"].point_id
+            row["target"].paired_with = row["source"].point_id
+            paired_count += 1
+        if paired_count:
+            self.parent._update_unpaired_count()
+            self.parent.redraw()
+            self.parent.show_temp_message(f"已配对 {paired_count} 组连接点", 2000)
+        else:
+            self.parent.show_temp_message("没有新的配对", 1500)
+        self._on_close()
+
+    # ── 关闭 ──
+
+    def _on_close(self):
+        self._stop_refresh_timer()
+        if self.parent._pairing_dialog is self:
+            self.parent._pairing_dialog = None
+        self.dialog.destroy()
+
+    # ── 居中 ──
+
+    def _center_dialog(self):
+        self.dialog.update_idletasks()
+        w = self.dialog.winfo_width()
+        h = self.dialog.winfo_height()
+        pw = self.parent.canvas.winfo_width() if hasattr(self.parent, 'canvas') else 800
+        ph = self.parent.canvas.winfo_height() if hasattr(self.parent, 'canvas') else 600
+        px = self.parent.canvas.winfo_rootx() if hasattr(self.parent, 'canvas') else 0
+        py = self.parent.canvas.winfo_rooty() if hasattr(self.parent, 'canvas') else 0
+        x = px + (pw - w) // 2
+        y = py + (ph - h) // 2
+        self.dialog.geometry(f"+{x}+{y}")
+
+    # ── 定时刷新 ──
+
+    def _start_refresh_timer(self):
+        self._timer_id = self.dialog.after(2000, self._refresh_check)
+
+    def _refresh_check(self):
+        if not self.dialog.winfo_exists():
+            return
+        if self._drag_idx >= 0:
+            self._start_refresh_timer()
+            return
+        changed = False
+        for key in ("source", "target"):
+            for row in list(self.rows):
+                cp = row[key]
+                if cp and cp not in self.parent.cad_data_manager.connection_points:
+                    row[key] = None
+                    row["checked"] = False
+                    row["var"].set(False)
+                    changed = True
+        self.rows = [r for r in self.rows if r["source"] or r["target"]]
+        if changed:
+            self.parent._update_unpaired_count()
+            self.parent.redraw()
+            self._build_rows()
+        self._start_refresh_timer()
+
+    def _stop_refresh_timer(self):
+        if self._timer_id:
+            try:
+                self.dialog.after_cancel(self._timer_id)
+            except Exception:
+                pass
+            self._timer_id = None
 

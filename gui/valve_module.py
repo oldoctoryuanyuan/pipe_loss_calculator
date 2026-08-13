@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
 import logging
+from gui.building_tab_manager import BuildingTabManager
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,13 @@ class ValvePage(ttk.Frame):
         self.cad_data_manager = cad_data_manager
         
         self.valve_data = []
+        self.building_tabs = BuildingTabManager(self, cad_data_manager)
         self.create_widgets()
         self.setup_context_menu()
     
     def create_widgets(self):
         """创建界面控件"""
+        self.building_tabs.build()
         # 阀门数据表格
         self.create_valve_table()
     
@@ -63,7 +66,7 @@ class ValvePage(ttk.Frame):
         
         # 绑定双击事件编辑状态
         self.tree.bind("<Double-1>", self.on_double_click)
-    
+
     def setup_context_menu(self):
         """设置右键菜单"""
         self.context_menu = tk.Menu(self, tearoff=0)
@@ -76,11 +79,11 @@ class ValvePage(ttk.Frame):
             label="跳转至楼层预览",
             command=self.jump_to_valve_floor
         )
-        self.context_menu.add_separator()
         self.context_menu.add_command(
-            label="刷新",
-            command=self.refresh_data
+            label="跳转至拼接预览",
+            command=self.jump_to_valve_spliced
         )
+        self.context_menu.add_separator()
         
         # 绑定右键事件
         self.tree.bind("<Button-3>", self.show_context_menu)
@@ -89,12 +92,14 @@ class ValvePage(ttk.Frame):
         """刷新阀门数据（静默模式）"""
         try:
             if not self.cad_data_manager.is_loaded:
-                # 不显示弹窗，只清空表格
                 for item in self.tree.get_children():
                     self.tree.delete(item)
+                self.valve_data = []
+                self.building_tabs.rebuild_tabs()
                 return
             
             self.valve_data = self.cad_data_manager.valves
+            self.building_tabs.rebuild_tabs()
             self.update_table()
             
             # 记录日志
@@ -109,8 +114,14 @@ class ValvePage(ttk.Frame):
         for item in self.tree.get_children():
             self.tree.delete(item)
         
+        bid = self.building_tabs.current_id
+        data = self.valve_data
+        if bid is not None:
+            prefix = bid + '_'
+            data = [v for v in data if v.valve_id.startswith(prefix)]
+        
         # 添加新数据
-        for valve in self.valve_data:
+        for valve in data:
             values = (
                 valve.valve_id,
                 valve.pipe_id if valve.pipe_id else "未匹配",
@@ -219,3 +230,23 @@ class ValvePage(ttk.Frame):
         preview = self._switch_to_preview()
         if preview:
             preview.jump_to_valve(values[0], to_global=False)
+
+    def jump_to_valve_spliced(self):
+        selection = self.tree.selection()
+        if not selection:
+            return
+        values = self.tree.item(selection[0], "values")
+        if not values:
+            return
+        preview = self._switch_to_preview()
+        if preview:
+            preview.jump_to_spliced_view(entity_type="valve", entity_id=values[0])
+
+    def _on_delete_building(self, building_id: str):
+        root = self.winfo_toplevel()
+        main_app = getattr(root, 'main_app', None)
+        if not main_app:
+            return
+        preview = main_app.pages.get("管网预览")
+        if preview:
+            preview._on_delete_building(building_id)
